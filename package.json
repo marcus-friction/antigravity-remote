@@ -1,6 +1,7 @@
 {
   "name": "antigravity-remote",
   "version": "1.0.4",
+  "license": "MIT",
   "private": true,
   "main": "index.ts",
   "scripts": {
