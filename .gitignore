@@ -30,3 +30,5 @@ yarn-error.*
 *.pem
 .env*.local
 *.tsbuildinfo
+__pycache__/
+*.pyc
