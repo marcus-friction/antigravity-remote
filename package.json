@@ -13,7 +13,7 @@
     "prebuild": "node scripts/patch-build-tools.js --check && expo prebuild",
     "build:play-aab": "node scripts/patch-build-tools.js --check && node scripts/check-native.js && cd android && ./gradlew bundleRelease && python3 ../scripts/check-16kb.py app/build/outputs/bundle/release/app-release.aab",
     "publish:play-internal": "npm run build:play-aab && cd android && ./gradlew publishReleaseBundle",
-    "publish:play-production": "PLAY_TRACK=production npm run publish:play-internal",
+    "publish:play-production": "npm run build:play-aab && cd android && PLAY_TRACK=production ./gradlew publishReleaseListing publishReleaseBundle",
     "typecheck": "tsc --noEmit",
     "test": "jest",
     "test:prebuild": "node scripts/test-prebuild.js",
