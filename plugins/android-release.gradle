@@ -39,6 +39,6 @@ if (publisherCredentials.exists()) {
         serviceAccountCredentials.set(publisherCredentials)
         track.set(targetTrack)
         defaultToAppBundles.set(true)
-        releaseStatus.set(com.github.triplet.gradle.androidpublisher.ReleaseStatus.valueOf(statusName))
+        releaseStatus.set(Enum.valueOf(releaseStatus.get().class, statusName))
     }
 }

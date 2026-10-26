@@ -19,6 +19,7 @@ Use Node.js 22.13 or later, JDK 17, and Android SDK 36 with NDK 27.1.12297006. N
 npm ci
 npm run typecheck
 npm test -- --runInBand
+npm run check:build-tools
 npm run check:native
 npm run test:prebuild
 npm run audit:dependencies
@@ -28,6 +29,8 @@ npm run ios
 ```
 
 `npm start` binds Metro to localhost. For development on a physical device over a trusted LAN, run `npx expo start --lan` explicitly.
+
+`npm ci` applies a checked node-forge security backport during postinstall. Raw `npm audit` still flags its original upstream version; `npm run audit:dependencies` verifies the installed fix and rejects all unpatched advisories. Expo's Zod dependency is overridden to patched 4.6.7. See [SECURITY.md](SECURITY.md) for the patch source, regression coverage, and removal procedure.
 
 ## Native regeneration
 
@@ -49,4 +52,4 @@ The build script verifies native configuration and all 64-bit library LOAD align
 
 `npm run publish:play-internal` builds and validates the AAB before invoking the Play publisher. Configure `PLAY_SERVICE_ACCOUNT_JSON` or an ignored `android/play-service-account.json` first. Publishing is a separate, explicit action.
 
-See [SECURITY.md](SECURITY.md) for the threat boundaries, regression coverage, and remaining upstream build-tool advisories.
+See [SECURITY.md](SECURITY.md) for the threat boundaries, regression coverage, and build-tool advisory remediation.
