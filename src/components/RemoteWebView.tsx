@@ -1,10 +1,5 @@
 import * as Linking from 'expo-linking';
-import React, {
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-} from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   AppState,
@@ -20,10 +15,7 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import {
-  WebView,
-  WebViewNavigation,
-} from 'react-native-webview';
+import { WebView, WebViewNavigation } from 'react-native-webview';
 import { ShouldStartLoadRequest } from 'react-native-webview/lib/WebViewTypes';
 import { ANTIGRAVITY_DASHBOARD_URL } from '../constants/config';
 import {
@@ -33,10 +25,13 @@ import {
   getLastActiveUrl,
   hydrateCookiesToWebView,
   saveLastActiveUrl,
+  suspendSessionPersistence,
+  resumeSessionPersistence,
 } from '../services/sessionVault';
 import { AuthFlowStage } from '../types/session';
 import {
   isGoogleCookieErrorUrl,
+  isAllowedAuthSubframeUrl,
   isInternalWebViewSchemeUrl,
   validateNavigationUrl,
 } from '../utils/urlValidator';
@@ -121,30 +116,40 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
 }) => {
   const insets = useSafeAreaInsets();
   const webViewRef = useRef<WebView | null>(null);
+  const hydratedRef = useRef(false);
   const canGoBackRef = useRef<boolean>(false);
   const uncompressedHeightRef = useRef<number>(0);
   const cookieRecoveryAttemptsRef = useRef<number>(0);
-  const isRecoveringCookiesRef = useRef<boolean>(false);
+  const isResettingSessionRef = useRef(false);
   const currentNavUrlRef = useRef<string>(ANTIGRAVITY_DASHBOARD_URL);
   const stageRef = useRef<AuthFlowStage>('hydrating');
   const baselineAuthSigRef = useRef<string | null>(null);
   const post2faReloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
-    null
+    null,
   );
 
   const [isHydrated, setIsHydrated] = useState<boolean>(false);
   const [currentSourceUrl, setCurrentSourceUrl] = useState<string>(
-    ANTIGRAVITY_DASHBOARD_URL
+    ANTIGRAVITY_DASHBOARD_URL,
   );
   const [stage, setStage] = useState<AuthFlowStage>('hydrating');
   const [hasNetworkError, setHasNetworkError] = useState<boolean>(false);
   const [isModalVisible, setIsModalVisible] = useState<boolean>(false);
   const [lastSyncedCookieCount, setLastSyncedCookieCount] = useState<number>(0);
   const [webViewInstanceKey, setWebViewInstanceKey] = useState<number>(1);
+  const [resetRequest, setResetRequest] = useState<{
+    reason: 'signout' | 'recovery';
+    attempt: number;
+  } | null>(null);
+  const [resetError, setResetError] = useState<string | null>(null);
+  const [initializationError, setInitializationError] = useState(false);
+  const [initializationAttempt, setInitializationAttempt] = useState(0);
+  const [pageError, setPageError] = useState<string | null>(null);
   const [rawKeyboardHeight, setRawKeyboardHeight] = useState<number>(0);
   const [rootLayoutHeight, setRootLayoutHeight] = useState<number>(0);
 
   const syncCookiesToVault = useCallback(async () => {
+    if (!hydratedRef.current || isResettingSessionRef.current) return;
     const count = await backupCookiesFromWebView();
     if (count > 0) {
       setLastSyncedCookieCount(count);
@@ -203,20 +208,29 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       if (incomingDeepLinkUrl) {
         onDeepLinkConsumed();
       }
-      setStage('authenticated');
+      setStage(restoredCount > 0 ? 'authenticated' : 'authenticating');
+      hydratedRef.current = true;
       setIsHydrated(true);
     }
 
-    initializeSession();
+    initializeSession().catch(() => {
+      if (isMounted) setInitializationError(true);
+    });
 
     return () => {
       isMounted = false;
     };
-  }, [incomingDeepLinkUrl, isHydrated, isInitialUrlResolved, onDeepLinkConsumed]);
+  }, [
+    incomingDeepLinkUrl,
+    isHydrated,
+    isInitialUrlResolved,
+    onDeepLinkConsumed,
+    initializationAttempt,
+  ]);
 
   // Step 2: Handle incoming deep links when the app is already mounted
   useEffect(() => {
-    if (!isHydrated || !incomingDeepLinkUrl) {
+    if (!isHydrated || isResettingSessionRef.current || !incomingDeepLinkUrl) {
       return;
     }
 
@@ -229,11 +243,12 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     ) {
       setHasNetworkError(false);
       setCurrentSourceUrl(validation.normalizedUrl);
+      setWebViewInstanceKey((prev) => prev + 1);
       currentNavUrlRef.current = validation.normalizedUrl;
       void saveLastActiveUrl(validation.normalizedUrl);
     }
     onDeepLinkConsumed();
-  }, [incomingDeepLinkUrl, isHydrated, onDeepLinkConsumed]);
+  }, [incomingDeepLinkUrl, isHydrated, onDeepLinkConsumed, resetRequest]);
 
   // Step 3: Flush & back up cookies whenever the app transitions to background/inactive,
   // and wake up / complete 2-Step Verification when returning to active
@@ -278,7 +293,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             }
           }
         }
-      }
+      },
     );
 
     return () => {
@@ -359,7 +374,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
 
     const subscription = BackHandler.addEventListener(
       'hardwareBackPress',
-      onHardwareBackPress
+      onHardwareBackPress,
     );
 
     return () => {
@@ -374,11 +389,14 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         return;
       }
       setRootLayoutHeight(measuredHeight);
-      if (rawKeyboardHeight === 0 || measuredHeight > uncompressedHeightRef.current) {
+      if (
+        rawKeyboardHeight === 0 ||
+        measuredHeight > uncompressedHeightRef.current
+      ) {
         uncompressedHeightRef.current = measuredHeight;
       }
     },
-    [rawKeyboardHeight]
+    [rawKeyboardHeight],
   );
 
   // Calculate how much bottom inset the WebView needs when the keyboard is open.
@@ -397,91 +415,135 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
 
   const isKeyboardVisible = rawKeyboardHeight > 0;
 
-  const recoverFromCookieMismatch = useCallback(async () => {
-    if (isRecoveringCookiesRef.current || cookieRecoveryAttemptsRef.current >= 2) {
+  const beginSessionReset = useCallback((reason: 'signout' | 'recovery') => {
+    if (isResettingSessionRef.current) return;
+    isResettingSessionRef.current = true;
+    suspendSessionPersistence();
+    webViewRef.current?.stopLoading();
+    stageRef.current = 'hydrating';
+    setStage('hydrating');
+    setIsModalVisible(false);
+    setResetError(null);
+    setResetRequest({ reason, attempt: 0 });
+  }, []);
+
+  // Effects run after the reset screen has unmounted the old WebView. No page
+  // may repopulate native cookies or DOM storage while cleanup is in progress.
+  useEffect(() => {
+    if (!resetRequest) return;
+    let mounted = true;
+    clearSession()
+      .then(() => {
+        if (!mounted) return;
+        setLastSyncedCookieCount(0);
+        setHasNetworkError(false);
+        setPageError(null);
+        setCurrentSourceUrl(ANTIGRAVITY_DASHBOARD_URL);
+        currentNavUrlRef.current = ANTIGRAVITY_DASHBOARD_URL;
+        canGoBackRef.current = false;
+        if (resetRequest.reason === 'signout')
+          cookieRecoveryAttemptsRef.current = 0;
+        setWebViewInstanceKey((prev) => prev + 1);
+        setStage('authenticating');
+        isResettingSessionRef.current = false;
+        resumeSessionPersistence();
+        setResetRequest(null);
+      })
+      .catch(() => {
+        if (mounted)
+          setResetError(
+            'Unable to finish clearing this session. Retry to securely sign out.',
+          );
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [resetRequest]);
+
+  const recoverFromCookieMismatch = useCallback(() => {
+    if (isResettingSessionRef.current) return;
+    if (cookieRecoveryAttemptsRef.current >= 2) {
+      setPageError(
+        'Automatic sign-in recovery stopped. Open Remote controls and sign out to start again.',
+      );
+      setHasNetworkError(true);
+      setStage('offline');
       return;
     }
-    isRecoveringCookiesRef.current = true;
-    cookieRecoveryAttemptsRef.current += 1;
-    try {
-      await clearSession();
-      webViewRef.current?.clearCache?.(true);
-      setLastSyncedCookieCount(0);
-      setHasNetworkError(false);
-      setStage('authenticating');
-      setCurrentSourceUrl(ANTIGRAVITY_DASHBOARD_URL);
-      setWebViewInstanceKey((prev) => prev + 1);
-    } finally {
-      isRecoveringCookiesRef.current = false;
-    }
-  }, []);
+    cookieRecoveryAttemptsRef.current++;
+    beginSessionReset('recovery');
+  }, [beginSessionReset]);
 
   const handleShouldStartLoadWithRequest = useCallback(
     (request: ShouldStartLoadRequest): boolean => {
-      if (isInternalWebViewSchemeUrl(request.url)) {
-        return true;
-      }
-
-      if (isGoogleCookieErrorUrl(request.url)) {
-        void recoverFromCookieMismatch();
-        return false;
-      }
-
+      if (isResettingSessionRef.current) return false;
+      // Internal documents are needed by auth subframes, never as top-level pages.
+      if (isInternalWebViewSchemeUrl(request.url))
+        return request.isTopFrame === false;
       const validation = validateNavigationUrl(request.url);
-      if (!validation.isValid || !validation.normalizedUrl) {
+      if (!validation.isValid || !validation.normalizedUrl) return false;
+      if (request.isTopFrame === false && isAllowedAuthSubframeUrl(request.url))
+        return true;
+      if (
+        request.isTopFrame !== false &&
+        isGoogleCookieErrorUrl(validation.normalizedUrl)
+      ) {
+        recoverFromCookieMismatch();
         return false;
       }
-
-      if (validation.isAllowedInApp) {
-        return true;
-      }
-
-      // Valid external HTTPS link on top frame: open safely in the OS browser
+      if (validation.isAllowedInApp) return true;
       if (request.isTopFrame !== false) {
-        void Linking.openURL(validation.normalizedUrl);
+        void Linking.openURL(validation.normalizedUrl).catch(() => undefined);
       }
       return false;
     },
-    [recoverFromCookieMismatch]
+    [recoverFromCookieMismatch],
   );
 
   const handleNavigationStateChange = useCallback(
     (navState: WebViewNavigation) => {
-      canGoBackRef.current = Boolean(navState.canGoBack);
-      if (navState.url) {
-        currentNavUrlRef.current = navState.url;
-      }
-
-      if (isGoogleCookieErrorUrl(navState.url)) {
-        void recoverFromCookieMismatch();
-        return;
-      }
-
+      if (isResettingSessionRef.current) return;
       const validation = validateNavigationUrl(navState.url);
-      if (!validation.isValid || !validation.normalizedUrl) {
+      if (!validation.isAllowedInApp || !validation.normalizedUrl) return;
+      canGoBackRef.current = Boolean(navState.canGoBack);
+      currentNavUrlRef.current = validation.normalizedUrl;
+      if (isGoogleCookieErrorUrl(validation.normalizedUrl)) {
+        recoverFromCookieMismatch();
         return;
       }
-
       if (validation.isAuthHost) {
         setStage('authenticating');
-        if (!navState.loading) {
-          void checkPost2faSessionAndAdvance();
-        }
+        if (!navState.loading) void checkPost2faSessionAndAdvance();
         return;
       }
-
-      setStage('authenticated');
-
-      const parsed = new URL(validation.normalizedUrl);
-      if (parsed.hostname.toLowerCase() === 'antigravity.google.com') {
-        cookieRecoveryAttemptsRef.current = 0;
+      if (
+        new URL(validation.normalizedUrl).hostname === 'antigravity.google.com'
+      ) {
         void saveLastActiveUrl(validation.normalizedUrl);
         if (!navState.loading) {
+          setHasNetworkError(false);
+          setPageError(null);
           void syncCookiesToVault();
+          // A loading dashboard can immediately redirect back to a broken login.
+          // Reset the retry budget only after a completed page with session cookies.
+          void getGoogleSessionSignature().then((signature) => {
+            if (
+              signature &&
+              !isResettingSessionRef.current &&
+              currentNavUrlRef.current === validation.normalizedUrl
+            ) {
+              cookieRecoveryAttemptsRef.current = 0;
+              setStage('authenticated');
+            }
+          });
         }
       }
     },
-    [checkPost2faSessionAndAdvance, recoverFromCookieMismatch, syncCookiesToVault]
+    [
+      checkPost2faSessionAndAdvance,
+      recoverFromCookieMismatch,
+      syncCookiesToVault,
+    ],
   );
 
   const handleLoadEnd = useCallback(() => {
@@ -490,30 +552,61 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   }, [syncCookiesToVault]);
 
   const handleReloadSession = useCallback(() => {
+    if (isResettingSessionRef.current) return;
     setHasNetworkError(false);
+    setPageError(null);
+    setStage('authenticating');
     void syncCookiesToVault();
     webViewRef.current?.reload();
   }, [syncCookiesToVault]);
 
   const handleNavigateToUrl = useCallback((targetUrl: string) => {
+    if (isResettingSessionRef.current) return;
     const validation = validateNavigationUrl(targetUrl);
-    if (!validation.isValid || !validation.normalizedUrl || !validation.isAllowedInApp) {
-      return;
-    }
+    if (!validation.isAllowedInApp || !validation.normalizedUrl) return;
     setHasNetworkError(false);
+    setPageError(null);
     setCurrentSourceUrl(validation.normalizedUrl);
+    currentNavUrlRef.current = validation.normalizedUrl;
+    // Explicit native navigation must work even when the source prop already
+    // contains this URL and the browser has since navigated somewhere else.
+    setWebViewInstanceKey((prev) => prev + 1);
     void saveLastActiveUrl(validation.normalizedUrl);
   }, []);
 
-  const handleSignOut = useCallback(async () => {
-    await clearSession();
-    webViewRef.current?.clearCache?.(true);
-    setLastSyncedCookieCount(0);
-    setHasNetworkError(false);
-    setStage('authenticating');
-    setCurrentSourceUrl(ANTIGRAVITY_DASHBOARD_URL);
-    setWebViewInstanceKey((prev) => prev + 1);
-  }, []);
+  const handleSignOut = useCallback(
+    () => beginSessionReset('signout'),
+    [beginSessionReset],
+  );
+
+  if (resetRequest) {
+    return (
+      <View style={styles.loadingScreen}>
+        <Text style={styles.loadingTitle}>
+          {resetError ? 'Sign-out needs attention' : 'Clearing session…'}
+        </Text>
+        {resetError ? (
+          <>
+            <Text style={styles.loadingSubtitle}>{resetError}</Text>
+            <TouchableOpacity
+              accessibilityRole="button"
+              onPress={() => {
+                setResetError(null);
+                setResetRequest(
+                  (previous) =>
+                    previous && { ...previous, attempt: previous.attempt + 1 },
+                );
+              }}
+            >
+              <Text style={styles.primaryRetryText}>Retry sign-out</Text>
+            </TouchableOpacity>
+          </>
+        ) : (
+          <ActivityIndicator size="large" color="#60A5FA" />
+        )}
+      </View>
+    );
+  }
 
   if (!isHydrated) {
     return (
@@ -521,8 +614,21 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         <ActivityIndicator size="large" color="#60A5FA" />
         <Text style={styles.loadingTitle}>Antigravity Remote</Text>
         <Text style={styles.loadingSubtitle}>
-          Restoring encrypted Google session...
+          {initializationError
+            ? 'Session storage is unavailable. Retry before opening the session.'
+            : 'Restoring saved session…'}
         </Text>
+        {initializationError ? (
+          <TouchableOpacity
+            accessibilityRole="button"
+            onPress={() => {
+              setInitializationError(false);
+              setInitializationAttempt((previous) => previous + 1);
+            }}
+          >
+            <Text style={styles.primaryRetryText}>Retry restore</Text>
+          </TouchableOpacity>
+        ) : null}
       </View>
     );
   }
@@ -539,14 +645,45 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             : null,
         ]}
       >
+        <WebView
+          key={`agy-webview-${webViewInstanceKey}`}
+          ref={webViewRef}
+          source={{ uri: currentSourceUrl }}
+          userAgent={getCleanMobileUserAgent()}
+          style={styles.webView}
+          containerStyle={styles.webViewContainer}
+          sharedCookiesEnabled={true}
+          thirdPartyCookiesEnabled={true}
+          domStorageEnabled={true}
+          javaScriptEnabled={true}
+          cacheEnabled={true}
+          setSupportMultipleWindows={false}
+          allowsBackForwardNavigationGestures={true}
+          pullToRefreshEnabled={true}
+          injectedJavaScript={KEYBOARD_ADAPTATION_SCRIPT}
+          originWhitelist={['*']}
+          onShouldStartLoadWithRequest={handleShouldStartLoadWithRequest}
+          onNavigationStateChange={handleNavigationStateChange}
+          onLoadEnd={handleLoadEnd}
+          onError={() => {
+            setPageError(null);
+            setHasNetworkError(true);
+            setStage('offline');
+          }}
+          onHttpError={(syntheticEvent) => {
+            if (syntheticEvent.nativeEvent.statusCode >= 502) {
+              setStage('offline');
+            }
+          }}
+        />
         {hasNetworkError ? (
-          <View style={styles.errorContainer}>
+          <View style={[styles.errorContainer, styles.errorOverlay]}>
             <Text style={styles.errorHeading}>
               Unable to reach Antigravity Remote
             </Text>
             <Text style={styles.errorBody}>
-              Check your internet connection. Your Google session cookies remain
-              safely stored on this device.
+              {pageError ??
+                'Check your internet connection, then reconnect to this page.'}
             </Text>
             <TouchableOpacity
               style={styles.primaryRetryButton}
@@ -556,38 +693,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
               <Text style={styles.primaryRetryText}>Reconnect</Text>
             </TouchableOpacity>
           </View>
-        ) : (
-          <WebView
-            key={`agy-webview-${webViewInstanceKey}`}
-            ref={webViewRef}
-            source={{ uri: currentSourceUrl }}
-            userAgent={getCleanMobileUserAgent()}
-            style={styles.webView}
-            containerStyle={styles.webViewContainer}
-            sharedCookiesEnabled={true}
-            thirdPartyCookiesEnabled={true}
-            domStorageEnabled={true}
-            javaScriptEnabled={true}
-            cacheEnabled={true}
-            setSupportMultipleWindows={false}
-            allowsBackForwardNavigationGestures={true}
-            pullToRefreshEnabled={true}
-            injectedJavaScript={KEYBOARD_ADAPTATION_SCRIPT}
-            originWhitelist={['https://*', 'about:blank', 'about:srcdoc', 'blob:*']}
-            onShouldStartLoadWithRequest={handleShouldStartLoadWithRequest}
-            onNavigationStateChange={handleNavigationStateChange}
-            onLoadEnd={handleLoadEnd}
-            onError={() => {
-              setHasNetworkError(true);
-              setStage('offline');
-            }}
-            onHttpError={(syntheticEvent) => {
-              if (syntheticEvent.nativeEvent.statusCode >= 502) {
-                setStage('offline');
-              }
-            }}
-          />
-        )}
+        ) : null}
       </View>
 
       {!isKeyboardVisible ? (
@@ -645,6 +751,10 @@ const styles = StyleSheet.create({
     color: '#94A3B8',
     fontSize: 13,
     textAlign: 'center',
+  },
+  errorOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 1,
   },
   errorContainer: {
     flex: 1,

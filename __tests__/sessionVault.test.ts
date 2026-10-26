@@ -1,5 +1,13 @@
+jest.mock('../src/services/webData', () => ({
+  clearWebData: jest.fn(async () => undefined),
+}));
 const mockSecureStoreData = new Map<string, string>();
 const mockCookieStore = new Map<string, Record<string, any>>();
+
+import CookieManager from '@preeternal/react-native-cookie-manager';
+import * as SecureStore from 'expo-secure-store';
+import { Platform } from 'react-native';
+import { clearWebData } from '../src/services/webData';
 
 jest.mock('react-native', () => ({
   Platform: {
@@ -20,7 +28,7 @@ jest.mock('expo-secure-store', () => ({
   }),
 }));
 
-jest.mock('@react-native-cookies/cookies', () => ({
+jest.mock('@preeternal/react-native-cookie-manager', () => ({
   __esModule: true,
   default: {
     get: jest.fn(async (url: string) => {
@@ -46,6 +54,9 @@ import {
   SECURE_STORE_CHUNK_SIZE,
   SECURE_STORE_META_KEY,
   SECURE_STORE_MIGRATION_V2_KEY,
+  SECURE_STORE_SNAPSHOT_PREFIX,
+  SECURE_STORE_CHUNK_PREFIX,
+  SECURE_STORE_SIGN_OUT_KEY,
 } from '../src/constants/config';
 import {
   backupCookiesFromWebView,
@@ -56,12 +67,160 @@ import {
   reassembleChunks,
   saveLastActiveUrl,
   splitIntoChunks,
+  resumeSessionPersistence,
 } from '../src/services/sessionVault';
 
 describe('sessionVault', () => {
   beforeEach(() => {
+    resumeSessionPersistence();
+    (Platform as { OS: string }).OS = 'ios';
+    (SecureStore.setItemAsync as jest.Mock).mockImplementation(
+      async (key: string, value: string) => {
+        mockSecureStoreData.set(key, value);
+      },
+    );
+    (CookieManager.clearAll as jest.Mock).mockImplementation(async () => {
+      mockCookieStore.clear();
+      return true;
+    });
+    (clearWebData as jest.Mock).mockResolvedValue(undefined);
     mockSecureStoreData.clear();
     mockCookieStore.clear();
+  });
+
+  const seed = (value: string) =>
+    mockCookieStore.set('https://antigravity.google.com', {
+      SID: { name: 'SID', value, domain: '.google.com', path: '/' },
+    });
+
+  it('invalidates and drains an in-flight backup before clearing all credentials', async () => {
+    seed('old-session');
+    let release!: () => void;
+    let reached!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const writeStarted = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    (SecureStore.setItemAsync as jest.Mock).mockImplementation(
+      async (key: string, value: string) => {
+        if (key === `${SECURE_STORE_SNAPSHOT_PREFIX}a_0`) {
+          reached();
+          await gate;
+        }
+        mockSecureStoreData.set(key, value);
+      },
+    );
+    const backup = backupCookiesFromWebView();
+    await writeStarted;
+    const clearing = clearSession();
+    const queuedBackup = backupCookiesFromWebView();
+    release();
+    await Promise.all([backup, clearing, queuedBackup]);
+    expect(mockCookieStore.size).toBe(0);
+    expect(mockSecureStoreData.has(SECURE_STORE_META_KEY)).toBe(false);
+    resumeSessionPersistence();
+    expect(await hydrateCookiesToWebView()).toBe(0);
+  });
+
+  it('preserves the committed snapshot when writing a later chunk fails', async () => {
+    seed('A'.repeat(2500));
+    await backupCookiesFromWebView();
+    const committed = mockSecureStoreData.get(SECURE_STORE_META_KEY);
+    seed('B'.repeat(2500));
+    (SecureStore.setItemAsync as jest.Mock).mockImplementation(
+      async (key: string, value: string) => {
+        if (key === `${SECURE_STORE_SNAPSHOT_PREFIX}b_1`)
+          throw new Error('Storage failure');
+        mockSecureStoreData.set(key, value);
+      },
+    );
+    expect(await backupCookiesFromWebView()).toBe(0);
+    expect(mockSecureStoreData.get(SECURE_STORE_META_KEY)).toBe(committed);
+    mockCookieStore.clear();
+    expect(await hydrateCookiesToWebView()).toBe(1);
+    expect(
+      mockCookieStore.get('https://antigravity.google.com')?.SID.value,
+    ).toBe('A'.repeat(2500));
+  });
+
+  it('commits removal of all cookies instead of replaying a stale snapshot', async () => {
+    seed('removed-session');
+    await backupCookiesFromWebView();
+    mockCookieStore.clear();
+    await backupCookiesFromWebView();
+    expect(await hydrateCookiesToWebView()).toBe(0);
+  });
+
+  it('attempts every store and rejects sign-out if any cleanup fails', async () => {
+    seed('old-session');
+    await backupCookiesFromWebView();
+    (CookieManager.clearAll as jest.Mock).mockRejectedValueOnce(
+      new Error('Cookie deletion failed'),
+    );
+    await expect(clearSession()).rejects.toThrow('Session cleanup failed');
+    expect(CookieManager.clearAll).toHaveBeenCalledWith(false);
+    expect(CookieManager.clearAll).toHaveBeenCalledWith(true);
+    expect(clearWebData).toHaveBeenCalled();
+    expect(mockSecureStoreData.get(SECURE_STORE_SIGN_OUT_KEY)).toBe('true');
+    expect(await backupCookiesFromWebView()).toBe(0);
+    await clearSession();
+    expect(mockSecureStoreData.has(SECURE_STORE_SIGN_OUT_KEY)).toBe(false);
+  });
+
+  it('retries interrupted sign-out on cold start and refuses hydration on failure', async () => {
+    seed('old-session');
+    mockSecureStoreData.set(SECURE_STORE_SIGN_OUT_KEY, 'true');
+    (clearWebData as jest.Mock).mockRejectedValueOnce(
+      new Error('Storage unavailable'),
+    );
+    await expect(hydrateCookiesToWebView()).rejects.toThrow(
+      'Session cleanup failed',
+    );
+    expect(mockSecureStoreData.has(SECURE_STORE_SIGN_OUT_KEY)).toBe(true);
+    await expect(hydrateCookiesToWebView()).resolves.toBe(0);
+    expect(mockSecureStoreData.has(SECURE_STORE_SIGN_OUT_KEY)).toBe(false);
+  });
+
+  it('restores the previous v2 format and upgrades the next backup atomically', async () => {
+    mockSecureStoreData.set(
+      SECURE_STORE_META_KEY,
+      JSON.stringify({ version: 2, chunkCount: 1 }),
+    );
+    mockSecureStoreData.set(
+      `${SECURE_STORE_CHUNK_PREFIX}0`,
+      JSON.stringify([
+        {
+          name: 'SID',
+          value: 'v2-session',
+          domain: '.google.com',
+          originUrl: 'https://antigravity.google.com',
+        },
+      ]),
+    );
+    expect(await hydrateCookiesToWebView()).toBe(1);
+    await backupCookiesFromWebView();
+    expect(
+      JSON.parse(mockSecureStoreData.get(SECURE_STORE_META_KEY)!).version,
+    ).toBe(3);
+    await clearSession();
+    expect(mockSecureStoreData.has(`${SECURE_STORE_CHUNK_PREFIX}0`)).toBe(
+      false,
+    );
+  });
+
+  it('preserves Android cookies natively and clears persistent web data during sign-out', async () => {
+    (Platform as { OS: string }).OS = 'android';
+    mockSecureStoreData.set(SECURE_STORE_MIGRATION_V2_KEY, 'true');
+    seed('android-session');
+    expect(await hydrateCookiesToWebView()).toBe(1);
+    expect(await backupCookiesFromWebView()).toBe(1);
+    expect(mockSecureStoreData.has(SECURE_STORE_META_KEY)).toBe(false);
+    await clearSession();
+    expect(clearWebData).toHaveBeenCalled();
+    expect(mockCookieStore.size).toBe(0);
+    expect(CookieManager.flush).toHaveBeenCalled();
   });
 
   it('splits large payloads into chunks under 2048 bytes and reassembles them losslessly', () => {
@@ -125,27 +284,29 @@ describe('sessionVault', () => {
     expect(restoredCount).toBe(3);
 
     const restoredAgCookies = mockCookieStore.get(
-      'https://antigravity.google.com'
+      'https://antigravity.google.com',
     );
     expect(restoredAgCookies).toBeDefined();
     expect(restoredAgCookies!['SID'].value).toContain('sid-token-');
-    expect(restoredAgCookies!['__Secure-1PSID'].value).toContain('1psid-token-');
+    expect(restoredAgCookies!['__Secure-1PSID'].value).toContain(
+      '1psid-token-',
+    );
   });
 
   it('persists and validates the last active Antigravity Remote URL', async () => {
     expect(await getLastActiveUrl()).toBe('https://antigravity.google.com');
 
     await saveLastActiveUrl(
-      'https://antigravity.google.com/r/devbox-swift-falcon?p=c%2F999'
+      'https://antigravity.google.com/r/devbox-swift-falcon?p=c%2F999',
     );
     expect(await getLastActiveUrl()).toBe(
-      'https://antigravity.google.com/r/devbox-swift-falcon?p=c%2F999'
+      'https://antigravity.google.com/r/devbox-swift-falcon?p=c%2F999',
     );
 
     // Rejects untrusted URLs from overwriting last active URL
     await saveLastActiveUrl('https://evil.example.com/r/123');
     expect(await getLastActiveUrl()).toBe(
-      'https://antigravity.google.com/r/devbox-swift-falcon?p=c%2F999'
+      'https://antigravity.google.com/r/devbox-swift-falcon?p=c%2F999',
     );
   });
 
@@ -171,10 +332,10 @@ describe('sessionVault', () => {
 
   it('excludes __Host- prefixed and domain-less cookies from CookieManager.set re-injection to prevent Google CookieMismatch', async () => {
     expect(isSafeToReinjectCookie('__Host-GAPS', 'accounts.google.com')).toBe(
-      false
+      false,
     );
     expect(isSafeToReinjectCookie('__Host-1PLSID', 'accounts.google.com')).toBe(
-      false
+      false,
     );
     expect(isSafeToReinjectCookie('SID', undefined)).toBe(false);
     expect(isSafeToReinjectCookie('SID', '.google.com')).toBe(true);
@@ -203,7 +364,7 @@ describe('sessionVault', () => {
     await hydrateCookiesToWebView();
 
     const hydratedAccountsCookies = mockCookieStore.get(
-      'https://accounts.google.com'
+      'https://accounts.google.com',
     );
     expect(hydratedAccountsCookies?.LSID?.value).toBe('valid-lsid-token');
     expect(hydratedAccountsCookies?.['__Host-GAPS']).toBeUndefined();
@@ -218,11 +379,11 @@ describe('sessionVault', () => {
         chunkCount: 1,
         updatedAtIso: new Date().toISOString(),
         cookieCount: 1,
-      })
+      }),
     );
     mockSecureStoreData.set(
       `${LEGACY_SECURE_STORE_CHUNK_PREFIX_V1}0`,
-      JSON.stringify([{ name: '__Host-GAPS', value: 'corrupted' }])
+      JSON.stringify([{ name: '__Host-GAPS', value: 'corrupted' }]),
     );
     mockCookieStore.set('https://accounts.google.com', {
       '__Host-GAPS': { name: '__Host-GAPS', value: 'corrupted-domain-cookie' },
@@ -232,10 +393,10 @@ describe('sessionVault', () => {
 
     expect(mockCookieStore.size).toBe(0);
     expect(
-      mockSecureStoreData.get(LEGACY_SECURE_STORE_META_KEY_V1)
+      mockSecureStoreData.get(LEGACY_SECURE_STORE_META_KEY_V1),
     ).toBeUndefined();
     expect(
-      mockSecureStoreData.get(`${LEGACY_SECURE_STORE_CHUNK_PREFIX_V1}0`)
+      mockSecureStoreData.get(`${LEGACY_SECURE_STORE_CHUNK_PREFIX_V1}0`),
     ).toBeUndefined();
     expect(mockSecureStoreData.get(SECURE_STORE_MIGRATION_V2_KEY)).toBe('true');
   });

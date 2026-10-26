@@ -1,0 +1,16 @@
+Antigravity Remote is an open-source mobile companion wrapper for accessing https://antigravity.google.com on Android devices.
+
+KEY FEATURES
+• Persistent Session Management: Sign in with your Google account once and resume your active Antigravity workspace automatically across app restarts.
+• Instant CLI & Desktop Handoff: Paste any /remote-control output link (https://antigravity.google.com/r/<instance-id>), instance ID, or open antigravity-remote://r/<instance-id> deep links directly into your active mobile session.
+• Adaptive Mobile Keyboard & Viewport: Automatically adjusts the viewport and keeps the bottom chat prompt visible above the software keyboard on Android 15/16 edge-to-edge screens.
+• One-Tap Session Hygiene: Unmounts the WebView and wipes all cookies, DOM storage, and WebView cache cleanly whenever you sign out.
+• Strict Origin Security: Restricts in-app navigation strictly to Antigravity and first-party Google authentication hosts while opening external HTTPS links in your default system browser.
+
+PRIVACY & SECURITY
+• Zero Off-Device Telemetry: Operates no backend servers, analytics SDKs, or advertising trackers.
+• Local-Only Storage: Session cookies remain strictly on your device with Android Auto Backup and device-to-device transfer disabled.
+• Open Source (MIT License): Source code and security architecture are publicly auditable at https://github.com/marcus-friction/antigravity-remote.
+
+DISCLAIMER
+Antigravity Remote is an independent open-source client wrapper developed by Friction Ventures and is not affiliated with, sponsored by, or endorsed by Google LLC.

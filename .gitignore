@@ -2,8 +2,12 @@ node_modules/
 .expo/
 dist/
 web-build/
-ios/
+/ios/
 android/.gradle/
+android/.kotlin/
+modules/**/android/build/
+modules/**/android/.cxx/
+modules/**/android/.gradle/
 android/build/
 android/app/build/
 android/local.properties
@@ -11,6 +15,7 @@ android/keystore.properties
 *.orig.*
 *.jks
 *.keystore
+!android/app/debug.keystore
 keystore.properties
 play-service-account.json
 *.p8

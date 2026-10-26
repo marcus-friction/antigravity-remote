@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none';" />
+  <title>Privacy Policy — Antigravity Remote</title>
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      padding: 32px 20px 64px;
+      background-color: #0B0F17;
+      color: #E2E8F0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      line-height: 1.65;
+    }
+    main {
+      max-width: 760px;
+      margin: 0 auto;
+      background-color: #0F172A;
+      border: 1px solid #1E293B;
+      border-radius: 16px;
+      padding: 32px 28px;
+    }
+    h1 {
+      color: #F8FAFC;
+      font-size: 1.75rem;
+      margin-top: 0;
+      margin-bottom: 8px;
+    }
+    h2 {
+      color: #F1F5F9;
+      font-size: 1.2rem;
+      margin-top: 28px;
+      margin-bottom: 8px;
+      border-bottom: 1px solid #1E293B;
+      padding-bottom: 6px;
+    }
+    p, li {
+      color: #CBD5E1;
+      font-size: 0.96rem;
+    }
+    ul, ol {
+      padding-left: 22px;
+    }
+    .meta {
+      color: #94A3B8;
+      font-size: 0.88rem;
+      margin-bottom: 24px;
+      padding: 12px 16px;
+      background-color: #1E293B;
+      border-radius: 10px;
+    }
+    a {
+      color: #93C5FD;
+      text-decoration: none;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+    code {
+      background-color: #1E293B;
+      color: #F8FAFC;
+      padding: 2px 6px;
+      border-radius: 5px;
+      font-size: 0.88rem;
+    }
+    footer {
+      margin-top: 32px;
+      padding-top: 16px;
+      border-top: 1px solid #1E293B;
+      color: #64748B;
+      font-size: 0.84rem;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Privacy Policy for Antigravity Remote</h1>
+    <div class="meta">
+      <div><strong>Effective Date:</strong> October 26, 2026</div>
+      <div><strong>Application:</strong> Antigravity Remote (<code>com.frictionventures.antigravityremote</code>)</div>
+      <div><strong>Developer / Publisher:</strong> Friction Ventures</div>
+      <div><strong>Contact Email:</strong> <a href="mailto:antigravity-remote@frictionventures.com">antigravity-remote@frictionventures.com</a></div>
+    </div>
+
+    <h2>1. Overview &amp; Independent Publisher Disclosure</h2>
+    <p>
+      <strong>Antigravity Remote</strong> is an open-source mobile companion wrapper developed by <strong>Friction Ventures</strong> for accessing <code>https://antigravity.google.com</code> on Android and iOS devices. Antigravity Remote is an independent client application and is not affiliated with, sponsored by, or endorsed by Google LLC.
+    </p>
+
+    <h2>2. Information Collection and Use (Zero Off-Device Collection)</h2>
+    <p>
+      <strong>Friction Ventures does not collect, transmit, store, share, or sell any personal data, authentication credentials, browsing history, or device telemetry.</strong>
+    </p>
+    <ul>
+      <li><strong>No Developer Backend:</strong> The application operates no backend servers or external APIs controlled by Friction Ventures.</li>
+      <li><strong>No Analytics or Advertising SDKs:</strong> The application contains no third-party analytics, crash-reporting, tracking, or advertising SDKs, and does not access the Android Advertising ID (<code>AD_ID</code>).</li>
+      <li><strong>Direct HTTPS Communication:</strong> All network requests occur directly over encrypted HTTPS (<code>TLS 1.2+</code> / <code>TLS 1.3</code>) between your device's system WebView (Android System WebView / iOS <code>WKWebView</code>) and Google's servers (<code>antigravity.google.com</code>, <code>accounts.google.com</code>, and regional Google authentication endpoints). Your interaction with Google services is governed by the <a href="https://policies.google.com/privacy" rel="noopener noreferrer">Google Privacy Policy</a>.</li>
+    </ul>
+
+    <h2>3. On-Device Session &amp; Cookie Storage</h2>
+    <p>To keep you signed in across app restarts and support <code>/remote-control</code> session handoff links:</p>
+    <ul>
+      <li><strong>Android:</strong> Session cookies are stored locally on your device inside the application's private Android System WebView database (<code>app_webview</code>). Cloud backup (<code>android:allowBackup="false"</code>) and device-to-device transfer are explicitly disabled in the Android manifest and data extraction rules.</li>
+      <li><strong>iOS:</strong> Eligible session cookies and the last visited <code>antigravity.google.com</code> session URL are stored locally on your device inside the iOS Keychain using <code>expo-secure-store</code> (<code>AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY</code>), which is excluded from iCloud backups.</li>
+    </ul>
+
+    <h2>4. Data Deletion &amp; User Control</h2>
+    <p>You have full control over all locally stored session data at any time:</p>
+    <ol>
+      <li><strong>In-App Sign Out:</strong> Tap the floating <strong>Remote</strong> button in the bottom-right corner, select <strong>Sign Out of Google Account</strong>, and tap <strong>Confirm Sign Out</strong>. This immediately unmounts the WebView and deletes all saved cookies, DOM storage, WebView cache, and Keychain/SecureStore snapshots from your device.</li>
+      <li><strong>Operating System Settings:</strong> Clearing storage or uninstalling <strong>Antigravity Remote</strong> through your Android or iOS system settings permanently deletes all local application data from your device.</li>
+    </ol>
+
+    <h2>5. Permissions</h2>
+    <p>
+      Antigravity Remote requests only standard network access (<code>android.permission.INTERNET</code>) required to load <code>https://antigravity.google.com</code>. It does not request access to your camera, microphone, contacts, location, photos, or external storage.
+    </p>
+
+    <h2>6. Changes to This Privacy Policy</h2>
+    <p>
+      If we update this Privacy Policy, we will publish the updated version on this page and in the public source repository at <a href="https://github.com/marcus-friction/antigravity-remote" rel="noopener noreferrer">github.com/marcus-friction/antigravity-remote</a> with an updated Effective Date.
+    </p>
+
+    <h2>7. Contact Us</h2>
+    <p>
+      If you have any questions about this Privacy Policy or the security practices of Antigravity Remote, contact us at <a href="mailto:antigravity-remote@frictionventures.com">antigravity-remote@frictionventures.com</a>.
+    </p>
+
+    <footer>
+      <p><a href="./index.html">Antigravity Remote Home</a> • <a href="https://github.com/marcus-friction/antigravity-remote" rel="noopener noreferrer">GitHub Repository (MIT License)</a></p>
+    </footer>
+  </main>
+</body>
+</html>

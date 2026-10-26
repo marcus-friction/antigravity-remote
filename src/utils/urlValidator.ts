@@ -1,5 +1,4 @@
 import {
-  ALLOWED_IN_APP_DOMAIN_SUFFIXES,
   ALLOWED_IN_APP_HOSTS,
   ANTIGRAVITY_DASHBOARD_URL,
   CUSTOM_APP_SCHEME,
@@ -31,8 +30,33 @@ const MAX_NAVIGATION_URL_LENGTH = 65536;
  * redirects (e.g., `www.google.de`, `accounts.google.de`, `www.google.co.uk`,
  * `www.google.ch`, `www.google.at`, `www.google.com.au`).
  */
-const REGIONAL_GOOGLE_HOST_PATTERN =
-  /^(?:[a-z0-9-]+\.)?google\.(?:[a-z]{2,3}|co\.[a-z]{2}|com\.[a-z]{2})$/i;
+// Enumerate the regions used by the supported account flow. Do not infer Google
+// ownership from arbitrary TLDs, or admit arbitrary subdomains of these domains.
+const GOOGLE_REGIONS = new Set([
+  'com',
+  'de',
+  'ch',
+  'at',
+  'fr',
+  'it',
+  'es',
+  'nl',
+  'be',
+  'ca',
+  'co.uk',
+  'com.au',
+  'co.nz',
+  'co.jp',
+  'co.in',
+  'com.br',
+]);
+
+function isGoogleAccountHost(hostname: string): boolean {
+  return (
+    hostname.startsWith('accounts.google.') &&
+    GOOGLE_REGIONS.has(hostname.slice('accounts.google.'.length))
+  );
+}
 
 const REGIONAL_GOOGLE_AUTH_PATH_PREFIXES: readonly string[] = [
   '/accounts/',
@@ -42,8 +66,12 @@ const REGIONAL_GOOGLE_AUTH_PATH_PREFIXES: readonly string[] = [
   '/v3/signin/',
 ];
 
-function isAllowedRegionalGoogleUrl(hostname: string, pathname: string): boolean {
-  if (!REGIONAL_GOOGLE_HOST_PATTERN.test(hostname)) {
+function isAllowedRegionalGoogleUrl(
+  hostname: string,
+  pathname: string,
+): boolean {
+  const match = /^(?:(www|accounts)\.)?google\.(.+)$/.exec(hostname);
+  if (!match || !GOOGLE_REGIONS.has(match[2])) {
     return false;
   }
   if (hostname.startsWith('accounts.google.')) {
@@ -51,7 +79,7 @@ function isAllowedRegionalGoogleUrl(hostname: string, pathname: string): boolean
   }
   const lowerPath = pathname.toLowerCase();
   return REGIONAL_GOOGLE_AUTH_PATH_PREFIXES.some((prefix) =>
-    lowerPath.startsWith(prefix)
+    prefix.endsWith('/') ? lowerPath.startsWith(prefix) : lowerPath === prefix,
   );
 }
 
@@ -64,11 +92,27 @@ export function isInternalWebViewSchemeUrl(rawUrl: string): boolean {
     return false;
   }
   const lower = rawUrl.trim().toLowerCase();
-  return (
+  if (
     lower === 'about:blank' ||
     lower === 'about:srcdoc' ||
-    lower.startsWith('about:blank#') ||
-    lower.startsWith('blob:https://')
+    lower.startsWith('about:blank#')
+  )
+    return true;
+  if (!lower.startsWith('blob:')) return false;
+  return validateNavigationUrl(rawUrl.trim().slice(5)).isAllowedInApp;
+}
+
+/** Authentication challenges may embed these documents without granting them top-level trust. */
+export function isAllowedAuthSubframeUrl(rawUrl: string): boolean {
+  const validation = validateNavigationUrl(rawUrl);
+  if (!validation.isValid || !validation.normalizedUrl) return false;
+  const parsed = new URL(validation.normalizedUrl);
+  return (
+    !parsed.port &&
+    ['www.google.com', 'www.recaptcha.net', 'www.gstatic.com'].includes(
+      parsed.hostname,
+    ) &&
+    parsed.pathname.startsWith('/recaptcha/')
   );
 }
 
@@ -133,12 +177,12 @@ export function validateNavigationUrl(rawUrl: string): UrlValidationResult {
 
   const hostname = parsed.hostname.toLowerCase();
   const isAllowedInApp =
-    ALLOWED_IN_APP_HOSTS.has(hostname) ||
-    ALLOWED_IN_APP_DOMAIN_SUFFIXES.some((suffix) => hostname.endsWith(suffix)) ||
-    isAllowedRegionalGoogleUrl(hostname, parsed.pathname);
+    !parsed.port &&
+    (ALLOWED_IN_APP_HOSTS.has(hostname) ||
+      isAllowedRegionalGoogleUrl(hostname, parsed.pathname));
   const isAuthHost =
-    GOOGLE_AUTH_HOSTS.has(hostname) ||
-    hostname.startsWith('accounts.google.');
+    isAllowedInApp &&
+    (GOOGLE_AUTH_HOSTS.has(hostname) || isGoogleAccountHost(hostname));
 
   return {
     isValid: true,
@@ -160,16 +204,12 @@ export function isGoogleCookieErrorUrl(rawUrl: string): boolean {
   try {
     const parsed = new URL(rawUrl.trim());
     const hostname = parsed.hostname.toLowerCase();
-    if (
-      hostname !== 'accounts.google.com' &&
-      !hostname.endsWith('.google.com')
-    ) {
+    const validation = validateNavigationUrl(rawUrl);
+    if (!validation.isAllowedInApp || !isGoogleAccountHost(hostname)) {
       return false;
     }
-    const lowerPathAndQuery = `${parsed.pathname}${parsed.search}`.toLowerCase();
-    return (
-      lowerPathAndQuery.includes('cookiemismatch') ||
-      lowerPathAndQuery.includes('/nocookie')
+    return /^(?:\/v3\/signin)?\/(?:cookiemismatch|nocookie)\/?$/i.test(
+      parsed.pathname,
     );
   } catch {
     return false;
@@ -198,7 +238,9 @@ export function parseHandoffInput(rawInput: string): string | null {
 
   // Case 1: Custom scheme deep link `antigravity-remote://...`
   if (trimmed.toLowerCase().startsWith(CUSTOM_APP_SCHEME)) {
-    const remainder = trimmed.slice(CUSTOM_APP_SCHEME.length).replace(/^\/+/, '');
+    const remainder = trimmed
+      .slice(CUSTOM_APP_SCHEME.length)
+      .replace(/^\/+/, '');
     if (!remainder) {
       return ANTIGRAVITY_DASHBOARD_URL;
     }

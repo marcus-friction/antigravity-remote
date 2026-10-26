@@ -1,3 +1,4 @@
+import * as Linking from 'expo-linking';
 import React, { useState } from 'react';
 import {
   KeyboardAvoidingView,
@@ -10,7 +11,11 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import { ANTIGRAVITY_DASHBOARD_URL } from '../constants/config';
+import {
+  ANTIGRAVITY_DASHBOARD_URL,
+  PRIVACY_POLICY_URL,
+  SOURCE_REPO_URL,
+} from '../constants/config';
 import { AuthFlowStage } from '../types/session';
 import { parseHandoffInput } from '../utils/urlValidator';
 
@@ -47,7 +52,7 @@ export const HandoffModal: React.FC<HandoffModalProps> = ({
     const parsedUrl = parseHandoffInput(handoffText);
     if (!parsedUrl) {
       setValidationError(
-        'Enter a valid antigravity.google.com/r/<instance-id> link or instance name.'
+        'Enter a valid antigravity.google.com/r/<instance-id> link or instance name.',
       );
       return;
     }
@@ -76,7 +81,7 @@ export const HandoffModal: React.FC<HandoffModalProps> = ({
 
   const statusText =
     stage === 'authenticated'
-      ? `Google session active (${lastSyncedCookieCount} cookies vaulted in hardware keystore)`
+      ? `Session active (${lastSyncedCookieCount} cookies on this device)`
       : stage === 'authenticating'
         ? 'Google Sign-In in progress'
         : 'Waiting for connection';
@@ -205,13 +210,41 @@ export const HandoffModal: React.FC<HandoffModalProps> = ({
                   onPress={handleConfirmSignOut}
                   accessibilityRole="button"
                 >
-                  <Text style={styles.confirmDangerText}>
-                    Confirm Sign Out
-                  </Text>
+                  <Text style={styles.confirmDangerText}>Confirm Sign Out</Text>
                 </TouchableOpacity>
               </View>
             </View>
           )}
+
+          <View style={styles.footerContainer}>
+            <View style={styles.footerLinksRow}>
+              <TouchableOpacity
+                onPress={() =>
+                  void Linking.openURL(PRIVACY_POLICY_URL).catch(
+                    () => undefined,
+                  )
+                }
+                accessibilityRole="link"
+                accessibilityLabel="Privacy Policy"
+              >
+                <Text style={styles.footerLinkText}>Privacy Policy</Text>
+              </TouchableOpacity>
+              <Text style={styles.footerSeparator}>•</Text>
+              <TouchableOpacity
+                onPress={() =>
+                  void Linking.openURL(SOURCE_REPO_URL).catch(() => undefined)
+                }
+                accessibilityRole="link"
+                accessibilityLabel="Open Source Repository"
+              >
+                <Text style={styles.footerLinkText}>Open Source (MIT)</Text>
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.footerDisclaimerText}>
+              Independent client wrapper by Friction Ventures • Not affiliated
+              with Google LLC
+            </Text>
+          </View>
         </View>
       </KeyboardAvoidingView>
     </Modal>
@@ -405,5 +438,33 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 13,
     fontWeight: '700',
+  },
+  footerContainer: {
+    marginTop: 16,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#1E293B',
+    alignItems: 'center',
+  },
+  footerLinksRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    marginBottom: 4,
+  },
+  footerLinkText: {
+    color: '#93C5FD',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  footerSeparator: {
+    color: '#475569',
+    fontSize: 12,
+  },
+  footerDisclaimerText: {
+    color: '#64748B',
+    fontSize: 11,
+    textAlign: 'center',
   },
 });

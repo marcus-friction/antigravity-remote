@@ -1,0 +1,5 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": { "modules": ["RemoteSessionModule"] },
+  "android": { "modules": ["expo.modules.remotesession.RemoteSessionModule"] }
+}

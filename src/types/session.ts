@@ -10,7 +10,8 @@ export interface PersistedCookieRecord {
 }
 
 export interface CookieVaultMetadata {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
+  slot?: 'a' | 'b';
   chunkCount: number;
   updatedAtIso: string;
   cookieCount: number;

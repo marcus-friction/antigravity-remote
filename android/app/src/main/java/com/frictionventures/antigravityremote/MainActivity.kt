@@ -2,9 +2,6 @@ package com.frictionventures.antigravityremote
 
 import android.os.Build
 import android.os.Bundle
-import android.view.View
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsCompat
 
 import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate
@@ -21,21 +18,13 @@ class MainActivity : ReactActivity() {
     setTheme(R.style.AppTheme);
     super.onCreate(null)
 
-    // On Android 15+ (targetSdk 35/36), edge-to-edge enforcement disables legacy
-    // adjustResize unless IME window insets are explicitly applied to the content view.
-    val contentView = findViewById<View>(android.R.id.content)
-    if (contentView != null) {
-      ViewCompat.setOnApplyWindowInsetsListener(contentView) { view, windowInsets ->
-        val imeInsets = windowInsets.getInsets(WindowInsetsCompat.Type.ime())
-        val systemBarInsets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-        val imeBottomPadding = if (imeInsets.bottom > systemBarInsets.bottom) {
-          imeInsets.bottom - systemBarInsets.bottom
-        } else {
-          0
-        }
-        view.setPadding(0, 0, 0, imeBottomPadding)
-        windowInsets
-      }
+    // Antigravity IME insets
+    val contentView = findViewById<android.view.View>(android.R.id.content)
+    androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(contentView) { view, insets ->
+      val ime = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.ime())
+      val bars = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+      view.setPadding(0, 0, 0, (ime.bottom - bars.bottom).coerceAtLeast(0))
+      insets
     }
   }
 

@@ -6,7 +6,8 @@ import {
 
 /**
  * Returns a clean, platform-matched mobile browser User-Agent string
- * that avoids Google's `403: disallowed_useragent` block on embedded WebViews.
+ * for compatibility with mobile pages. Embedded authentication support is
+ * controlled by Google and cannot be guaranteed by a User-Agent override.
  */
 export function getCleanMobileUserAgent(os: string = Platform.OS): string {
   if (os === 'ios') {

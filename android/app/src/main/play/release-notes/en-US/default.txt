@@ -1,0 +1,4 @@
+• Added in-app Privacy Policy and Open Source (MIT) repository links in Remote controls.
+• Upgraded to Expo SDK 55 / React Native 0.83 with 16 KB page-size native library compatibility.
+• Hardened sign-out cleanup using the native RemoteSession browsing-data module and atomic session vault queue.
+• Improved Google 2-Step Verification and regional cookie-sync redirect handling.

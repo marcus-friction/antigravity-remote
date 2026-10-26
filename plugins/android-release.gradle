@@ -1,0 +1,44 @@
+// Applied by withRemoteSecurity after the generated application build file.
+def credentials = new Properties()
+def credentialsFile = rootProject.file('keystore.properties')
+if (credentialsFile.exists()) credentialsFile.withInputStream { credentials.load(it) }
+
+android {
+    signingConfigs {
+        release {
+            def location = System.getenv('ANDROID_KEYSTORE_FILE') ?: credentials['storeFile']
+            if (location) storeFile file(location)
+            storePassword System.getenv('ANDROID_KEYSTORE_PASSWORD') ?: credentials['storePassword'] ?: storePassword
+            keyAlias System.getenv('ANDROID_KEY_ALIAS') ?: credentials['keyAlias'] ?: keyAlias
+            keyPassword System.getenv('ANDROID_KEY_PASSWORD') ?: credentials['keyPassword'] ?: keyPassword
+        }
+    }
+    buildTypes.release {
+        signingConfig signingConfigs.release
+        minifyEnabled true
+        shrinkResources true
+    }
+}
+
+gradle.taskGraph.whenReady { graph ->
+    if (graph.allTasks.any { it.project == project && it.name.toLowerCase().contains('release') }) {
+        def signing = android.signingConfigs.release
+        if (!signing.storeFile?.isFile() || !signing.storePassword || !signing.keyAlias || !signing.keyPassword) {
+            throw new GradleException('Release signing credentials are required. Configure android/keystore.properties or ANDROID_KEYSTORE_* and ANDROID_KEY_* variables.')
+        }
+    }
+}
+
+def publisherCredentials = System.getenv('PLAY_SERVICE_ACCOUNT_JSON')
+    ? file(System.getenv('PLAY_SERVICE_ACCOUNT_JSON')) : rootProject.file('play-service-account.json')
+if (publisherCredentials.exists()) {
+    apply plugin: 'com.github.triplet.play'
+    def targetTrack = (System.getenv('PLAY_TRACK') ?: findProperty('playTrack') ?: 'internal').toString().trim()
+    def statusName = (System.getenv('PLAY_RELEASE_STATUS') ?: findProperty('playReleaseStatus') ?: 'COMPLETED').toString().trim().toUpperCase()
+    play {
+        serviceAccountCredentials.set(publisherCredentials)
+        track.set(targetTrack)
+        defaultToAppBundles.set(true)
+        releaseStatus.set(com.github.triplet.gradle.androidpublisher.ReleaseStatus.valueOf(statusName))
+    }
+}

@@ -2,26 +2,23 @@
   "expo": {
     "name": "Antigravity Remote",
     "slug": "antigravity-remote",
-    "version": "1.0.4",
+    "version": "1.0.5",
     "orientation": "default",
     "icon": "./assets/icon.png",
     "scheme": "antigravity-remote",
     "userInterfaceStyle": "dark",
     "backgroundColor": "#0B0F17",
-    "newArchEnabled": false,
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.frictionventures.antigravity-remote",
-      "associatedDomains": [
-        "applinks:antigravity.google.com"
-      ],
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
       "package": "com.frictionventures.antigravityremote",
-      "versionCode": 5,
+      "allowBackup": false,
+      "versionCode": 6,
       "blockedPermissions": [
         "android.permission.SYSTEM_ALERT_WINDOW",
         "android.permission.READ_EXTERNAL_STORAGE",
@@ -31,29 +28,7 @@
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#121417"
-      },
-      "intentFilters": [
-        {
-          "action": "VIEW",
-          "autoVerify": true,
-          "data": [
-            {
-              "scheme": "https",
-              "host": "antigravity.google.com",
-              "pathPrefix": "/r/"
-            },
-            {
-              "scheme": "https",
-              "host": "antigravity.google.com",
-              "pathPrefix": "/"
-            }
-          ],
-          "category": [
-            "BROWSABLE",
-            "DEFAULT"
-          ]
-        }
-      ]
+      }
     },
     "plugins": [
       [
@@ -63,7 +38,9 @@
           "faceIDPermission": "Allow Antigravity Remote to securely access your persisted session cookies."
         }
       ],
-      "expo-asset"
+      "expo-asset",
+      "expo-system-ui",
+      "./plugins/withRemoteSecurity"
     ]
   }
 }

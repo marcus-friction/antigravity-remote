@@ -1,0 +1,12 @@
+{
+  "GHSA-86w9-cpqp-85rv": {
+    "reviewBy": "2026-11-26",
+    "package": "node-forge",
+    "reason": "Latest published version is affected. Exposure is Expo CLI certificate/development signing tooling; this app has no OTA signing or untrusted certificate input. See SECURITY.md before changing that boundary."
+  },
+  "GHSA-mrhx-c7xc-m3w5": {
+    "reviewBy": "2026-11-26",
+    "package": "zod",
+    "reason": "Expo CLI 55 uses Zod 3 for local developer-tool extension metadata and MCP schemas. No extensions/MCP server are configured; the patched Zod 4 major requires upstream compatibility work. See SECURITY.md."
+  }
+}
