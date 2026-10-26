@@ -33,12 +33,16 @@ def publisherCredentials = System.getenv('PLAY_SERVICE_ACCOUNT_JSON')
     ? file(System.getenv('PLAY_SERVICE_ACCOUNT_JSON')) : rootProject.file('play-service-account.json')
 if (publisherCredentials.exists()) {
     apply plugin: 'com.github.triplet.play'
+    // Applied scripts do not inherit the publisher plugin's dependency classes.
+    def statusType = plugins.getPlugin('com.github.triplet.play').getClass().getClassLoader().loadClass(
+        'com.github.triplet.gradle.androidpublisher.ReleaseStatus'
+    )
     def targetTrack = (System.getenv('PLAY_TRACK') ?: findProperty('playTrack') ?: 'internal').toString().trim()
     def statusName = (System.getenv('PLAY_RELEASE_STATUS') ?: findProperty('playReleaseStatus') ?: 'COMPLETED').toString().trim().toUpperCase()
     play {
         serviceAccountCredentials.set(publisherCredentials)
         track.set(targetTrack)
         defaultToAppBundles.set(true)
-        releaseStatus.set(com.github.triplet.gradle.androidpublisher.ReleaseStatus.valueOf(statusName))
+        releaseStatus.set(Enum.valueOf(statusType, statusName))
     }
 }
