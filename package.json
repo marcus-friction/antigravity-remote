@@ -1,24 +1,22 @@
 {
   "name": "antigravity-remote",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "license": "MIT",
   "private": true,
   "main": "index.ts",
   "scripts": {
-    "postinstall": "node scripts/patch-build-tools.js",
-    "start": "node scripts/patch-build-tools.js --check && expo start --localhost",
-    "android": "node scripts/patch-build-tools.js --check && expo run:android",
-    "ios": "node scripts/patch-build-tools.js --check && expo run:ios",
-    "web": "node scripts/patch-build-tools.js --check && expo start --web",
-    "prebuild": "node scripts/patch-build-tools.js --check && expo prebuild",
-    "build:play-aab": "node scripts/patch-build-tools.js --check && node scripts/check-native.js && cd android && ./gradlew bundleRelease && python3 ../scripts/check-16kb.py app/build/outputs/bundle/release/app-release.aab",
+    "start": "expo start --localhost",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "web": "expo start --web",
+    "prebuild": "expo prebuild",
+    "build:play-aab": "node scripts/check-native.js && cd android && ./gradlew bundleRelease && python3 ../scripts/check-16kb.py app/build/outputs/bundle/release/app-release.aab",
     "publish:play-internal": "npm run build:play-aab && cd android && ./gradlew publishReleaseBundle",
     "publish:play-production": "npm run build:play-aab && cd android && PLAY_TRACK=production ./gradlew publishReleaseListing publishReleaseBundle",
     "typecheck": "tsc --noEmit",
     "test": "jest",
     "test:prebuild": "node scripts/test-prebuild.js",
-    "audit:dependencies": "node scripts/audit-dependencies.js",
-    "check:build-tools": "node scripts/patch-build-tools.js --check",
+    "audit:dependencies": "npm audit --include=dev --include=optional --include=peer",
     "check:native": "node scripts/check-native.js",
     "check:16kb": "python3 scripts/check-16kb.py"
   },
@@ -51,7 +49,6 @@
   "overrides": {
     "@expo/cli": {
       "zod": "4.6.7"
-    },
-    "node-forge": "1.4.0"
+    }
   }
 }

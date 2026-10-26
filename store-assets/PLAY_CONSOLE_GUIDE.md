@@ -1,6 +1,6 @@
 # Google Play Console — Production Release Checklist & Copy-Paste Guide
 
-Use the answers below to complete the mandatory **Monitor and improve → Policy and programs → App content** declarations and **Grow users → Store presence → Main store listing** in Google Play Console before promoting **Antigravity Remote (`1.0.5 (6)`)** to **Production**.
+Use the answers below to complete the mandatory **Monitor and improve → Policy and programs → App content** declarations and **Grow users → Store presence → Main store listing** in Google Play Console before promoting **Antigravity Remote (`1.0.6 (7)`)** to **Production**.
 
 ---
 
