@@ -240,6 +240,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     if (visible) {
       setIsDraggingOpen(false);
       setIsAnimatingOut(false);
+      translateX.stopAnimation?.();
       Animated.spring(translateX, {
         toValue: 0,
         damping: 26,
@@ -250,12 +251,15 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     } else if (wasVisibleRef.current) {
       setIsDraggingOpen(false);
       setIsAnimatingOut(true);
+      translateX.stopAnimation?.();
       Animated.timing(translateX, {
         toValue: -drawerWidth,
         duration: 180,
         useNativeDriver: true,
-      }).start(() => {
-        setIsAnimatingOut(false);
+      }).start((result) => {
+        if (!result || result.finished !== false) {
+          setIsAnimatingOut(false);
+        }
       });
     } else if (!isDraggingOpen) {
       translateX.setValue(-drawerWidth);
@@ -271,59 +275,60 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
 
   const handleClose = useCallback(() => {
     resetTransientInputs();
+    setIsDraggingOpen(false);
+    setIsAnimatingOut(false);
     onClose();
   }, [onClose, resetTransientInputs]);
 
   const handleTapOpen = useCallback(() => {
     setActiveMode(defaultModeRef.current);
     const startOffset = -drawerWidthRef.current + HANDLE_ALIGNMENT_OFFSET;
+    translateX.stopAnimation?.();
     translateX.setValue(startOffset);
     onOpen();
   }, [onOpen, translateX]);
 
-  // Pull-right gesture on the closed handle strip (starts 22dp inside the screen
+  // Pull-right gesture on the closed handle strip (starts 20dp inside the screen
   // bezel so iOS and Android edge-back gestures at 0..20dp are never triggered).
-  const closedHandlePanResponder = useMemo(
-    () =>
-      PanResponder.create({
-        onStartShouldSetPanResponder: () => false,
-        onMoveShouldSetPanResponder: (_evt, gestureState) =>
-          gestureState.dx > 6 &&
-          Math.abs(gestureState.dx) > Math.abs(gestureState.dy) * 1.15,
-        onPanResponderGrant: () => {
-          setActiveMode(defaultModeRef.current);
-          const width = drawerWidthRef.current;
-          translateX.setValue(-width + HANDLE_ALIGNMENT_OFFSET);
-          setIsDraggingOpen(true);
-        },
-        onPanResponderMove: (_evt, gestureState) => {
-          const width = drawerWidthRef.current;
-          const clampedX = Math.max(
-            -width,
-            Math.min(0, -width + HANDLE_ALIGNMENT_OFFSET + gestureState.dx),
-          );
-          translateX.setValue(clampedX);
-        },
-        onPanResponderRelease: (_evt, gestureState) => {
-          const width = drawerWidthRef.current;
-          const shouldOpen =
-            gestureState.dx > width * 0.24 ||
-            (gestureState.dx > 22 && gestureState.vx > 0.35);
-          if (shouldOpen) {
-            setIsDraggingOpen(false);
-            onOpen();
-          } else {
-            Animated.timing(translateX, {
-              toValue: -width,
-              duration: 150,
-              useNativeDriver: true,
-            }).start(() => {
-              setIsDraggingOpen(false);
-            });
-          }
-        },
-        onPanResponderTerminate: () => {
-          const width = drawerWidthRef.current;
+  // Capture-phase takeover lets horizontal drags take responder ownership from
+  // the inner TouchableOpacity while preserving simple taps.
+  const closedHandlePanResponder = useMemo(() => {
+    const shouldClaimPullRight = (gestureState: { dx: number; dy: number }) =>
+      gestureState.dx > 6 &&
+      Math.abs(gestureState.dx) > Math.abs(gestureState.dy) * 1.15;
+
+    return PanResponder.create({
+      onStartShouldSetPanResponder: () => false,
+      onStartShouldSetPanResponderCapture: () => false,
+      onMoveShouldSetPanResponder: (_evt, gestureState) =>
+        shouldClaimPullRight(gestureState),
+      onMoveShouldSetPanResponderCapture: (_evt, gestureState) =>
+        shouldClaimPullRight(gestureState),
+      onPanResponderTerminationRequest: () => false,
+      onPanResponderGrant: () => {
+        translateX.stopAnimation?.();
+        setActiveMode(defaultModeRef.current);
+        const width = drawerWidthRef.current;
+        translateX.setValue(-width + HANDLE_ALIGNMENT_OFFSET);
+        setIsDraggingOpen(true);
+      },
+      onPanResponderMove: (_evt, gestureState) => {
+        const width = drawerWidthRef.current;
+        const clampedX = Math.max(
+          -width,
+          Math.min(0, -width + HANDLE_ALIGNMENT_OFFSET + gestureState.dx),
+        );
+        translateX.setValue(clampedX);
+      },
+      onPanResponderRelease: (_evt, gestureState) => {
+        const width = drawerWidthRef.current;
+        const shouldOpen =
+          gestureState.dx > width * 0.24 ||
+          (gestureState.dx > 22 && gestureState.vx > 0.35);
+        if (shouldOpen) {
+          setIsDraggingOpen(false);
+          onOpen();
+        } else {
           Animated.timing(translateX, {
             toValue: -width,
             duration: 150,
@@ -331,42 +336,51 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
           }).start(() => {
             setIsDraggingOpen(false);
           });
-        },
-      }),
-    [onOpen, translateX],
-  );
+        }
+      },
+      onPanResponderTerminate: () => {
+        const width = drawerWidthRef.current;
+        Animated.timing(translateX, {
+          toValue: -width,
+          duration: 150,
+          useNativeDriver: true,
+        }).start(() => {
+          setIsDraggingOpen(false);
+        });
+      },
+    });
+  }, [onOpen, translateX]);
 
   // Push/swipe-left gesture on the open drawer or its inner-right handle line.
-  const openDrawerPanResponder = useMemo(
-    () =>
-      PanResponder.create({
-        onStartShouldSetPanResponder: () => false,
-        onMoveShouldSetPanResponder: (_evt, gestureState) =>
-          gestureState.dx < -8 &&
-          Math.abs(gestureState.dx) > Math.abs(gestureState.dy) * 1.2,
-        onPanResponderMove: (_evt, gestureState) => {
-          const width = drawerWidthRef.current;
-          const clampedX = Math.max(-width, Math.min(0, gestureState.dx));
-          translateX.setValue(clampedX);
-        },
-        onPanResponderRelease: (_evt, gestureState) => {
-          const width = drawerWidthRef.current;
-          const shouldClose =
-            gestureState.dx < -width * 0.22 ||
-            (gestureState.dx < -20 && gestureState.vx < -0.35);
-          if (shouldClose) {
-            handleClose();
-          } else {
-            Animated.spring(translateX, {
-              toValue: 0,
-              damping: 26,
-              stiffness: 280,
-              mass: 0.9,
-              useNativeDriver: true,
-            }).start();
-          }
-        },
-        onPanResponderTerminate: () => {
+  const openDrawerPanResponder = useMemo(() => {
+    const shouldClaimSwipeLeft = (gestureState: { dx: number; dy: number }) =>
+      gestureState.dx < -8 &&
+      Math.abs(gestureState.dx) > Math.abs(gestureState.dy) * 1.2;
+
+    return PanResponder.create({
+      onStartShouldSetPanResponder: () => false,
+      onStartShouldSetPanResponderCapture: () => false,
+      onMoveShouldSetPanResponder: (_evt, gestureState) =>
+        shouldClaimSwipeLeft(gestureState),
+      onMoveShouldSetPanResponderCapture: (_evt, gestureState) =>
+        shouldClaimSwipeLeft(gestureState),
+      onPanResponderTerminationRequest: () => false,
+      onPanResponderGrant: () => {
+        translateX.stopAnimation?.();
+      },
+      onPanResponderMove: (_evt, gestureState) => {
+        const width = drawerWidthRef.current;
+        const clampedX = Math.max(-width, Math.min(0, gestureState.dx));
+        translateX.setValue(clampedX);
+      },
+      onPanResponderRelease: (_evt, gestureState) => {
+        const width = drawerWidthRef.current;
+        const shouldClose =
+          gestureState.dx < -width * 0.22 ||
+          (gestureState.dx < -20 && gestureState.vx < -0.35);
+        if (shouldClose) {
+          handleClose();
+        } else {
           Animated.spring(translateX, {
             toValue: 0,
             damping: 26,
@@ -374,10 +388,19 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
             mass: 0.9,
             useNativeDriver: true,
           }).start();
-        },
-      }),
-    [handleClose, translateX],
-  );
+        }
+      },
+      onPanResponderTerminate: () => {
+        Animated.spring(translateX, {
+          toValue: 0,
+          damping: 26,
+          stiffness: 280,
+          mass: 0.9,
+          useNativeDriver: true,
+        }).start();
+      },
+    });
+  }, [handleClose, translateX]);
 
   const connectedInstances = useMemo(
     () => snapshot.instances.filter((inst) => inst.status === 'connected'),
@@ -516,15 +539,19 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
 
   const isDrawerRendered = visible || isDraggingOpen || isAnimatingOut;
 
+  const backdropOpacity = useMemo(
+    () =>
+      translateX.interpolate({
+        inputRange: [-drawerWidth, 0],
+        outputRange: [0, 1],
+        extrapolate: 'clamp',
+      }),
+    [drawerWidth, translateX],
+  );
+
   if (!isDrawerRendered && isKeyboardVisible) {
     return null;
   }
-
-  const backdropOpacity = translateX.interpolate({
-    inputRange: [-drawerWidth, 0],
-    outputRange: [0, 1],
-    extrapolate: 'clamp',
-  });
 
   const badgeCountLabel =
     attentionCount > 99
@@ -540,37 +567,11 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
 
   return (
     <View style={styles.overlayRoot} pointerEvents="box-none">
-      {!isDrawerRendered ? (
+      {isDrawerRendered ? (
         <View
-          style={styles.closedHandleZone}
-          {...closedHandlePanResponder.panHandlers}
+          style={styles.openOverlay}
+          pointerEvents={visible ? 'auto' : 'none'}
         >
-          <TouchableOpacity
-            style={styles.closedHandleButton}
-            activeOpacity={0.8}
-            onPress={handleTapOpen}
-            accessibilityRole="button"
-            accessibilityLabel="Open Antigravity drawer"
-            accessibilityHint={closedHandleAccessibilityLabel}
-          >
-            <View
-              style={[
-                styles.handleLine,
-                { backgroundColor: handleVisuals.lineColor },
-                handleVisuals.glowColor
-                  ? {
-                      shadowColor: handleVisuals.glowColor,
-                      shadowOpacity: 0.7,
-                      shadowRadius: 7,
-                      elevation: 5,
-                    }
-                  : null,
-              ]}
-            />
-          </TouchableOpacity>
-        </View>
-      ) : (
-        <View style={styles.openOverlay}>
           <Animated.View
             style={[styles.backdrop, { opacity: backdropOpacity }]}
           >
@@ -1270,7 +1271,45 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
             </TouchableOpacity>
           </Animated.View>
         </View>
-      )}
+      ) : null}
+
+      <View
+        style={[
+          styles.closedHandleZone,
+          isDrawerRendered ? styles.closedHandleZoneHidden : null,
+        ]}
+        pointerEvents={visible && !isDraggingOpen ? 'none' : 'auto'}
+        importantForAccessibility={
+          isDrawerRendered ? 'no-hide-descendants' : 'auto'
+        }
+        {...closedHandlePanResponder.panHandlers}
+      >
+        {!visible || isDraggingOpen ? (
+          <TouchableOpacity
+            style={styles.closedHandleButton}
+            activeOpacity={0.8}
+            onPress={handleTapOpen}
+            accessibilityRole="button"
+            accessibilityLabel="Open Antigravity drawer"
+            accessibilityHint={closedHandleAccessibilityLabel}
+          >
+            <View
+              style={[
+                styles.handleLine,
+                { backgroundColor: handleVisuals.lineColor },
+                handleVisuals.glowColor
+                  ? {
+                      shadowColor: handleVisuals.glowColor,
+                      shadowOpacity: 0.7,
+                      shadowRadius: 7,
+                      elevation: 5,
+                    }
+                  : null,
+              ]}
+            />
+          </TouchableOpacity>
+        ) : null}
+      </View>
     </View>
   );
 };
@@ -1289,6 +1328,9 @@ const styles = StyleSheet.create({
     height: HANDLE_TOUCH_ZONE_HEIGHT,
     justifyContent: 'center',
   },
+  closedHandleZoneHidden: {
+    opacity: 0,
+  },
   closedHandleButton: {
     flex: 1,
     paddingLeft: CLOSED_HANDLE_BAR_INSET,
@@ -1302,7 +1344,7 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 0 },
   },
   openOverlay: {
-    flex: 1,
+    ...StyleSheet.absoluteFillObject,
   },
   backdrop: {
     ...StyleSheet.absoluteFillObject,

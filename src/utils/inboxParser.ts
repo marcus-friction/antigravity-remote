@@ -423,17 +423,51 @@ function unwrapTrajectoryMap(
   return result;
 }
 
+function extractPreservedHostQueryParams(
+  rawUrl?: string | null,
+): Record<string, string> {
+  if (!rawUrl || typeof rawUrl !== 'string') {
+    return {};
+  }
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.hostname.toLowerCase() !== 'antigravity.google.com') {
+      return {};
+    }
+    const preserved: Record<string, string> = {};
+    const authuser = parsed.searchParams.get('authuser');
+    if (authuser && /^\d+$/.test(authuser)) {
+      preserved.authuser = authuser;
+    }
+    if (parsed.searchParams.get('enableBusinessSignIn') === 'true') {
+      preserved.enableBusinessSignIn = 'true';
+    }
+    return preserved;
+  } catch {
+    return {};
+  }
+}
+
 function buildVerifiedTargetUrl(
   source: 'remote-control' | 'cloud',
   instanceUuid: string,
   cascadeId: string,
   accountPrefix: string,
+  preservedQueryParams: Readonly<Record<string, string>> = {},
 ): { targetUrl: string; childPath: string } | null {
   const childPath = `c/${cascadeId}`;
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(preservedQueryParams)) {
+    query.set(key, value);
+  }
+  if (source !== 'cloud') {
+    query.set('p', childPath);
+  }
+  const querySuffix = query.toString() ? `?${query.toString()}` : '';
   const candidateUrl =
     source === 'cloud'
-      ? `${ANTIGRAVITY_DASHBOARD_URL}${accountPrefix}/remote/c/${encodeURIComponent(cascadeId)}`
-      : `${ANTIGRAVITY_DASHBOARD_URL}${accountPrefix}/r/${encodeURIComponent(instanceUuid)}?p=${encodeURIComponent(childPath)}`;
+      ? `${ANTIGRAVITY_DASHBOARD_URL}${accountPrefix}/remote/c/${encodeURIComponent(cascadeId)}${querySuffix}`
+      : `${ANTIGRAVITY_DASHBOARD_URL}${accountPrefix}/r/${encodeURIComponent(instanceUuid)}${querySuffix}`;
 
   const validation = validateNavigationUrl(candidateUrl);
   if (!validation.isValid || !validation.isAllowedInApp || !validation.normalizedUrl) {
@@ -460,6 +494,7 @@ function parseTrajectoriesForSource(params: {
   activeInstanceUuid: string | null;
   activeCascadeId: string | null;
   accountPrefix: string;
+  preservedQueryParams: Readonly<Record<string, string>>;
   locallyReadAtByThreadId: Readonly<Record<string, number>>;
 }): InboxThreadItem[] {
   const {
@@ -470,6 +505,7 @@ function parseTrajectoriesForSource(params: {
     activeInstanceUuid,
     activeCascadeId,
     accountPrefix,
+    preservedQueryParams,
     locallyReadAtByThreadId,
   } = params;
 
@@ -600,6 +636,7 @@ function parseTrajectoriesForSource(params: {
       instanceUuid,
       cascadeId,
       accountPrefix,
+      preservedQueryParams,
     );
     if (!navTarget) {
       continue;
@@ -775,6 +812,7 @@ function parseTrajectoriesForSource(params: {
       instanceUuid,
       parentCascadeId,
       accountPrefix,
+      preservedQueryParams,
     );
     if (!navTarget) {
       continue;
@@ -833,6 +871,7 @@ export function buildInboxSnapshot(
       : routeFromUrl.cascadeId;
 
   const accountPrefix = extractAccountPathPrefix(referenceUrl);
+  const preservedQueryParams = extractPreservedHostQueryParams(referenceUrl);
 
   const instances: InboxInstanceSummary[] = [];
   const allThreads: InboxThreadItem[] = [];
@@ -879,6 +918,7 @@ export function buildInboxSnapshot(
           activeInstanceUuid,
           activeCascadeId,
           accountPrefix,
+          preservedQueryParams,
           locallyReadAtByThreadId,
         }),
       );
@@ -895,6 +935,7 @@ export function buildInboxSnapshot(
         activeInstanceUuid,
         activeCascadeId,
         accountPrefix,
+        preservedQueryParams,
         locallyReadAtByThreadId,
       }),
     );

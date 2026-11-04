@@ -39,6 +39,8 @@ export const INBOX_BRIDGE_SCRIPT = `
     var activeIframeCascadeId = null;
     var activeIframeLocationHref = null;
     var hasIframeRouteOverride = false;
+    var pendingFastNav = null;
+    var FAST_NAV_CONFIRM_MS = 380;
     var refreshTimer = null;
     var inFlightRefresh = null;
 
@@ -706,12 +708,86 @@ export const INBOX_BRIDGE_SCRIPT = `
       return null;
     }
 
+    function parseJspbPayload(raw) {
+      if (Array.isArray(raw)) {
+        return raw;
+      }
+      if (typeof raw === 'string' && raw.charAt(0) === '[') {
+        try {
+          var parsed = JSON.parse(raw);
+          return Array.isArray(parsed) ? parsed : null;
+        } catch (_) {
+          return null;
+        }
+      }
+      return null;
+    }
+
+    function clearPendingFastNav() {
+      if (pendingFastNav && pendingFastNav.timer) {
+        clearTimeout(pendingFastNav.timer);
+      }
+      pendingFastNav = null;
+    }
+
+    function syncHostLocationUrl(targetUrl) {
+      if (
+        typeof targetUrl !== 'string' ||
+        !targetUrl ||
+        !window.history ||
+        typeof window.history.replaceState !== 'function'
+      ) {
+        return;
+      }
+      try {
+        var parsedTarget = new URL(targetUrl);
+        if (parsedTarget.origin === window.location.origin) {
+          window.history.replaceState(
+            window.history.state,
+            '',
+            parsedTarget.pathname + parsedTarget.search + parsedTarget.hash
+          );
+        }
+      } catch (_) {}
+    }
+
+    function completePendingFastNavIfMatched(confirmedCascadeId) {
+      if (!pendingFastNav || !confirmedCascadeId) {
+        return false;
+      }
+      if (confirmedCascadeId !== pendingFastNav.expectedCascadeId) {
+        return false;
+      }
+      var completed = pendingFastNav;
+      clearPendingFastNav();
+      syncHostLocationUrl(completed.targetUrl);
+      setIframeCascadeOverride(confirmedCascadeId);
+      postToNative({
+        type: 'AGY_INBOX_FAST_NAV_RESULT',
+        requestId: completed.requestId,
+        handled: true,
+        targetUrl: completed.targetUrl
+      });
+      postToNative({
+        type: 'AGY_INBOX_ACTIVE_ROUTE',
+        activeUrl: window.location.href,
+        activeInstanceUuid: completed.instanceUuid,
+        activeCascadeId: confirmedCascadeId
+      });
+      return true;
+    }
+
     function fastNavigate(requestId, instanceUuid, childPath, targetUrl) {
       var route = parseRouteFromLocation();
       var frame = findHubIframe();
+      var cleanPath = '/' + String(childPath || '').replace(/^\\/+/, '');
+      var cMatch = /^\\/c\\/([a-zA-Z0-9._-]+)/.exec(cleanPath);
+      var expectedCascadeId = cMatch && cMatch[1] ? cMatch[1] : null;
+
       if (
         !instanceUuid ||
         instanceUuid === '__cloud__' ||
+        !expectedCascadeId ||
         route.instanceUuid !== instanceUuid ||
         !frame ||
         !frame.contentWindow ||
@@ -727,45 +803,45 @@ export const INBOX_BRIDGE_SCRIPT = `
       }
 
       try {
+        clearPendingFastNav();
         var frameOrigin = new URL(frame.src).origin;
-        var cleanPath = '/' + String(childPath || '').replace(/^\\/+/, '');
-        var cMatch = /^\\/c\\/([a-zA-Z0-9._-]+)/.exec(cleanPath);
+        var timer = setTimeout(function() {
+          if (!pendingFastNav || pendingFastNav.requestId !== requestId) {
+            return;
+          }
+          pendingFastNav = null;
+          postToNative({
+            type: 'AGY_INBOX_FAST_NAV_RESULT',
+            requestId: requestId,
+            handled: false,
+            targetUrl: targetUrl
+          });
+        }, FAST_NAV_CONFIRM_MS);
+
+        pendingFastNav = {
+          requestId: requestId,
+          instanceUuid: instanceUuid,
+          expectedCascadeId: expectedCascadeId,
+          targetUrl: targetUrl,
+          timer: timer
+        };
+
+        // Antigravity's Closure/Jetbox IframeMessage (wZ.prototype.serialize /
+        // Zub) encodes jspbPayload as a JSON string, NOT a raw JS array:
+        // - Field 2 (index 1) = URL_NAVIGATE: [null, ["/c/<cascadeId>"]]
+        // - Field 3 (index 2) = URL_QUERY:    [null, null, []] (replies with
+        //   field 4 URL_RESPONSE even if the iframe was already on cleanPath).
         frame.contentWindow.postMessage(
-          { jspbPayload: [null, [cleanPath]] },
+          { jspbPayload: JSON.stringify([null, [cleanPath]]) },
           frameOrigin
         );
-        if (
-          typeof targetUrl === 'string' &&
-          targetUrl &&
-          window.history &&
-          typeof window.history.replaceState === 'function'
-        ) {
-          try {
-            var parsedTarget = new URL(targetUrl);
-            if (parsedTarget.origin === window.location.origin) {
-              window.history.replaceState(
-                window.history.state,
-                '',
-                parsedTarget.pathname + parsedTarget.search + parsedTarget.hash
-              );
-            }
-          } catch (_) {}
-        }
-        setIframeCascadeOverride(cMatch && cMatch[1] ? cMatch[1] : null);
-        postToNative({
-          type: 'AGY_INBOX_FAST_NAV_RESULT',
-          requestId: requestId,
-          handled: true,
-          targetUrl: targetUrl
-        });
-        postToNative({
-          type: 'AGY_INBOX_ACTIVE_ROUTE',
-          activeUrl: window.location.href,
-          activeInstanceUuid: instanceUuid,
-          activeCascadeId: activeIframeCascadeId
-        });
+        frame.contentWindow.postMessage(
+          { jspbPayload: JSON.stringify([null, null, []]) },
+          frameOrigin
+        );
         return true;
       } catch (_) {
+        clearPendingFastNav();
         postToNative({
           type: 'AGY_INBOX_FAST_NAV_RESULT',
           requestId: requestId,
@@ -802,9 +878,11 @@ export const INBOX_BRIDGE_SCRIPT = `
         var frameSrc = frame ? frame.src : '';
 
         if (data.type === 'URL_CHANGED' && typeof data.path === 'string') {
-          setIframeCascadeOverride(
-            extractCascadeIdFromIframePath(data.path, frameSrc)
-          );
+          var changedCascadeId = extractCascadeIdFromIframePath(data.path, frameSrc);
+          if (completePendingFastNavIfMatched(changedCascadeId)) {
+            return;
+          }
+          setIframeCascadeOverride(changedCascadeId);
           var routeNow = parseRouteFromLocation();
           postToNative({
             type: 'AGY_INBOX_ACTIVE_ROUTE',
@@ -815,30 +893,42 @@ export const INBOX_BRIDGE_SCRIPT = `
           return;
         }
 
-        var jspb = data.jspbPayload;
-        if (!Array.isArray(jspb)) return;
+        var jspb = parseJspbPayload(data.jspbPayload);
+        if (!jspb) return;
 
-        // Field 1 (index 0): URL_CHANGE
-        if (Array.isArray(jspb[0]) && typeof jspb[0][0] === 'string') {
-          setIframeCascadeOverride(
-            extractCascadeIdFromIframePath(jspb[0][0], frameSrc)
-          );
-          var currentRoute = parseRouteFromLocation();
-          postToNative({
-            type: 'AGY_INBOX_ACTIVE_ROUTE',
-            activeUrl: window.location.href,
-            activeInstanceUuid: currentRoute.instanceUuid,
-            activeCascadeId: activeIframeCascadeId
-          });
+        // Field 1 (index 0): URL_CHANGE, or Field 4 (index 3): URL_RESPONSE
+        var reportedPath =
+          Array.isArray(jspb[0]) && typeof jspb[0][0] === 'string'
+            ? jspb[0][0]
+            : Array.isArray(jspb[3]) && typeof jspb[3][0] === 'string'
+              ? jspb[3][0]
+              : null;
+        if (reportedPath !== null) {
+          var extractedCascadeId = extractCascadeIdFromIframePath(reportedPath, frameSrc);
+          if (completePendingFastNavIfMatched(extractedCascadeId)) {
+            return;
+          }
+          if (Array.isArray(jspb[0])) {
+            setIframeCascadeOverride(extractedCascadeId);
+            var currentRoute = parseRouteFromLocation();
+            postToNative({
+              type: 'AGY_INBOX_ACTIVE_ROUTE',
+              activeUrl: window.location.href,
+              activeInstanceUuid: currentRoute.instanceUuid,
+              activeCascadeId: activeIframeCascadeId
+            });
+          }
         }
 
-        // Field 5 (index 4): NOTIFICATION_REQUEST
+        // Field 5 (index 4): NOTIFICATION_REQUEST (D9 wraps C9 at index 0)
         if (Array.isArray(jspb[4])) {
+          var notif = Array.isArray(jspb[4][0]) ? jspb[4][0] : jspb[4];
           postToNative({
             type: 'AGY_INBOX_REALTIME_HINT',
             reason: 'notification',
-            title: typeof jspb[4][0] === 'string' ? jspb[4][0] : null,
-            body: typeof jspb[4][1] === 'string' ? jspb[4][1] : null
+            cascadeId: typeof notif[5] === 'string' ? notif[5] : null,
+            title: typeof notif[1] === 'string' ? notif[1] : null,
+            body: typeof notif[2] === 'string' ? notif[2] : null
           });
           scheduleRefresh(300);
         }
@@ -854,7 +944,7 @@ export const INBOX_BRIDGE_SCRIPT = `
       } catch (_) {}
     });
 
-    window.addEventListener('popstate', function() {
+    function emitActiveRouteFromLocation() {
       var route = parseRouteFromLocation();
       postToNative({
         type: 'AGY_INBOX_ACTIVE_ROUTE',
@@ -862,7 +952,15 @@ export const INBOX_BRIDGE_SCRIPT = `
         activeInstanceUuid: route.instanceUuid,
         activeCascadeId: route.cascadeId
       });
-    });
+    }
+
+    window.addEventListener('popstate', emitActiveRouteFromLocation);
+
+    try {
+      if (window.navigation && typeof window.navigation.addEventListener === 'function') {
+        window.navigation.addEventListener('currententrychange', emitActiveRouteFromLocation);
+      }
+    } catch (_) {}
 
     window.addEventListener('focus', function() {
       scheduleRefresh(250);
@@ -896,6 +994,7 @@ export const INBOX_BRIDGE_SCRIPT = `
       markThreadRead: markThreadRead,
       fastNavigate: fastNavigate,
       stop: function() {
+        clearPendingFastNav();
         if (refreshTimer) clearTimeout(refreshTimer);
         if (pollId) clearInterval(pollId);
       }

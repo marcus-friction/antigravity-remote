@@ -228,6 +228,32 @@ describe('inboxParser', () => {
       'https://antigravity.google.com/u/1/r/workstation-a?p=c%2Fparent-with-subagent-prompt',
     );
 
+    const enterpriseSnapshot = buildInboxSnapshot(
+      {
+        type: 'AGY_INBOX_SNAPSHOT',
+        fetchedAtMs: 1_762_265_000_000,
+        activeUrl:
+          'https://antigravity.google.com/r/workstation-a?enableBusinessSignIn=true&authuser=2',
+        instances: [
+          {
+            uuid: 'workstation-a',
+            name: 'Enterprise Box',
+            status: 1,
+            trajectories: {
+              'ent-thread': {
+                summary: 'Enterprise session',
+                lastModifiedTime: '2026-11-04T14:20:00Z',
+              },
+            },
+          },
+        ],
+      },
+      {},
+    );
+    expect(enterpriseSnapshot.threads[0].targetUrl).toBe(
+      'https://antigravity.google.com/r/workstation-a?authuser=2&enableBusinessSignIn=true&p=c%2Fent-thread',
+    );
+
     const errorThread = snapshot.threads[1];
     expect(errorThread.attentionKind).toBe('error');
     expect(errorThread.needsAttention).toBe(true);
@@ -301,7 +327,10 @@ describe('inboxParser', () => {
     expect(INBOX_BRIDGE_SCRIPT).not.toMatch(/AIza[0-9A-Za-z_-]{20,}/);
 
     const postedToNative: any[] = [];
-    const postedToIframe: Array<{ msg: any; origin: string }> = [];
+    const postedToIframe: Array<{ msg: any; decodedJspb: any; origin: string }> =
+      [];
+    const scheduledTimers = new Map<number, () => void>();
+    let nextTimerId = 10;
     const proxyRequests: Array<{
       uuid: string;
       rpcPath: string;
@@ -375,7 +404,11 @@ describe('inboxParser', () => {
           : null,
       contentWindow: {
         postMessage: (msg: any, origin: string) => {
-          postedToIframe.push({ msg, origin });
+          // Match real Jetbox `Zub`: `jspbPayload` MUST be a JSON string, never a raw Array.
+          expect(typeof msg?.jspbPayload).toBe('string');
+          const decodedJspb = JSON.parse(msg.jspbPayload);
+          expect(Array.isArray(decodedJspb)).toBe(true);
+          postedToIframe.push({ msg, decodedJspb, origin });
         },
       },
     };
@@ -432,8 +465,16 @@ describe('inboxParser', () => {
       TextDecoder,
       URL,
       URLSearchParams,
-      setTimeout: () => 1,
-      clearTimeout: () => undefined,
+      setTimeout: (fn: () => void, ms?: number) => {
+        const id = nextTimerId++;
+        if (ms === 380) {
+          scheduledTimers.set(id, fn);
+        }
+        return id;
+      },
+      clearTimeout: (id: number) => {
+        scheduledTimers.delete(id);
+      },
       setInterval: () => 2,
       clearInterval: () => undefined,
     };
@@ -471,7 +512,7 @@ describe('inboxParser', () => {
       ),
     ).toBe(true);
 
-    // Test fast same-workstation iframe navigation
+    // Test fast same-workstation iframe navigation (JSON-serialized JSPB + confirmation)
     vm.runInContext(
       buildFastThreadSwitchScript({
         requestId: 'fast-1',
@@ -483,10 +524,37 @@ describe('inboxParser', () => {
     );
     expect(postedToIframe).toEqual([
       {
-        msg: { jspbPayload: [null, ['/c/cascade-42']] },
+        msg: { jspbPayload: JSON.stringify([null, ['/c/cascade-42']]) },
+        decodedJspb: [null, ['/c/cascade-42']],
+        origin: 'https://antigravity.static.usercontent.goog',
+      },
+      {
+        msg: { jspbPayload: JSON.stringify([null, null, []]) },
+        decodedJspb: [null, null, []],
         origin: 'https://antigravity.static.usercontent.goog',
       },
     ]);
+    // Must NOT prematurely claim `handled: true` before the iframe confirms the route change
+    expect(
+      postedToNative.some(
+        (m) => m.type === 'AGY_INBOX_FAST_NAV_RESULT' && m.requestId === 'fast-1',
+      ),
+    ).toBe(false);
+
+    // Simulate the iframe echoing `URL_RESPONSE` (field 4 / index 3) as a JSON string
+    for (const listener of windowListeners.get('message') ?? []) {
+      listener({
+        origin: 'https://antigravity.static.usercontent.goog',
+        data: {
+          jspbPayload: JSON.stringify([
+            null,
+            null,
+            null,
+            ['/web/1.0.20260910010023/c/cascade-42'],
+          ]),
+        },
+      });
+    }
     expect(
       postedToNative.some(
         (m) =>
@@ -499,13 +567,40 @@ describe('inboxParser', () => {
       'https://antigravity.google.com/r/box-alpha?p=c%2Fcascade-42',
     );
 
-    // Test iframe URL_CHANGE message stripping `/web/<version>` base path
+    // Test unready/stalled iframe fallback: if the iframe does not confirm within 380ms,
+    // `fastNavigate` reports `handled: false` so native falls back to full URL navigation.
+    postedToIframe.length = 0;
+    vm.runInContext(
+      buildFastThreadSwitchScript({
+        requestId: 'fast-timeout',
+        instanceUuid: 'box-alpha',
+        childPath: 'c/cascade-77',
+        targetUrl: 'https://antigravity.google.com/r/box-alpha?p=c%2Fcascade-77',
+      }),
+      context,
+    );
+    expect(scheduledTimers.size).toBe(1);
+    for (const timerFn of Array.from(scheduledTimers.values())) {
+      timerFn();
+    }
+    expect(
+      postedToNative.some(
+        (m) =>
+          m.type === 'AGY_INBOX_FAST_NAV_RESULT' &&
+          m.requestId === 'fast-timeout' &&
+          m.handled === false,
+      ),
+    ).toBe(true);
+
+    // Test iframe URL_CHANGE (JSON string `jspbPayload`) stripping `/web/<version>` base path
     // AND overriding stale `?p=` query parameter on subsequent snapshot polls
     for (const listener of windowListeners.get('message') ?? []) {
       listener({
         origin: 'https://antigravity.static.usercontent.goog',
         data: {
-          jspbPayload: [['/web/1.0.20260910010023/c/cascade-99']],
+          jspbPayload: JSON.stringify([
+            ['/web/1.0.20260910010023/c/cascade-99'],
+          ]),
         },
       });
     }
@@ -515,6 +610,41 @@ describe('inboxParser', () => {
           m.type === 'AGY_INBOX_ACTIVE_ROUTE' &&
           m.activeInstanceUuid === 'box-alpha' &&
           m.activeCascadeId === 'cascade-99',
+      ),
+    ).toBe(true);
+
+    // Test NOTIFICATION_REQUEST nested C9 payload (`jspb[4][0]`) serialized as JSON string
+    for (const listener of windowListeners.get('message') ?? []) {
+      listener({
+        origin: 'https://antigravity.static.usercontent.goog',
+        data: {
+          jspbPayload: JSON.stringify([
+            null,
+            null,
+            null,
+            null,
+            [
+              [
+                'notif-1',
+                'Command approval',
+                './gradlew bundleRelease',
+                false,
+                '/c/cascade-99',
+                'cascade-99',
+              ],
+            ],
+          ]),
+        },
+      });
+    }
+    expect(
+      postedToNative.some(
+        (m) =>
+          m.type === 'AGY_INBOX_REALTIME_HINT' &&
+          m.reason === 'notification' &&
+          m.cascadeId === 'cascade-99' &&
+          m.title === 'Command approval' &&
+          m.body === './gradlew bundleRelease',
       ),
     ).toBe(true);
 

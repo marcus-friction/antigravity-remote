@@ -34,6 +34,9 @@ jest.mock('react-native', () => {
     setValue(nextValue: number) {
       this._value = nextValue;
     }
+    stopAnimation(cb?: (value: number) => void) {
+      cb?.(this._value);
+    }
     interpolate() {
       return 1;
     }
@@ -1181,25 +1184,89 @@ describe('Session and navigation regressions', () => {
       'Open Antigravity drawer (2 need attention)',
     );
 
-    // 3. Pull the left drawer open via horizontal drag gesture on the closed handle zone
-    const closedDragZone = tree.root.findAll(
-      (node) =>
-        node.type === ('View' as any) &&
-        typeof node.props.onMoveShouldSetPanResponder === 'function',
-    )[0];
-    expect(closedDragZone).toBeDefined();
+    // 3. Multi-frame gesture regression: pulling the closed handle right must NEVER
+    // unmount the active responder mid-gesture or leave an invisible overlay eating touches.
+    const findClosedDragZone = () =>
+      tree.root.findAll(
+        (node) =>
+          node.type === ('View' as any) &&
+          typeof node.props.onMoveShouldSetPanResponder === 'function' &&
+          node.props.onMoveShouldSetPanResponder({}, { dx: 18, dy: 2 }) === true,
+      )[0];
+
+    const closedDragZoneInitial = findClosedDragZone();
+    expect(closedDragZoneInitial).toBeDefined();
     expect(
-      closedDragZone.props.onMoveShouldSetPanResponder({}, { dx: 18, dy: 2 }),
+      closedDragZoneInitial.props.onMoveShouldSetPanResponderCapture(
+        {},
+        { dx: 18, dy: 2 },
+      ),
     ).toBe(true);
+    expect(
+      closedDragZoneInitial.props.onMoveShouldSetPanResponderCapture(
+        {},
+        { dx: 3, dy: 1 },
+      ),
+    ).toBe(false);
+
+    // 3a. Cancelled short drag across separate React commits:
+    await act(async () => {
+      closedDragZoneInitial.props.onPanResponderGrant();
+    });
+
+    // Responder MUST remain mounted in the live tree after `isDraggingOpen` commits,
+    // and the preview drawer overlay MUST stay `pointerEvents="none"` while `visible === false`.
+    const closedDragZoneMidShortDrag = findClosedDragZone();
+    expect(closedDragZoneMidShortDrag).toBe(closedDragZoneInitial);
+    expect(closedDragZoneMidShortDrag.props.pointerEvents).toBe('auto');
+    const findBackdropOverlayContainer = () => {
+      const backdrop = tree.root
+        .findAllByType('Pressable' as any)
+        .find((node) => node.props.accessibilityLabel === 'Close drawer backdrop');
+      let cursor = backdrop?.parent ?? null;
+      while (cursor && cursor.props.pointerEvents === undefined) {
+        cursor = cursor.parent;
+      }
+      return cursor;
+    };
+    expect(findBackdropOverlayContainer()?.props.pointerEvents).toBe('none');
 
     await act(async () => {
-      closedDragZone.props.onPanResponderGrant();
-      closedDragZone.props.onPanResponderMove({}, { dx: 180, dy: 4, vx: 0.6 });
-      closedDragZone.props.onPanResponderRelease(
+      closedDragZoneMidShortDrag.props.onPanResponderMove(
+        {},
+        { dx: 12, dy: 1, vx: 0.05 },
+      );
+    });
+    await act(async () => {
+      closedDragZoneMidShortDrag.props.onPanResponderRelease(
+        {},
+        { dx: 12, dy: 1, vx: 0.05 },
+      );
+    });
+    expect(controls().props.visible).toBe(false);
+    expect(findClosedDragZone().props.pointerEvents).toBe('auto');
+
+    // 3b. Full multi-frame pull-open gesture across separate React commits:
+    await act(async () => {
+      findClosedDragZone().props.onPanResponderGrant();
+    });
+    expect(findClosedDragZone()).toBe(closedDragZoneInitial);
+    await act(async () => {
+      findClosedDragZone().props.onPanResponderMove(
+        {},
+        { dx: 92, dy: 3, vx: 0.45 },
+      );
+    });
+    expect(findClosedDragZone()).toBe(closedDragZoneInitial);
+    await act(async () => {
+      findClosedDragZone().props.onPanResponderRelease(
         {},
         { dx: 180, dy: 4, vx: 0.6 },
       );
     });
+    expect(controls().props.visible).toBe(true);
+    expect(findBackdropOverlayContainer()?.props.pointerEvents).toBe('auto');
+    expect(findClosedDragZone().props.pointerEvents).toBe('none');
 
     // Open drawer displays Inbox mode with count badge '2' and matching 4px × 112px inner-right handle
     const inboxModeBtn = tree.root
@@ -1254,7 +1321,10 @@ describe('Session and navigation regressions', () => {
       inboxModeBtn.findAllByType('Text' as any).map((t) => t.props.children),
     ).toEqual(['Inbox', '1']);
 
-    // 4. Select `approval-local` on the same workstation -> uses fast iframe switch without remounting WebView
+    // 4. Select `approval-local` on the same workstation ( note: WebView initially booted at `/`
+    // and navigated via SPA `activeUrl` in the snapshot without `onNavigationStateChange`! ) ->
+    // `RemoteWebView` syncs `activeUrl`, attempts fast iframe switch first, and falls back to
+    // full URL navigation if the iframe reports `handled: false`, or stays in-place on `handled: true`.
     const mountsBeforeFastSwitch = mockWebViewMountCount;
     mockWebViewInjectJavaScript.mockClear();
 
@@ -1292,6 +1362,69 @@ describe('Session and navigation regressions', () => {
     });
     expect(mockWebViewMountCount).toBe(mountsBeforeFastSwitch);
 
+    // 4b. Verify fallback when same-workstation iframe is not ready (`handled: false`) ->
+    // opens the thread cleanly via full WebView URL navigation.
+    const reopenForFallback = tree.root.findAll(
+      (node) =>
+        node.type === ('TouchableOpacity' as any) &&
+        node.props.accessibilityLabel === 'Open Antigravity drawer',
+    )[0];
+    await act(async () => {
+      reopenForFallback.props.onPress();
+    });
+
+    // Also verify swipe-left capture on the open drawer panel claims horizontal swipes
+    // while ignoring vertical ScrollView gestures.
+    const openDrawerDragPanel = tree.root.findAll(
+      (node) =>
+        typeof node.props.onMoveShouldSetPanResponderCapture === 'function' &&
+        node.props.onMoveShouldSetPanResponderCapture({}, { dx: -20, dy: 2 }) ===
+          true,
+    )[0];
+    expect(openDrawerDragPanel).toBeDefined();
+    expect(
+      openDrawerDragPanel.props.onMoveShouldSetPanResponderCapture(
+        {},
+        { dx: -6, dy: 24 },
+      ),
+    ).toBe(false);
+
+    mockWebViewInjectJavaScript.mockClear();
+    const approvalCardFallback = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find(
+        (node) =>
+          node.props.accessibilityLabel === 'Open thread Deploy mobile release',
+      )!;
+    await act(async () => {
+      approvalCardFallback.props.onPress();
+    });
+    const fallbackSwitchCall = mockWebViewInjectJavaScript.mock.calls.find(
+      ([script]) =>
+        typeof script === 'string' && script.includes('fastNavigate'),
+    );
+    expect(fallbackSwitchCall).toBeDefined();
+    const fallbackReqId = /"requestId":"([^"]+)"/.exec(fallbackSwitchCall![0])![1];
+
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fapproval-local',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_FAST_NAV_RESULT',
+            requestId: fallbackReqId,
+            handled: false,
+            targetUrl:
+              'https://antigravity.google.com/r/workstation-1?p=c%2Fapproval-local',
+          }),
+        },
+      });
+    });
+    expect(mockWebViewMountCount).toBe(mountsBeforeFastSwitch + 1);
+    expect(webView().props.source.uri).toBe(
+      'https://antigravity.google.com/r/workstation-1?p=c%2Fapproval-local',
+    );
+
     // Unsolicited or replayed AGY_INBOX_FAST_NAV_RESULT messages must be ignored
     await act(async () => {
       webView().props.onMessage({
@@ -1317,7 +1450,7 @@ describe('Session and navigation regressions', () => {
         },
       });
     });
-    expect(mockWebViewMountCount).toBe(mountsBeforeFastSwitch);
+    expect(mockWebViewMountCount).toBe(mountsBeforeFastSwitch + 1);
     expect(webView().props.source.uri).not.toContain('spoofed-workstation');
 
     // 5. Reopen drawer, verify keyboard inset while open, and verify Android hardware Back closes drawer before WebView history

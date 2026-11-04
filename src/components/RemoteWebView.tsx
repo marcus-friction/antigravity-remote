@@ -180,7 +180,7 @@ function buildKeepAliveWebLockScript(acquire: boolean): string {
 
 const MAX_RENDER_RECOVERY_ATTEMPTS = 3;
 const RENDER_RECOVERY_WINDOW_MS = 30_000;
-const FAST_THREAD_NAV_FALLBACK_MS = 450;
+const FAST_THREAD_NAV_FALLBACK_MS = 750;
 const INBOX_REFRESH_TIMEOUT_MS = 9_000;
 const MAX_LOCALLY_READ_ENTRIES = 500;
 
@@ -265,6 +265,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     DEFAULT_KEEP_ALIVE_MINUTES,
   );
   const locallyReadMapRef = useRef<Record<string, number>>({});
+  const activeInstanceUuidRef = useRef<string | null>(null);
   const pendingFastNavRef = useRef<
     Map<string, { timer: ReturnType<typeof setTimeout>; targetUrl: string }>
   >(new Map());
@@ -686,6 +687,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       void configureNativeKeepAlive?.(false, 0, false);
       clearInboxTimers();
       locallyReadMapRef.current = {};
+      activeInstanceUuidRef.current = null;
       webViewRef.current?.stopLoading();
       stageRef.current = 'hydrating';
       setStage('hydrating');
@@ -804,6 +806,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       ) {
         void saveLastActiveUrl(validation.normalizedUrl);
         const route = extractActiveRouteFromUrl(validation.normalizedUrl);
+        activeInstanceUuidRef.current = route.instanceUuid;
         if (route.instanceUuid && route.cascadeId) {
           recordBoundedLocalRead(
             locallyReadMapRef.current,
@@ -927,6 +930,9 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     }
     setCurrentSourceUrl(validation.normalizedUrl);
     currentNavUrlRef.current = validation.normalizedUrl;
+    activeInstanceUuidRef.current = extractActiveRouteFromUrl(
+      validation.normalizedUrl,
+    ).instanceUuid;
     // Explicit native navigation must work even when the source prop already
     // contains this URL and the browser has since navigated somewhere else.
     setWebViewInstanceKey((prev) => prev + 1);
@@ -1057,9 +1063,12 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       );
 
       const currentRoute = extractActiveRouteFromUrl(currentNavUrlRef.current);
+      const isSameActiveInstance =
+        currentRoute.instanceUuid === thread.instanceUuid ||
+        activeInstanceUuidRef.current === thread.instanceUuid;
       if (
         thread.source === 'remote-control' &&
-        currentRoute.instanceUuid === thread.instanceUuid &&
+        isSameActiveInstance &&
         webViewRef.current
       ) {
         const requestId = `nav-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -1089,6 +1098,20 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     [handleCloseDrawer, handleNavigateToUrl],
   );
 
+  const syncVerifiedActiveHostUrl = useCallback((rawActiveUrl?: string) => {
+    if (typeof rawActiveUrl !== 'string' || !rawActiveUrl) return;
+    const activeValidation = validateNavigationUrl(rawActiveUrl);
+    if (
+      activeValidation.isAllowedInApp &&
+      activeValidation.normalizedUrl &&
+      new URL(activeValidation.normalizedUrl).hostname ===
+        'antigravity.google.com'
+    ) {
+      currentNavUrlRef.current = activeValidation.normalizedUrl;
+      void saveLastActiveUrl(activeValidation.normalizedUrl);
+    }
+  }, []);
+
   const handleWebViewMessage = useCallback(
     (event: WebViewMessageEvent) => {
       if (isResettingSessionRef.current) return;
@@ -1113,11 +1136,13 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             inboxRefreshTimeoutRef.current = null;
           }
           setIsInboxRefreshing(false);
+          syncVerifiedActiveHostUrl(message.activeUrl);
           const built = buildInboxSnapshot(
             message,
             locallyReadMapRef.current,
             currentNavUrlRef.current,
           );
+          activeInstanceUuidRef.current = built.activeInstanceUuid;
           if (built.activeInstanceUuid && built.activeCascadeId) {
             const activeKey = `${built.activeInstanceUuid}:${built.activeCascadeId}`;
             recordBoundedLocalRead(
@@ -1131,6 +1156,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         }
 
         case 'AGY_INBOX_ACTIVE_ROUTE': {
+          syncVerifiedActiveHostUrl(message.activeUrl);
           const fallbackRoute = extractActiveRouteFromUrl(
             message.activeUrl ?? currentNavUrlRef.current,
           );
@@ -1138,6 +1164,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             message.activeInstanceUuid ?? fallbackRoute.instanceUuid;
           const activeCascadeId =
             message.activeCascadeId ?? fallbackRoute.cascadeId;
+          activeInstanceUuidRef.current = activeInstanceUuid;
           if (activeInstanceUuid && activeCascadeId) {
             recordBoundedLocalRead(
               locallyReadMapRef.current,
@@ -1171,22 +1198,16 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           if (!message.handled) {
             handleNavigateToUrl(pending.targetUrl);
           } else {
-            const targetValidation = validateNavigationUrl(pending.targetUrl);
-            if (
-              targetValidation.isAllowedInApp &&
-              targetValidation.normalizedUrl &&
-              new URL(targetValidation.normalizedUrl).hostname ===
-                'antigravity.google.com'
-            ) {
-              currentNavUrlRef.current = targetValidation.normalizedUrl;
-              void saveLastActiveUrl(targetValidation.normalizedUrl);
-            }
+            syncVerifiedActiveHostUrl(pending.targetUrl);
+            activeInstanceUuidRef.current = extractActiveRouteFromUrl(
+              pending.targetUrl,
+            ).instanceUuid;
           }
           break;
         }
       }
     },
-    [armInboxRefreshTimeout, handleNavigateToUrl],
+    [armInboxRefreshTimeout, handleNavigateToUrl, syncVerifiedActiveHostUrl],
   );
 
   const inboxCounts = useMemo(() => {

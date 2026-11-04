@@ -2,7 +2,7 @@
   "expo": {
     "name": "Antigravity Remote",
     "slug": "antigravity-remote",
-    "version": "1.1.1",
+    "version": "1.1.2",
     "orientation": "default",
     "icon": "./assets/icon.png",
     "scheme": "antigravity-remote",
@@ -18,7 +18,7 @@
     "android": {
       "package": "com.frictionventures.antigravityremote",
       "allowBackup": false,
-      "versionCode": 9,
+      "versionCode": 10,
       "blockedPermissions": [
         "android.permission.SYSTEM_ALERT_WINDOW",
         "android.permission.READ_EXTERNAL_STORAGE",
