@@ -23,7 +23,7 @@ export type AuthFlowStage =
   | 'authenticated'
   | 'offline';
 
-export type KeepAliveMinutes = 0 | 15 | 30 | 60;
+export type KeepAliveMinutes = 0 | 5 | 15 | 30 | 60;
 
 export interface UrlValidationResult {
   isValid: boolean;

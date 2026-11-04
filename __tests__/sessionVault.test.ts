@@ -313,8 +313,11 @@ describe('sessionVault', () => {
     );
   });
 
-  it('persists valid keep-alive durations and resets to default on clearSession()', async () => {
-    expect(await getKeepAliveMinutes()).toBe(30);
+  it('persists valid keep-alive durations and resets to default Off (0) on clearSession()', async () => {
+    expect(await getKeepAliveMinutes()).toBe(0);
+
+    await saveKeepAliveMinutes(5);
+    expect(await getKeepAliveMinutes()).toBe(5);
 
     await saveKeepAliveMinutes(60);
     expect(await getKeepAliveMinutes()).toBe(60);
@@ -324,7 +327,7 @@ describe('sessionVault', () => {
 
     // Rejects unsupported numbers stored externally
     mockSecureStoreData.set('agy_keep_alive_minutes_v1', '999');
-    expect(await getKeepAliveMinutes()).toBe(30);
+    expect(await getKeepAliveMinutes()).toBe(0);
 
     await saveKeepAliveMinutes(15);
     expect(await getKeepAliveMinutes()).toBe(15);
@@ -333,11 +336,11 @@ describe('sessionVault', () => {
     await saveLastActiveUrl('https://antigravity.google.com/r/stale-session');
     mockSecureStoreData.set(SECURE_STORE_SIGN_OUT_KEY, 'true');
     expect(await getLastActiveUrl()).toBe('https://antigravity.google.com');
-    expect(await getKeepAliveMinutes()).toBe(30);
+    expect(await getKeepAliveMinutes()).toBe(0);
     mockSecureStoreData.delete(SECURE_STORE_SIGN_OUT_KEY);
 
     await clearSession();
-    expect(await getKeepAliveMinutes()).toBe(30);
+    expect(await getKeepAliveMinutes()).toBe(0);
   });
 
   it('completely wipes CookieManager and all SecureStore chunks on clearSession()', async () => {

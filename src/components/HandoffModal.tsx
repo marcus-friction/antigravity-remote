@@ -15,6 +15,7 @@ import {
 import {
   ANTIGRAVITY_DASHBOARD_URL,
   DEFAULT_KEEP_ALIVE_MINUTES,
+  IOS_KEEP_ALIVE_ENABLED_MINUTES,
   KEEP_ALIVE_DURATION_OPTIONS,
   PRIVACY_POLICY_URL,
   SOURCE_REPO_URL,
@@ -96,11 +97,11 @@ export const HandoffModal: React.FC<HandoffModalProps> = ({
   const isAndroid = Platform.OS === 'android';
   const keepAliveHint = isAndroid
     ? keepAliveMinutes > 0
-      ? `Holds active sessions open in background up to ${keepAliveMinutes}m (ongoing notification).`
-      : 'Background keep-alive off; OS may freeze idle sessions quickly.'
+      ? `Active for up to ${keepAliveMinutes}m in background: shows a silent ongoing notification with a Stop Keep-Alive button and uses slightly more battery until the timer expires.`
+      : 'Off by default (no background battery use): sessions pause in the background and reconnect when you return. Choosing a timer shows a silent ongoing notification with a Stop Keep-Alive button.'
     : keepAliveMinutes > 0
-      ? 'Holds connection across quick app switches (~30s iOS background limit).'
-      : 'Background keep-alive off; suspends immediately when switching apps.';
+      ? 'Active: holds the connection across quick app switches (up to the ~30s iOS background limit) using slightly more battery during switches.'
+      : 'Off by default (no background battery use): sessions pause immediately when switching apps and reconnect when you return.';
 
   return (
     <Modal
@@ -142,6 +143,11 @@ export const HandoffModal: React.FC<HandoffModalProps> = ({
 
           <View style={styles.keepAliveSection}>
             <Text style={styles.sectionLabel}>Background Keep-Alive</Text>
+            <Text style={styles.keepAliveDescription}>
+              Keeps your live workstation stream connected while you switch to
+              other apps (2FA, browser, chat) so returning is instant instead of
+              reconnecting.
+            </Text>
             <View style={styles.keepAliveRow}>
               {isAndroid
                 ? KEEP_ALIVE_DURATION_OPTIONS.map((minutes) => {
@@ -175,7 +181,7 @@ export const HandoffModal: React.FC<HandoffModalProps> = ({
                       { label: 'Off', value: 0 as KeepAliveMinutes, selected: keepAliveMinutes === 0 },
                       {
                         label: 'On (~30s)',
-                        value: DEFAULT_KEEP_ALIVE_MINUTES as KeepAliveMinutes,
+                        value: IOS_KEEP_ALIVE_ENABLED_MINUTES as KeepAliveMinutes,
                         selected: keepAliveMinutes > 0,
                       },
                     ] as const
@@ -401,16 +407,22 @@ const styles = StyleSheet.create({
   keepAliveSection: {
     marginBottom: 14,
   },
+  keepAliveDescription: {
+    color: '#94A3B8',
+    fontSize: 12,
+    lineHeight: 17,
+    marginBottom: 6,
+  },
   keepAliveRow: {
     flexDirection: 'row',
-    gap: 8,
-    marginTop: 4,
+    gap: 6,
+    marginTop: 2,
     marginBottom: 6,
   },
   keepAliveChip: {
     flex: 1,
     paddingVertical: 8,
-    paddingHorizontal: 8,
+    paddingHorizontal: 4,
     borderRadius: 9,
     backgroundColor: '#1E293B',
     borderWidth: 1,
@@ -433,6 +445,7 @@ const styles = StyleSheet.create({
   keepAliveHint: {
     color: '#94A3B8',
     fontSize: 11,
+    lineHeight: 16,
   },
   statusLabel: {
     color: '#94A3B8',

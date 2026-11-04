@@ -19,8 +19,8 @@ import expo.modules.kotlin.modules.ModuleDefinition
 
 class RemoteSessionModule : Module() {
   private val mainHandler = Handler(Looper.getMainLooper())
-  @Volatile private var keepAliveEnabled: Boolean = true
-  @Volatile private var keepAliveMinutes: Int = 30
+  @Volatile private var keepAliveEnabled: Boolean = false
+  @Volatile private var keepAliveMinutes: Int = 0
   @Volatile private var sessionActive: Boolean = false
   @Volatile private var stoppedForCurrentBackgroundStay: Boolean = false
   private var registeredApplication: Application? = null

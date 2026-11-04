@@ -358,6 +358,29 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     onDeepLinkConsumed();
   }, [incomingDeepLinkUrl, isHydrated, onDeepLinkConsumed, resetRequest]);
 
+  const requestNotificationPermissionIfNeeded = useCallback(() => {
+    if (
+      Platform.OS !== 'android' ||
+      typeof Platform.Version !== 'number' ||
+      Platform.Version < 33 ||
+      notificationPermissionRequestedRef.current
+    ) {
+      return;
+    }
+    notificationPermissionRequestedRef.current = true;
+    const permission = 'android.permission.POST_NOTIFICATIONS' as any;
+    void (async () => {
+      try {
+        const alreadyGranted = await PermissionsAndroid?.check?.(permission);
+        if (!alreadyGranted) {
+          await PermissionsAndroid?.request?.(permission);
+        }
+      } catch {
+        // Ignore permission request errors on restricted profiles/ROMs.
+      }
+    })();
+  }, []);
+
   // Step 2b: Synchronize bounded background keep-alive settings with native Android/iOS controllers
   useEffect(() => {
     const keepAliveEligible =
@@ -380,27 +403,16 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       );
     }
 
-    if (
-      Platform.OS === 'android' &&
-      typeof Platform.Version === 'number' &&
-      Platform.Version >= 33 &&
-      keepAliveEligible &&
-      !notificationPermissionRequestedRef.current
-    ) {
-      notificationPermissionRequestedRef.current = true;
-      const permission = 'android.permission.POST_NOTIFICATIONS' as any;
-      void (async () => {
-        try {
-          const alreadyGranted = await PermissionsAndroid?.check?.(permission);
-          if (!alreadyGranted) {
-            await PermissionsAndroid?.request?.(permission);
-          }
-        } catch {
-          // Ignore permission request errors on restricted profiles/ROMs.
-        }
-      })();
+    if (keepAliveEligible) {
+      requestNotificationPermissionIfNeeded();
     }
-  }, [isHydrated, keepAliveMinutes, resetRequest, stage]);
+  }, [
+    isHydrated,
+    keepAliveMinutes,
+    requestNotificationPermissionIfNeeded,
+    resetRequest,
+    stage,
+  ]);
 
   useEffect(() => {
     return () => {
@@ -615,6 +627,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         canGoBackRef.current = false;
         if (resetRequest.reason === 'signout') {
           cookieRecoveryAttemptsRef.current = 0;
+          notificationPermissionRequestedRef.current = false;
           setKeepAliveMinutes(DEFAULT_KEEP_ALIVE_MINUTES);
           keepAliveMinutesRef.current = DEFAULT_KEEP_ALIVE_MINUTES;
         }
@@ -780,8 +793,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       keepAliveMinutesRef.current = minutes;
       setKeepAliveMinutes(minutes);
       void saveKeepAliveMinutes(minutes);
+      if (minutes > 0) {
+        requestNotificationPermissionIfNeeded();
+      }
     },
-    [],
+    [requestNotificationPermissionIfNeeded],
   );
 
   const handleNavigateToUrl = useCallback((targetUrl: string) => {

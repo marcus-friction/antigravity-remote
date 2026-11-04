@@ -740,18 +740,15 @@ describe('Session and navigation regressions', () => {
     expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(false, 0, false);
     expect(mockPermissionsRequest).not.toHaveBeenCalled();
 
+    // Default is Off (0): even after signing in, native keep-alive and POST_NOTIFICATIONS stay inactive until user opts in
     mockCookieStore.set('https://antigravity.google.com', {
       SID: { name: 'SID', value: 'live-session', domain: '.google.com' },
     });
     await navigate('https://antigravity.google.com/r/workstation-1', false);
 
-    expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(true, 30, true);
-    expect(mockPermissionsCheck).toHaveBeenCalledWith(
-      'android.permission.POST_NOTIFICATIONS',
-    );
-    expect(mockPermissionsRequest).toHaveBeenCalledWith(
-      'android.permission.POST_NOTIFICATIONS',
-    );
+    expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(false, 0, false);
+    expect(mockPermissionsCheck).not.toHaveBeenCalled();
+    expect(mockPermissionsRequest).not.toHaveBeenCalled();
     mockWebViewInjectJavaScript.mockClear();
 
     // Brief iOS/Android inactive peek without backgrounding does not spam wakeup events on authenticated pages
@@ -781,7 +778,7 @@ describe('Session and navigation regressions', () => {
       ),
     ).toBe(true);
 
-    // Open HandoffModal and tap actual rendered Android Keep-Alive chips ('Off' -> '60m')
+    // Open HandoffModal, verify explanatory guidance, and opt in ('5m' -> '60m' -> 'Off')
     const menuPill = tree.root.findAll(
       (node) =>
         node.type === ('TouchableOpacity' as any) &&
@@ -791,14 +788,43 @@ describe('Session and navigation regressions', () => {
       menuPill.props.onPress();
     });
 
-    const offChip = tree.root
+    expect(
+      tree.root
+        .findAllByType('Text' as any)
+        .some(
+          (node) =>
+            typeof node.props.children === 'string' &&
+            node.props.children.includes(
+              'Keeps your live workstation stream connected',
+            ),
+        ),
+    ).toBe(true);
+    expect(
+      tree.root
+        .findAllByType('Text' as any)
+        .some(
+          (node) =>
+            typeof node.props.children === 'string' &&
+            node.props.children.includes(
+              'Off by default (no background battery use)',
+            ),
+        ),
+    ).toBe(true);
+
+    const fiveChip = tree.root
       .findAllByType('TouchableOpacity' as any)
-      .find((node) => node.props.accessibilityLabel === 'Keep-alive Off')!;
-    expect(offChip).toBeDefined();
+      .find((node) => node.props.accessibilityLabel === 'Keep-alive 5m')!;
+    expect(fiveChip).toBeDefined();
     await act(async () => {
-      offChip.props.onPress();
+      fiveChip.props.onPress();
     });
-    expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(false, 0, false);
+    expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(true, 5, true);
+    expect(mockPermissionsCheck).toHaveBeenCalledWith(
+      'android.permission.POST_NOTIFICATIONS',
+    );
+    expect(mockPermissionsRequest).toHaveBeenCalledWith(
+      'android.permission.POST_NOTIFICATIONS',
+    );
 
     const sixtyChip = tree.root
       .findAllByType('TouchableOpacity' as any)
@@ -809,11 +835,34 @@ describe('Session and navigation regressions', () => {
     });
     expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(true, 60, true);
 
-    // Sign Out stops keep-alive and resets preference back to default 30m
+    const offChip = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((node) => node.props.accessibilityLabel === 'Keep-alive Off')!;
+    expect(offChip).toBeDefined();
+    await act(async () => {
+      offChip.props.onPress();
+    });
+    expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(false, 0, false);
+
+    // Verify iOS 'On (~30s)' chip passes a non-zero duration even though DEFAULT_KEEP_ALIVE_MINUTES is 0
+    RNPlatform.OS = 'ios';
+    await act(async () => {
+      tree.update(<App />);
+    });
+    const iosOnChip = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((node) => node.props.accessibilityLabel === 'Keep-alive On')!;
+    expect(iosOnChip).toBeDefined();
+    await act(async () => {
+      iosOnChip.props.onPress();
+    });
+    expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(true, 30, true);
+
+    // Sign Out stops keep-alive and resets preference back to default Off (0)
     await act(async () => {
       await controls().props.onSignOut();
     });
-    expect(controls().props.keepAliveMinutes).toBe(30);
+    expect(controls().props.keepAliveMinutes).toBe(0);
     expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(false, 0, false);
   });
 
@@ -833,7 +882,7 @@ describe('Session and navigation regressions', () => {
     });
 
     expect(webView().props.source.uri).toBe('https://antigravity.google.com');
-    expect(controls().props.keepAliveMinutes).toBe(30);
+    expect(controls().props.keepAliveMinutes).toBe(0);
     expect(mockSecureStoreData.has('agy_session_cleanup_pending')).toBe(false);
     expect(mockSecureStoreData.has('agy_last_active_url_v1')).toBe(false);
     expect(mockSecureStoreData.has('agy_keep_alive_minutes_v1')).toBe(false);

@@ -3,8 +3,8 @@ import UIKit
 import WebKit
 
 public class RemoteSessionModule: Module {
-  private var keepAliveEnabled: Bool = true
-  private var keepAliveMinutes: Int = 30
+  private var keepAliveEnabled: Bool = false
+  private var keepAliveMinutes: Int = 0
   private var sessionActive: Bool = false
   private var backgroundTaskId: UIBackgroundTaskIdentifier = .invalid
 
