@@ -22,8 +22,6 @@ export const INBOX_BRIDGE_SCRIPT = `
       return true;
     }
 
-    var TEST_HEADER_KEY = 'x-antigravity-test-72e4dd1c-e8ae-4e97-873b-c3d3a01b735d';
-    var DEFAULT_API_KEY = 'AIzaSyCUicsvglkMf8CM2MPlGjopIcIxu3VJEDU';
     var GET_TRAJECTORIES_PATH = '/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories';
     var UPDATE_ANNOTATIONS_PATH = '/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations';
     var POLL_INTERVAL_MS = 20000;
@@ -31,6 +29,7 @@ export const INBOX_BRIDGE_SCRIPT = `
     var SAFE_ID_RE = /^[a-zA-Z0-9._-]+$/;
 
     var capturedApiClient = null;
+    var capturedMetadata = null;
     var standaloneApiClient = null;
     var cachedProtoNs = null;
     var cachedAuthFirstParty = null;
@@ -264,6 +263,20 @@ export const INBOX_BRIDGE_SCRIPT = `
               if (this) {
                 capturedApiClient = this;
               }
+              var callMeta = arguments.length > 1 ? arguments[1] : null;
+              if (callMeta && typeof callMeta === 'object') {
+                try {
+                  var copy = Object.create(null);
+                  var mKeys = Object.keys(callMeta);
+                  for (var k = 0; k < mKeys.length; k++) {
+                    var mk = mKeys[k];
+                    if (typeof callMeta[mk] === 'string') {
+                      copy[mk] = callMeta[mk];
+                    }
+                  }
+                  capturedMetadata = copy;
+                } catch (_) {}
+              }
               return orig.apply(this, arguments);
             };
           })(methodNames[i]);
@@ -358,7 +371,12 @@ export const INBOX_BRIDGE_SCRIPT = `
 
       if (capturedApiClient) {
         var meta = Object.create(null);
-        meta[TEST_HEADER_KEY] = 'true';
+        if (capturedMetadata) {
+          var capKeys = Object.keys(capturedMetadata);
+          for (var c = 0; c < capKeys.length; c++) {
+            meta[capKeys[c]] = capturedMetadata[capKeys[c]];
+          }
+        }
         return Promise.resolve({
           proto: proto,
           client: capturedApiClient,
@@ -380,12 +398,19 @@ export const INBOX_BRIDGE_SCRIPT = `
 
       return buildStandaloneAuthHeader().then(function(authHeader) {
         var meta = Object.create(null);
+        if (capturedMetadata) {
+          var cmKeys = Object.keys(capturedMetadata);
+          for (var m = 0; m < cmKeys.length; m++) {
+            meta[cmKeys[m]] = capturedMetadata[cmKeys[m]];
+          }
+        }
         meta['X-Origin'] = window.location.origin;
         meta['X-Referer'] = window.location.origin;
         meta['X-Goog-Encode-Response-If-Executable'] = 'base64';
-        meta['X-Goog-Api-Key'] = cachedApiKey || DEFAULT_API_KEY;
+        if (cachedApiKey) {
+          meta['X-Goog-Api-Key'] = cachedApiKey;
+        }
         meta['X-Goog-AuthUser'] = getAccountSessionIndex();
-        meta[TEST_HEADER_KEY] = 'true';
         if (authHeader) {
           meta['Authorization'] = authHeader;
         }

@@ -298,6 +298,7 @@ describe('inboxParser', () => {
     ]) {
       expect(INBOX_BRIDGE_SCRIPT).not.toContain(forbiddenSink);
     }
+    expect(INBOX_BRIDGE_SCRIPT).not.toMatch(/AIza[0-9A-Za-z_-]{20,}/);
 
     const postedToNative: any[] = [];
     const postedToIframe: Array<{ msg: any; origin: string }> = [];
