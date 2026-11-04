@@ -63,6 +63,9 @@ export const LEGACY_SECURE_STORE_META_KEY_V1 = 'agy_cookie_vault_meta_v1';
 export const LEGACY_SECURE_STORE_CHUNK_PREFIX_V1 = 'agy_cookie_vault_chunk_v1_';
 export const SECURE_STORE_MIGRATION_V2_KEY = 'agy_cookie_migration_v2_done';
 export const SECURE_STORE_LAST_URL_KEY = 'agy_last_active_url_v1';
+export const SECURE_STORE_KEEP_ALIVE_MINUTES_KEY = 'agy_keep_alive_minutes_v1';
+export const KEEP_ALIVE_DURATION_OPTIONS = [0, 15, 30, 60] as const;
+export const DEFAULT_KEEP_ALIVE_MINUTES = 30;
 export const SECURE_STORE_CHUNK_SIZE = 1800;
 export const MAX_COOKIE_CHUNKS = 32;
 

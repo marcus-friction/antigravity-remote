@@ -59,6 +59,21 @@ function checkNative(root) {
       'RemoteSessionModule',
     ),
   );
+  const sessionManifest = read(
+    'modules/remote-session/android/src/main/AndroidManifest.xml',
+  );
+  for (const snippet of [
+    'android.permission.FOREGROUND_SERVICE_SPECIAL_USE',
+    'expo.modules.remotesession.RemoteKeepAliveService',
+    'android:exported="false"',
+    'android:foregroundServiceType="specialUse"',
+    'android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE',
+  ]) {
+    assert(
+      sessionManifest.includes(snippet),
+      `Missing keep-alive manifest setting: ${snippet}`,
+    );
+  }
   return true;
 }
 

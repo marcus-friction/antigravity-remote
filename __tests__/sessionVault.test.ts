@@ -1,5 +1,6 @@
 jest.mock('../src/services/webData', () => ({
   clearWebData: jest.fn(async () => undefined),
+  configureNativeKeepAlive: jest.fn(async () => undefined),
 }));
 const mockSecureStoreData = new Map<string, string>();
 const mockCookieStore = new Map<string, Record<string, any>>();
@@ -61,10 +62,12 @@ import {
 import {
   backupCookiesFromWebView,
   clearSession,
+  getKeepAliveMinutes,
   getLastActiveUrl,
   hydrateCookiesToWebView,
   isSafeToReinjectCookie,
   reassembleChunks,
+  saveKeepAliveMinutes,
   saveLastActiveUrl,
   splitIntoChunks,
   resumeSessionPersistence,
@@ -308,6 +311,26 @@ describe('sessionVault', () => {
     expect(await getLastActiveUrl()).toBe(
       'https://antigravity.google.com/r/devbox-swift-falcon?p=c%2F999',
     );
+  });
+
+  it('persists valid keep-alive durations and resets to default on clearSession()', async () => {
+    expect(await getKeepAliveMinutes()).toBe(30);
+
+    await saveKeepAliveMinutes(60);
+    expect(await getKeepAliveMinutes()).toBe(60);
+
+    await saveKeepAliveMinutes(0);
+    expect(await getKeepAliveMinutes()).toBe(0);
+
+    // Rejects unsupported numbers stored externally
+    mockSecureStoreData.set('agy_keep_alive_minutes_v1', '999');
+    expect(await getKeepAliveMinutes()).toBe(30);
+
+    await saveKeepAliveMinutes(15);
+    expect(await getKeepAliveMinutes()).toBe(15);
+
+    await clearSession();
+    expect(await getKeepAliveMinutes()).toBe(30);
   });
 
   it('completely wipes CookieManager and all SecureStore chunks on clearSession()', async () => {

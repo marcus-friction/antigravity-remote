@@ -1,5 +1,6 @@
 jest.mock('../src/services/webData', () => ({
   clearWebData: jest.fn(async () => undefined),
+  configureNativeKeepAlive: jest.fn(async () => undefined),
 }));
 import React from 'react';
 import renderer, { act, ReactTestRenderer } from 'react-test-renderer';
@@ -153,7 +154,10 @@ jest.mock('react-native-webview', () => {
 });
 
 import App from '../App';
-import { clearWebData } from '../src/services/webData';
+import {
+  clearWebData,
+  configureNativeKeepAlive,
+} from '../src/services/webData';
 import { HandoffModal } from '../src/components/HandoffModal';
 import { RemoteWebView } from '../src/components/RemoteWebView';
 import { resumeSessionPersistence } from '../src/services/sessionVault';
@@ -446,7 +450,11 @@ describe('Session and navigation regressions', () => {
     mockWebViewMountCount = 0;
     mockOpenURL.mockClear();
     mockWebViewReload.mockClear();
+    mockWebViewInjectJavaScript.mockClear();
     (clearWebData as jest.Mock).mockReset().mockResolvedValue(undefined);
+    (configureNativeKeepAlive as jest.Mock)
+      .mockReset()
+      .mockResolvedValue(undefined);
     await act(async () => {
       tree = renderer.create(<App />);
     });
@@ -704,6 +712,89 @@ describe('Session and navigation regressions', () => {
     );
     expect(mockOpenURL).toHaveBeenCalledWith(
       'https://github.com/marcus-friction/antigravity-remote',
+    );
+  });
+
+  it('wakes authenticated sessions immediately on foreground resume and syncs keep-alive controls', async () => {
+    mockCookieStore.set('https://antigravity.google.com', {
+      SID: { name: 'SID', value: 'live-session', domain: '.google.com' },
+    });
+    await navigate('https://antigravity.google.com/r/workstation-1', false);
+
+    expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(true, 30, true);
+    mockWebViewInjectJavaScript.mockClear();
+
+    await act(async () => {
+      for (const listener of mockAppStateListeners) listener('background');
+      for (const listener of mockAppStateListeners) listener('active');
+    });
+
+    expect(
+      mockWebViewInjectJavaScript.mock.calls.some(
+        ([script]) =>
+          typeof script === 'string' &&
+          script.includes("new Event('online')") &&
+          script.includes("new Event('focus')"),
+      ),
+    ).toBe(true);
+
+    // Disable keep-alive via HandoffModal callback and verify native controller stops it
+    await act(async () => {
+      controls().props.onChangeKeepAliveMinutes?.(0);
+    });
+    expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(false, 0, false);
+
+    // Re-enable to 60 minutes
+    await act(async () => {
+      controls().props.onChangeKeepAliveMinutes?.(60);
+    });
+    expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(true, 60, true);
+  });
+
+  it('auto-recovers killed WebView render processes at the active URL and caps crash loops', async () => {
+    await navigate('https://antigravity.google.com/r/resilient-box', false);
+    const initialMounts = mockWebViewMountCount;
+
+    // 3 background process evictions auto-remount right at the active workstation URL
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await act(async () => {
+        webView().props.onRenderProcessGone({ nativeEvent: { didCrash: false } });
+      });
+      expect(mockWebViewMountCount).toBe(initialMounts + attempt);
+      expect(webView().props.source.uri).toBe(
+        'https://antigravity.google.com/r/resilient-box',
+      );
+    }
+
+    // 4th rapid termination within 30s halts auto-loop and shows manual Reconnect
+    await act(async () => {
+      webView().props.onContentProcessDidTerminate({ nativeEvent: {} });
+    });
+    expect(mockWebViewMountCount).toBe(initialMounts + 3);
+    expect(
+      tree.root
+        .findAllByType('Text' as any)
+        .some(
+          (node) =>
+            node.props.children ===
+            'The remote session view stopped unexpectedly. Tap Reconnect to reload.',
+        ),
+    ).toBe(true);
+
+    // Tapping Reconnect recreates the dead WebView instance cleanly
+    const reconnectBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((node) =>
+        node
+          .findAllByType('Text' as any)
+          .some((t) => t.props.children === 'Reconnect'),
+      )!;
+    await act(async () => {
+      reconnectBtn.props.onPress();
+    });
+    expect(mockWebViewMountCount).toBe(initialMounts + 4);
+    expect(webView().props.source.uri).toBe(
+      'https://antigravity.google.com/r/resilient-box',
     );
   });
 });

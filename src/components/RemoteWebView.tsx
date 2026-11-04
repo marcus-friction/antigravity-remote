@@ -8,6 +8,7 @@ import {
   Keyboard,
   KeyboardEvent,
   LayoutChangeEvent,
+  PermissionsAndroid,
   Platform,
   StyleSheet,
   Text,
@@ -17,18 +18,24 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { WebView, WebViewNavigation } from 'react-native-webview';
 import { ShouldStartLoadRequest } from 'react-native-webview/lib/WebViewTypes';
-import { ANTIGRAVITY_DASHBOARD_URL } from '../constants/config';
+import {
+  ANTIGRAVITY_DASHBOARD_URL,
+  DEFAULT_KEEP_ALIVE_MINUTES,
+} from '../constants/config';
 import {
   backupCookiesFromWebView,
   clearSession,
   getGoogleSessionSignature,
+  getKeepAliveMinutes,
   getLastActiveUrl,
   hydrateCookiesToWebView,
+  saveKeepAliveMinutes,
   saveLastActiveUrl,
   suspendSessionPersistence,
   resumeSessionPersistence,
 } from '../services/sessionVault';
-import { AuthFlowStage } from '../types/session';
+import { configureNativeKeepAlive } from '../services/webData';
+import { AuthFlowStage, KeepAliveMinutes } from '../types/session';
 import {
   isGoogleCookieErrorUrl,
   isAllowedAuthSubframeUrl,
@@ -84,6 +91,73 @@ const KEYBOARD_ADAPTATION_SCRIPT = `
 `;
 
 /**
+ * Dispatched immediately when the app returns to the foreground so active
+ * Antigravity WebSocket / streaming RPC clients and Google 2FA flows bypass
+ * stale reconnect backoff timers without reloading or losing unsent input.
+ */
+const RESUME_WAKEUP_SCRIPT = `
+(function() {
+  try {
+    window.dispatchEvent(new Event('online'));
+    window.dispatchEvent(new Event('focus'));
+    if (typeof PageTransitionEvent === 'function') {
+      window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: false }));
+    } else {
+      window.dispatchEvent(new Event('pageshow'));
+    }
+    document.dispatchEvent(new Event('visibilitychange'));
+  } catch (_) {}
+  return true;
+})();
+`;
+
+/**
+ * Acquires or releases a W3C Web Lock (`navigator.locks`) while background
+ * keep-alive is enabled so Chromium's Blink PageScheduler opts the session out
+ * of background page freezing without spoofing `document.visibilityState`.
+ */
+function buildKeepAliveWebLockScript(acquire: boolean): string {
+  if (acquire) {
+    return `
+(function() {
+  try {
+    if (window.__agyKeepAliveLockHeld) return true;
+    if (navigator && navigator.locks && typeof navigator.locks.request === 'function') {
+      window.__agyKeepAliveLockHeld = true;
+      navigator.locks.request('__agy_remote_keep_alive', function() {
+        return new Promise(function(resolve) {
+          window.__agyReleaseKeepAliveLock = function() {
+            window.__agyKeepAliveLockHeld = false;
+            window.__agyReleaseKeepAliveLock = null;
+            resolve();
+          };
+        });
+      }).catch(function() {
+        window.__agyKeepAliveLockHeld = false;
+      });
+    }
+  } catch (_) {}
+  return true;
+})();
+`;
+  }
+  return `
+(function() {
+  try {
+    if (typeof window.__agyReleaseKeepAliveLock === 'function') {
+      window.__agyReleaseKeepAliveLock();
+    }
+    window.__agyKeepAliveLockHeld = false;
+  } catch (_) {}
+  return true;
+})();
+`;
+}
+
+const MAX_RENDER_RECOVERY_ATTEMPTS = 3;
+const RENDER_RECOVERY_WINDOW_MS = 30_000;
+
+/**
  * Push-notification 2-Step Verification and cookie-sync paths where the user
  * approves a prompt outside the WebView (e.g., Google Prompt notification) and
  * the page may stall upon returning to the app. Excludes interactive input
@@ -127,8 +201,17 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const post2faReloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
+  const renderRecoveryTimestampsRef = useRef<number[]>([]);
+  const renderProcessDeadRef = useRef<boolean>(false);
+  const notificationPermissionRequestedRef = useRef<boolean>(false);
+  const keepAliveMinutesRef = useRef<KeepAliveMinutes>(
+    DEFAULT_KEEP_ALIVE_MINUTES,
+  );
 
   const [isHydrated, setIsHydrated] = useState<boolean>(false);
+  const [keepAliveMinutes, setKeepAliveMinutes] = useState<KeepAliveMinutes>(
+    DEFAULT_KEEP_ALIVE_MINUTES,
+  );
   const [currentSourceUrl, setCurrentSourceUrl] = useState<string>(
     ANTIGRAVITY_DASHBOARD_URL,
   );
@@ -159,6 +242,10 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   useEffect(() => {
     stageRef.current = stage;
   }, [stage]);
+
+  useEffect(() => {
+    keepAliveMinutesRef.current = keepAliveMinutes;
+  }, [keepAliveMinutes]);
 
   const checkPost2faSessionAndAdvance = useCallback(async () => {
     if (stageRef.current !== 'authenticating') {
@@ -194,8 +281,12 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     let isMounted = true;
 
     async function initializeSession() {
-      const restoredCount = await hydrateCookiesToWebView();
-      const savedUrl = await getLastActiveUrl();
+      const [restoredCount, savedUrl, savedKeepAliveMinutes] =
+        await Promise.all([
+          hydrateCookiesToWebView(),
+          getLastActiveUrl(),
+          getKeepAliveMinutes(),
+        ]);
 
       if (!isMounted) {
         return;
@@ -203,6 +294,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
 
       const initialTarget = incomingDeepLinkUrl ?? savedUrl;
       setLastSyncedCookieCount(restoredCount);
+      setKeepAliveMinutes(savedKeepAliveMinutes);
+      keepAliveMinutesRef.current = savedKeepAliveMinutes;
       setCurrentSourceUrl(initialTarget);
       currentNavUrlRef.current = initialTarget;
       if (incomingDeepLinkUrl) {
@@ -250,8 +343,59 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     onDeepLinkConsumed();
   }, [incomingDeepLinkUrl, isHydrated, onDeepLinkConsumed, resetRequest]);
 
+  // Step 2b: Synchronize bounded background keep-alive settings with native Android/iOS controllers
+  useEffect(() => {
+    const keepAliveEligible =
+      isHydrated &&
+      !isResettingSessionRef.current &&
+      !resetRequest &&
+      keepAliveMinutes > 0 &&
+      (stage === 'authenticated' || stage === 'authenticating');
+    const effectiveMinutes = keepAliveEligible
+      ? stage === 'authenticating'
+        ? Math.min(keepAliveMinutes, 3)
+        : keepAliveMinutes
+      : 0;
+
+    void configureNativeKeepAlive?.(
+      keepAliveEligible && effectiveMinutes > 0,
+      effectiveMinutes,
+      keepAliveEligible,
+    );
+
+    if (isHydrated && !resetRequest) {
+      webViewRef.current?.injectJavaScript(
+        buildKeepAliveWebLockScript(
+          keepAliveEligible && stage === 'authenticated',
+        ),
+      );
+    }
+
+    if (
+      Platform.OS === 'android' &&
+      typeof Platform.Version === 'number' &&
+      Platform.Version >= 33 &&
+      isHydrated &&
+      !resetRequest &&
+      stage === 'authenticated' &&
+      keepAliveMinutes > 0 &&
+      !notificationPermissionRequestedRef.current
+    ) {
+      notificationPermissionRequestedRef.current = true;
+      void PermissionsAndroid?.request?.(
+        'android.permission.POST_NOTIFICATIONS' as any,
+      )?.catch?.(() => undefined);
+    }
+  }, [isHydrated, keepAliveMinutes, resetRequest, stage]);
+
+  useEffect(() => {
+    return () => {
+      void configureNativeKeepAlive?.(false, 0, false);
+    };
+  }, []);
+
   // Step 3: Flush & back up cookies whenever the app transitions to background/inactive,
-  // and wake up / complete 2-Step Verification when returning to active
+  // and wake up active sessions + 2-Step Verification immediately when returning to active
   useEffect(() => {
     let resumeTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -261,18 +405,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         if (nextAppState === 'background' || nextAppState === 'inactive') {
           void syncCookiesToVault();
         } else if (nextAppState === 'active') {
+          if (hydratedRef.current && !isResettingSessionRef.current) {
+            webViewRef.current?.injectJavaScript(RESUME_WAKEUP_SCRIPT);
+          }
           void syncCookiesToVault();
           if (stageRef.current === 'authenticating') {
-            webViewRef.current?.injectJavaScript(`
-              (function() {
-                try {
-                  window.dispatchEvent(new Event('focus'));
-                  document.dispatchEvent(new Event('visibilitychange'));
-                  window.dispatchEvent(new Event('online'));
-                } catch (_) {}
-                return true;
-              })();
-            `);
             void checkPost2faSessionAndAdvance();
 
             const urlAtResume = currentNavUrlRef.current;
@@ -419,6 +556,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     if (isResettingSessionRef.current) return;
     isResettingSessionRef.current = true;
     suspendSessionPersistence();
+    void configureNativeKeepAlive?.(false, 0, false);
     webViewRef.current?.stopLoading();
     stageRef.current = 'hydrating';
     setStage('hydrating');
@@ -438,11 +576,16 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         setLastSyncedCookieCount(0);
         setHasNetworkError(false);
         setPageError(null);
+        renderProcessDeadRef.current = false;
+        renderRecoveryTimestampsRef.current = [];
         setCurrentSourceUrl(ANTIGRAVITY_DASHBOARD_URL);
         currentNavUrlRef.current = ANTIGRAVITY_DASHBOARD_URL;
         canGoBackRef.current = false;
-        if (resetRequest.reason === 'signout')
+        if (resetRequest.reason === 'signout') {
           cookieRecoveryAttemptsRef.current = 0;
+          setKeepAliveMinutes(DEFAULT_KEEP_ALIVE_MINUTES);
+          keepAliveMinutesRef.current = DEFAULT_KEEP_ALIVE_MINUTES;
+        }
         setWebViewInstanceKey((prev) => prev + 1);
         setStage('authenticating');
         isResettingSessionRef.current = false;
@@ -533,6 +676,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
               currentNavUrlRef.current === validation.normalizedUrl
             ) {
               cookieRecoveryAttemptsRef.current = 0;
+              renderRecoveryTimestampsRef.current = [];
+              renderProcessDeadRef.current = false;
               setStage('authenticated');
             }
           });
@@ -549,7 +694,37 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const handleLoadEnd = useCallback(() => {
     void syncCookiesToVault();
     webViewRef.current?.injectJavaScript(KEYBOARD_ADAPTATION_SCRIPT);
+    webViewRef.current?.injectJavaScript(
+      buildKeepAliveWebLockScript(
+        keepAliveMinutesRef.current > 0 && stageRef.current === 'authenticated',
+      ),
+    );
   }, [syncCookiesToVault]);
+
+  const handleWebProcessTerminated = useCallback(() => {
+    if (isResettingSessionRef.current) return;
+    const now = Date.now();
+    const recent = renderRecoveryTimestampsRef.current.filter(
+      (timestamp) => now - timestamp < RENDER_RECOVERY_WINDOW_MS,
+    );
+    if (recent.length >= MAX_RENDER_RECOVERY_ATTEMPTS) {
+      renderRecoveryTimestampsRef.current = recent;
+      renderProcessDeadRef.current = true;
+      setPageError(
+        'The remote session view stopped unexpectedly. Tap Reconnect to reload.',
+      );
+      setHasNetworkError(true);
+      setStage('offline');
+      return;
+    }
+    recent.push(now);
+    renderRecoveryTimestampsRef.current = recent;
+    renderProcessDeadRef.current = false;
+    setHasNetworkError(false);
+    setPageError(null);
+    setCurrentSourceUrl(currentNavUrlRef.current);
+    setWebViewInstanceKey((prev) => prev + 1);
+  }, []);
 
   const handleReloadSession = useCallback(() => {
     if (isResettingSessionRef.current) return;
@@ -557,8 +732,25 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     setPageError(null);
     setStage('authenticating');
     void syncCookiesToVault();
+    if (renderProcessDeadRef.current) {
+      renderProcessDeadRef.current = false;
+      renderRecoveryTimestampsRef.current = [];
+      setCurrentSourceUrl(currentNavUrlRef.current);
+      setWebViewInstanceKey((prev) => prev + 1);
+      return;
+    }
     webViewRef.current?.reload();
   }, [syncCookiesToVault]);
+
+  const handleChangeKeepAliveMinutes = useCallback(
+    (minutes: KeepAliveMinutes) => {
+      if (isResettingSessionRef.current) return;
+      keepAliveMinutesRef.current = minutes;
+      setKeepAliveMinutes(minutes);
+      void saveKeepAliveMinutes(minutes);
+    },
+    [],
+  );
 
   const handleNavigateToUrl = useCallback((targetUrl: string) => {
     if (isResettingSessionRef.current) return;
@@ -665,6 +857,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           onShouldStartLoadWithRequest={handleShouldStartLoadWithRequest}
           onNavigationStateChange={handleNavigationStateChange}
           onLoadEnd={handleLoadEnd}
+          onRenderProcessGone={handleWebProcessTerminated}
+          onContentProcessDidTerminate={handleWebProcessTerminated}
           onError={() => {
             setPageError(null);
             setHasNetworkError(true);
@@ -707,6 +901,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         visible={isModalVisible}
         stage={stage}
         lastSyncedCookieCount={lastSyncedCookieCount}
+        keepAliveMinutes={keepAliveMinutes}
+        onChangeKeepAliveMinutes={handleChangeKeepAliveMinutes}
         onClose={() => setIsModalVisible(false)}
         onNavigateToUrl={handleNavigateToUrl}
         onReloadSession={handleReloadSession}

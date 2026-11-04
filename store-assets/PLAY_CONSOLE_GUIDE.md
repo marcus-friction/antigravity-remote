@@ -71,3 +71,10 @@ Select **"All or some functionality in my app is restricted"** → **"Add instru
 - **Government app**: `No`
 - **Financial features**: `My app doesn't provide any financial features`
 - **Health features**: `My app does not have any health features`
+
+### I. Foreground Service Permissions (`FOREGROUND_SERVICE_SPECIAL_USE`)
+- **Foreground service type**: `specialUse`
+- **Use-case justification (Copy-Paste)**:
+  ```text
+  Antigravity Remote connects the user's mobile device to an active remote workstation CLI/IDE session on https://antigravity.google.com/r/<instance-id> over persistent HTTPS/WebSocket streams. Users frequently switch between Antigravity Remote and companion apps (2FA authenticators, password managers, documentation browsers, or team chat) while monitoring or steering an active remote coding session. Without a foreground service, Android freezes the process within seconds and drops the live workstation stream. When enabled by the user (15, 30, or 60 minutes max, or Off in Remote controls), the bounded non-exported foreground service keeps the active session open while multitasking and displays an ongoing notification with an immediate "Stop Keep-Alive" action button.
+  ```

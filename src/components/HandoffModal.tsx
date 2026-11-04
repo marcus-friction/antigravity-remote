@@ -13,16 +13,20 @@ import {
 } from 'react-native';
 import {
   ANTIGRAVITY_DASHBOARD_URL,
+  DEFAULT_KEEP_ALIVE_MINUTES,
+  KEEP_ALIVE_DURATION_OPTIONS,
   PRIVACY_POLICY_URL,
   SOURCE_REPO_URL,
 } from '../constants/config';
-import { AuthFlowStage } from '../types/session';
+import { AuthFlowStage, KeepAliveMinutes } from '../types/session';
 import { parseHandoffInput } from '../utils/urlValidator';
 
 interface HandoffModalProps {
   visible: boolean;
   stage: AuthFlowStage;
   lastSyncedCookieCount: number;
+  keepAliveMinutes?: KeepAliveMinutes;
+  onChangeKeepAliveMinutes?: (minutes: KeepAliveMinutes) => void;
   onClose: () => void;
   onNavigateToUrl: (targetUrl: string) => void;
   onReloadSession: () => void;
@@ -33,6 +37,8 @@ export const HandoffModal: React.FC<HandoffModalProps> = ({
   visible,
   stage,
   lastSyncedCookieCount,
+  keepAliveMinutes = DEFAULT_KEEP_ALIVE_MINUTES,
+  onChangeKeepAliveMinutes,
   onClose,
   onNavigateToUrl,
   onReloadSession,
@@ -86,6 +92,15 @@ export const HandoffModal: React.FC<HandoffModalProps> = ({
         ? 'Google Sign-In in progress'
         : 'Waiting for connection';
 
+  const isAndroid = Platform.OS === 'android';
+  const keepAliveHint = isAndroid
+    ? keepAliveMinutes > 0
+      ? `Holds active sessions open in background up to ${keepAliveMinutes}m (ongoing notification).`
+      : 'Background keep-alive off; OS may freeze idle sessions quickly.'
+    : keepAliveMinutes > 0
+      ? 'Holds connection across quick app switches (~30s iOS background limit).'
+      : 'Background keep-alive off; suspends immediately when switching apps.';
+
   return (
     <Modal
       visible={visible}
@@ -117,6 +132,73 @@ export const HandoffModal: React.FC<HandoffModalProps> = ({
           <View style={styles.statusCard}>
             <Text style={styles.statusLabel}>SESSION VAULT STATUS</Text>
             <Text style={styles.statusValue}>{statusText}</Text>
+          </View>
+
+          <View style={styles.keepAliveSection}>
+            <Text style={styles.sectionLabel}>Background Keep-Alive</Text>
+            <View style={styles.keepAliveRow}>
+              {isAndroid
+                ? KEEP_ALIVE_DURATION_OPTIONS.map((minutes) => {
+                    const selected = keepAliveMinutes === minutes;
+                    const label = minutes === 0 ? 'Off' : `${minutes}m`;
+                    return (
+                      <TouchableOpacity
+                        key={minutes}
+                        style={[
+                          styles.keepAliveChip,
+                          selected ? styles.keepAliveChipSelected : null,
+                        ]}
+                        onPress={() => onChangeKeepAliveMinutes?.(minutes)}
+                        accessibilityRole="button"
+                        accessibilityState={{ selected }}
+                        accessibilityLabel={`Keep-alive ${label}`}
+                      >
+                        <Text
+                          style={[
+                            styles.keepAliveChipText,
+                            selected ? styles.keepAliveChipTextSelected : null,
+                          ]}
+                        >
+                          {label}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })
+                : (
+                    [
+                      { label: 'Off', value: 0 as KeepAliveMinutes, selected: keepAliveMinutes === 0 },
+                      {
+                        label: 'On (~30s)',
+                        value: DEFAULT_KEEP_ALIVE_MINUTES as KeepAliveMinutes,
+                        selected: keepAliveMinutes > 0,
+                      },
+                    ] as const
+                  ).map((option) => (
+                    <TouchableOpacity
+                      key={option.label}
+                      style={[
+                        styles.keepAliveChip,
+                        option.selected ? styles.keepAliveChipSelected : null,
+                      ]}
+                      onPress={() => onChangeKeepAliveMinutes?.(option.value)}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected: option.selected }}
+                      accessibilityLabel={`Keep-alive ${option.value === 0 ? 'Off' : 'On'}`}
+                    >
+                      <Text
+                        style={[
+                          styles.keepAliveChipText,
+                          option.selected
+                            ? styles.keepAliveChipTextSelected
+                            : null,
+                        ]}
+                      >
+                        {option.label}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+            </View>
+            <Text style={styles.keepAliveHint}>{keepAliveHint}</Text>
           </View>
 
           <Text style={styles.sectionLabel}>
@@ -304,9 +386,45 @@ const styles = StyleSheet.create({
     backgroundColor: '#1E293B',
     borderRadius: 12,
     padding: 12,
-    marginBottom: 18,
+    marginBottom: 14,
     borderWidth: 1,
     borderColor: '#334155',
+  },
+  keepAliveSection: {
+    marginBottom: 14,
+  },
+  keepAliveRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 4,
+    marginBottom: 6,
+  },
+  keepAliveChip: {
+    flex: 1,
+    paddingVertical: 8,
+    paddingHorizontal: 8,
+    borderRadius: 9,
+    backgroundColor: '#1E293B',
+    borderWidth: 1,
+    borderColor: '#334155',
+    alignItems: 'center',
+  },
+  keepAliveChipSelected: {
+    backgroundColor: '#1D4ED8',
+    borderColor: '#60A5FA',
+  },
+  keepAliveChipText: {
+    color: '#CBD5E1',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  keepAliveChipTextSelected: {
+    color: '#FFFFFF',
+    fontWeight: '700',
+  },
+  keepAliveHint: {
+    color: '#94A3B8',
+    fontSize: 11,
   },
   statusLabel: {
     color: '#94A3B8',

@@ -12,6 +12,8 @@ Android uses the native cookie database, not an encrypted cookie backup. iOS eli
 
 The local RemoteSession module clears Android web storage and cache, using the browsing-data completion callback on supported WebViews, and removes all WKWebsiteDataStore data on iOS. Older Android WebViews expose only the legacy storage-deletion API without a completion callback; real-device sign-out validation must include supported WebView versions.
 
+Background session keep-alive uses a non-exported Android `specialUse` foreground service (`RemoteKeepAliveService`) with an immutable stop action, bounded CPU wake lock (`1..60` minutes), and renderer priority retention while enabled, plus a synchronous `UIApplication.beginBackgroundTask` (~30 second OS limit) on iOS. Starting sign-out or disabling keep-alive immediately stops the service, releases wake locks, and clears the saved preference during cleanup.
+
 ## Navigation boundaries
 
 All schemes enter the application navigation callback through `originWhitelist=['*']`; this prevents react-native-webview from automatically launching unapproved schemes. Only validated external HTTPS documents can be handed to the OS. Internal blank/srcdoc/blob documents are limited to subframes; blob origins must themselves be trusted.
