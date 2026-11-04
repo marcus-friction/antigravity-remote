@@ -2,12 +2,14 @@ package expo.modules.remotesession
 
 import android.app.Activity
 import android.app.Application
+import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.View
 import android.view.ViewGroup
+import java.util.WeakHashMap
 import android.webkit.WebStorage
 import android.webkit.WebView
 import androidx.webkit.WebStorageCompat
@@ -24,6 +26,7 @@ class RemoteSessionModule : Module() {
   @Volatile private var sessionActive: Boolean = false
   @Volatile private var stoppedForCurrentBackgroundStay: Boolean = false
   private var registeredApplication: Application? = null
+  private val observedDecorViews = WeakHashMap<View, View.OnLayoutChangeListener>()
 
   private val activityLifecycleCallbacks = object : Application.ActivityLifecycleCallbacks {
     override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
@@ -34,6 +37,7 @@ class RemoteSessionModule : Module() {
       stoppedForCurrentBackgroundStay = false
       runOnMain {
         stopKeepAliveServiceIfRunning()
+        applyDrawerGestureExclusion(activity)
         applyWebViewKeepAlivePolicy(
           protectInBackground = shouldKeepAlive(),
           wakeTimers = true,
@@ -78,7 +82,14 @@ class RemoteSessionModule : Module() {
     }
 
     override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
-    override fun onActivityDestroyed(activity: Activity) = Unit
+    override fun onActivityDestroyed(activity: Activity) {
+      val decorView = activity.window?.decorView ?: return
+      runOnMain {
+        observedDecorViews.remove(decorView)?.let { listener ->
+          decorView.removeOnLayoutChangeListener(listener)
+        }
+      }
+    }
   }
 
   private fun runOnMain(block: () -> Unit) {
@@ -141,6 +152,45 @@ class RemoteSessionModule : Module() {
     }
   }
 
+  private fun applyDrawerGestureExclusion(hostActivity: Activity? = null) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+    val activity = hostActivity ?: appContext.currentActivity ?: return
+    val decorView = activity.window?.decorView ?: return
+
+    fun updateExclusionRects(view: View) {
+      val height = view.height
+      if (height <= 0) return
+      val density = view.resources.displayMetrics.density
+      val halfZonePx = (74f * density).toInt()
+      val edgeWidthPx = (48f * density).toInt()
+      val centerY = height / 2
+      view.systemGestureExclusionRects = listOf(
+        Rect(
+          0,
+          (centerY - halfZonePx).coerceAtLeast(0),
+          edgeWidthPx,
+          (centerY + halfZonePx).coerceAtMost(height)
+        )
+      )
+    }
+
+    if (!observedDecorViews.containsKey(decorView)) {
+      val listener = View.OnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+        updateExclusionRects(v)
+      }
+      observedDecorViews[decorView] = listener
+      decorView.addOnLayoutChangeListener(listener)
+    }
+    decorView.post { updateExclusionRects(decorView) }
+  }
+
+  private fun clearDrawerGestureExclusionObservers() {
+    for ((view, listener) in observedDecorViews) {
+      view.removeOnLayoutChangeListener(listener)
+    }
+    observedDecorViews.clear()
+  }
+
   private fun stopKeepAliveServiceIfRunning() {
     val context = appContext.reactContext ?: appContext.currentActivity?.applicationContext ?: return
     RemoteKeepAliveService.stop(context)
@@ -151,6 +201,7 @@ class RemoteSessionModule : Module() {
 
     OnCreate {
       registerActivityLifecycleObserverIfNeeded()
+      runOnMain { applyDrawerGestureExclusion() }
       RemoteKeepAliveService.registerKeepAliveEndedListener(this@RemoteSessionModule) { stoppedByUser ->
         if (stoppedByUser) {
           stoppedForCurrentBackgroundStay = true
@@ -209,6 +260,7 @@ class RemoteSessionModule : Module() {
       runOnMain {
         registerActivityLifecycleObserverIfNeeded()
         stopKeepAliveServiceIfRunning()
+        applyDrawerGestureExclusion()
         applyWebViewKeepAlivePolicy(
           protectInBackground = shouldKeepAlive(),
           wakeTimers = true
@@ -224,6 +276,7 @@ class RemoteSessionModule : Module() {
     }
 
     OnDestroy {
+      runOnMain { clearDrawerGestureExclusionObservers() }
       unregisterActivityLifecycleObserver()
       RemoteKeepAliveService.unregisterKeepAliveEndedListener(this@RemoteSessionModule)
       stopKeepAliveServiceIfRunning()

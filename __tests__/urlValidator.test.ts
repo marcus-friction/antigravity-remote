@@ -5,6 +5,7 @@ jest.mock('react-native', () => ({
 }));
 
 import {
+  isAllowedRemoteClientSubframeUrl,
   isGoogleCookieErrorUrl,
   isInternalWebViewSchemeUrl,
   parseHandoffInput,
@@ -68,6 +69,23 @@ describe('urlValidator', () => {
     expect(
       isInternalWebViewSchemeUrl('blob:http://accounts.google.com/id'),
     ).toBe(false);
+  });
+
+  it('permits Antigravity static workspace client URLs strictly as subframes, never top-level', () => {
+    const clientUrl =
+      'https://antigravity.static.usercontent.goog/web/1.0.20260910010023/?iframe=true';
+    expect(isAllowedRemoteClientSubframeUrl(clientUrl)).toBe(true);
+    expect(validateNavigationUrl(clientUrl).isAllowedInApp).toBe(false);
+
+    for (const disallowed of [
+      'https://antigravity.static.usercontent.goog/',
+      'https://antigravity.static.usercontent.goog/other/index.html',
+      'https://other.static.usercontent.goog/web/1.0/index.html',
+      'https://antigravity.static.usercontent.goog:8443/web/1.0/index.html',
+      'http://antigravity.static.usercontent.goog/web/1.0/index.html',
+    ]) {
+      expect(isAllowedRemoteClientSubframeUrl(disallowed)).toBe(false);
+    }
   });
   describe('validateNavigationUrl', () => {
     it('allows Antigravity Remote dashboard and handoff URLs in-app', () => {

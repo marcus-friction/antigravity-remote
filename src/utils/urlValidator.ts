@@ -117,6 +117,23 @@ export function isAllowedAuthSubframeUrl(rawUrl: string): boolean {
 }
 
 /**
+ * Antigravity Remote Control embeds the Jetski web client inside an iframe
+ * served from `https://antigravity.static.usercontent.goog/web/<version>/`.
+ * Granting subframe-only permission allows WKWebView / Android WebView to mount
+ * the embedded workspace UI without granting top-level trust to `.usercontent.goog`.
+ */
+export function isAllowedRemoteClientSubframeUrl(rawUrl: string): boolean {
+  const validation = validateNavigationUrl(rawUrl);
+  if (!validation.isValid || !validation.normalizedUrl) return false;
+  const parsed = new URL(validation.normalizedUrl);
+  return (
+    !parsed.port &&
+    parsed.hostname === 'antigravity.static.usercontent.goog' &&
+    parsed.pathname.startsWith('/web/')
+  );
+}
+
+/**
  * Validates a URL before allowing the WebView to navigate or handing it off to
  * the system browser. Enforces HTTPS and checks against the strict hostname allow-list.
  */

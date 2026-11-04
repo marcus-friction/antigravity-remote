@@ -11,6 +11,7 @@ const mockAppStateListeners = new Set<(state: string) => void>();
 const mockKeyboardShowListeners = new Set<(event: any) => void>();
 const mockKeyboardHideListeners = new Set<() => void>();
 const mockLinkingListeners = new Set<(event: { url: string }) => void>();
+const mockBackPressListeners = new Set<() => boolean>();
 let mockInitialUrl: string | null = null;
 const mockOpenURL = jest.fn(async (_url: string) => true);
 const mockPermissionsCheck = jest.fn(async (_permission: string) => false);
@@ -25,6 +26,19 @@ jest.mock('react-native', () => {
       ReactLib.createElement(name, { ...props, ref }, props.children),
     );
 
+  class MockAnimatedValue {
+    _value: number;
+    constructor(initialValue: number) {
+      this._value = initialValue;
+    }
+    setValue(nextValue: number) {
+      this._value = nextValue;
+    }
+    interpolate() {
+      return 1;
+    }
+  }
+
   return {
     Platform: { OS: 'ios', Version: 34 },
     PermissionsAndroid: {
@@ -36,6 +50,30 @@ jest.mock('react-native', () => {
       create: (styles: any) => styles,
       hairlineWidth: 1,
       absoluteFillObject: {},
+    },
+    useWindowDimensions: () => ({ width: 390, height: 844 }),
+    Animated: {
+      Value: MockAnimatedValue,
+      View: mockComponent('Animated.View'),
+      timing: (val: any, config: any) => ({
+        start: (cb?: (result: { finished: boolean }) => void) => {
+          if (val && typeof val.setValue === 'function' && typeof config?.toValue === 'number') {
+            val.setValue(config.toValue);
+          }
+          cb?.({ finished: true });
+        },
+      }),
+      spring: (val: any, config: any) => ({
+        start: (cb?: (result: { finished: boolean }) => void) => {
+          if (val && typeof val.setValue === 'function' && typeof config?.toValue === 'number') {
+            val.setValue(config.toValue);
+          }
+          cb?.({ finished: true });
+        },
+      }),
+    },
+    PanResponder: {
+      create: (handlers: any) => ({ panHandlers: handlers }),
     },
     View: mockComponent('View'),
     ScrollView: mockComponent('ScrollView'),
@@ -70,7 +108,10 @@ jest.mock('react-native', () => {
       }),
     },
     BackHandler: {
-      addEventListener: jest.fn(() => ({ remove: jest.fn() })),
+      addEventListener: jest.fn((_event: string, handler: () => boolean) => {
+        mockBackPressListeners.add(handler);
+        return { remove: () => mockBackPressListeners.delete(handler) };
+      }),
     },
   };
 });
@@ -168,7 +209,12 @@ import {
   clearWebData,
   configureNativeKeepAlive,
 } from '../src/services/webData';
-import { HandoffModal } from '../src/components/HandoffModal';
+import {
+  CLOSED_HANDLE_TOUCH_LEFT,
+  HANDLE_LINE_HEIGHT,
+  HANDLE_LINE_WIDTH,
+  LeftNavigationDrawer,
+} from '../src/components/LeftNavigationDrawer';
 import { RemoteWebView } from '../src/components/RemoteWebView';
 import { resumeSessionPersistence } from '../src/services/sessionVault';
 import { SECURE_STORE_META_KEY } from '../src/constants/config';
@@ -184,6 +230,7 @@ describe('End-to-End <App /> Flow', () => {
     mockCookieStore.clear();
     mockAppStateListeners.clear();
     mockLinkingListeners.clear();
+    mockBackPressListeners.clear();
     mockInitialUrl = null;
     mockOpenURL.mockClear();
     mockWebViewReload.mockClear();
@@ -294,18 +341,40 @@ describe('End-to-End <App /> Flow', () => {
       'Google Sign-In active — your session will be saved automatically',
     );
 
-    // 6. Open native Handoff Modal via the floating 'Remote' pill and paste CLI output
-    const pillButton = tree.root.findAll(
+    // 6. Open unified left-hand navigation drawer, switch to Session mode, and paste CLI output
+    expect(
+      tree.root.findAll(
+        (node) =>
+          node.type === ('TouchableOpacity' as any) &&
+          node.props.accessibilityLabel === 'Open Antigravity Remote controls',
+      ),
+    ).toHaveLength(0);
+
+    const drawerHandleButton = tree.root.findAll(
       (node) =>
         node.type === ('TouchableOpacity' as any) &&
-        node.props.accessibilityLabel === 'Open Antigravity Remote controls',
+        node.props.accessibilityLabel === 'Open Antigravity drawer',
     )[0];
+    expect(drawerHandleButton).toBeDefined();
 
     await act(async () => {
-      pillButton.props.onPress();
+      drawerHandleButton.props.onPress();
     });
 
-    const handoffInput = tree.root.findByType('TextInput' as any);
+    const sessionModeBtn = tree.root.findAll(
+      (node) =>
+        node.type === ('TouchableOpacity' as any) &&
+        node.props.accessibilityLabel === 'Drawer mode Session',
+    )[0];
+    await act(async () => {
+      sessionModeBtn.props.onPress();
+    });
+
+    const handoffInput = tree.root.findAll(
+      (node) =>
+        node.type === ('TextInput' as any) &&
+        node.props.accessibilityLabel === 'CLI handoff link or instance ID',
+    )[0];
     await act(async () => {
       handoffInput.props.onChangeText(
         'Remote control on for this session.\nOpen https://antigravity.google.com/r/devbox-swift-falcon?p=c%2F777 on another device',
@@ -363,12 +432,12 @@ describe('End-to-End <App /> Flow', () => {
       }
     });
 
-    // Verify floating 'Remote' pill hides while typing and WebView wrapper shrinks above keyboard
+    // Verify closed left-drawer handle hides while typing and WebView wrapper shrinks above keyboard
     expect(
       tree.root.findAll(
         (node) =>
           node.type === ('TouchableOpacity' as any) &&
-          node.props.accessibilityLabel === 'Open Antigravity Remote controls',
+          node.props.accessibilityLabel === 'Open Antigravity drawer',
       ).length,
     ).toBe(0);
     expect(mockWebViewInjectJavaScript).toHaveBeenCalled();
@@ -380,16 +449,25 @@ describe('End-to-End <App /> Flow', () => {
       }
     });
 
-    const restoredPillButton = tree.root.findAll(
+    const restoredDrawerHandle = tree.root.findAll(
       (node) =>
         node.type === ('TouchableOpacity' as any) &&
-        node.props.accessibilityLabel === 'Open Antigravity Remote controls',
+        node.props.accessibilityLabel === 'Open Antigravity drawer',
     )[0];
-    expect(restoredPillButton).toBeDefined();
+    expect(restoredDrawerHandle).toBeDefined();
 
     // 9. Test Sign Out flow: wipes CookieManager, SecureStore chunks, and resets WebView
     await act(async () => {
-      restoredPillButton.props.onPress();
+      restoredDrawerHandle.props.onPress();
+    });
+
+    const sessionModeBtnForSignOut = tree.root.findAll(
+      (node) =>
+        node.type === ('TouchableOpacity' as any) &&
+        node.props.accessibilityLabel === 'Drawer mode Session',
+    )[0];
+    await act(async () => {
+      sessionModeBtnForSignOut.props.onPress();
     });
 
     const signOutTrigger = tree.root.findAll(
@@ -456,6 +534,7 @@ describe('Session and navigation regressions', () => {
     mockKeyboardShowListeners.clear();
     mockKeyboardHideListeners.clear();
     mockLinkingListeners.clear();
+    mockBackPressListeners.clear();
     mockInitialUrl = null;
     mockWebViewMountCount = 0;
     mockOpenURL.mockClear();
@@ -478,7 +557,7 @@ describe('Session and navigation regressions', () => {
     await act(async () => tree.unmount());
   });
   const webView = () => tree.root.findByType('WebView' as any);
-  const controls = () => tree.root.findByType(HandoffModal);
+  const controls = () => tree.root.findByType(LeftNavigationDrawer);
   const navigate = async (url: string, loading = false) => {
     await act(async () =>
       webView().props.onNavigationStateChange({
@@ -603,8 +682,26 @@ describe('Session and navigation regressions', () => {
           isTopFrame: false,
         }),
       ).toBe(true);
+      expect(
+        webView().props.onShouldStartLoadWithRequest({
+          url: 'https://antigravity.static.usercontent.goog/web/1.0.20260910010023/?iframe=true',
+          isTopFrame: false,
+        }),
+      ).toBe(true);
     });
     expect(mockOpenURL).not.toHaveBeenCalled();
+    await act(async () => {
+      expect(
+        webView().props.onShouldStartLoadWithRequest({
+          url: 'https://antigravity.static.usercontent.goog/web/1.0.20260910010023/?iframe=true',
+          isTopFrame: true,
+        }),
+      ).toBe(false);
+    });
+    expect(mockOpenURL).toHaveBeenCalledWith(
+      'https://antigravity.static.usercontent.goog/web/1.0.20260910010023/?iframe=true',
+    );
+    mockOpenURL.mockClear();
     await act(async () => {
       expect(
         webView().props.onShouldStartLoadWithRequest({
@@ -701,14 +798,14 @@ describe('Session and navigation regressions', () => {
     expect(clearWebData).toHaveBeenCalledTimes(3);
   });
 
-  it('opens the Privacy Policy and Open Source links in the external browser from Remote controls', async () => {
-    const pillButton = tree.root.findAll(
+  it('opens the Privacy Policy and Open Source links in the external browser from the left Session drawer', async () => {
+    const drawerHandle = tree.root.findAll(
       (node) =>
         node.type === ('TouchableOpacity' as any) &&
-        node.props.accessibilityLabel === 'Open Antigravity Remote controls',
+        node.props.accessibilityLabel === 'Open Antigravity drawer',
     )[0];
     await act(async () => {
-      pillButton.props.onPress();
+      drawerHandle.props.onPress();
     });
     const privacyLink = tree.root
       .findAllByType('TouchableOpacity' as any)
@@ -778,14 +875,20 @@ describe('Session and navigation regressions', () => {
       ),
     ).toBe(true);
 
-    // Open HandoffModal, verify explanatory guidance, and opt in ('5m' -> '60m' -> 'Off')
-    const menuPill = tree.root.findAll(
+    // Open left drawer, switch to Session mode, verify explanatory guidance, and opt in ('5m' -> '60m' -> 'Off')
+    const drawerHandle = tree.root.findAll(
       (node) =>
         node.type === ('TouchableOpacity' as any) &&
-        node.props.accessibilityLabel === 'Open Antigravity Remote controls',
+        node.props.accessibilityLabel === 'Open Antigravity drawer',
     )[0];
     await act(async () => {
-      menuPill.props.onPress();
+      drawerHandle.props.onPress();
+    });
+    const sessionModeBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((node) => node.props.accessibilityLabel === 'Drawer mode Session')!;
+    await act(async () => {
+      sessionModeBtn.props.onPress();
     });
 
     expect(
@@ -934,7 +1037,7 @@ describe('Session and navigation regressions', () => {
       'https://antigravity.google.com/r/resilient-box',
     );
 
-    // Trigger another 4-crash halt and verify manual HandoffModal navigation also clears dead-renderer state
+    // Trigger another 4-crash halt and verify manual LeftNavigationDrawer navigation also clears dead-renderer state
     for (let attempt = 1; attempt <= 4; attempt++) {
       await act(async () => {
         webView().props.onRenderProcessGone({ nativeEvent: { didCrash: true } });
@@ -950,5 +1053,343 @@ describe('Session and navigation regressions', () => {
       controls().props.onReloadSession();
     });
     expect(mockWebViewReload).toHaveBeenCalledTimes(1);
+  });
+
+  it('aggregates cross-machine threads in the pull-in left Inbox drawer, preserves back-gesture edge gap and matching handle geometry, and wipes state on Sign Out', async () => {
+    const RNPlatform = require('react-native').Platform;
+    RNPlatform.OS = 'android';
+    RNPlatform.Version = 34;
+    await act(async () => {
+      tree.unmount();
+    });
+    await act(async () => {
+      tree = renderer.create(<App />);
+    });
+
+    // Verify back-gesture-safe gap (>= 20dp) and shared 4px × 112px handle geometry
+    expect(CLOSED_HANDLE_TOUCH_LEFT).toBeGreaterThanOrEqual(20);
+    expect(HANDLE_LINE_WIDTH).toBe(4);
+    expect(HANDLE_LINE_HEIGHT).toBe(112);
+
+    mockCookieStore.set('https://antigravity.google.com', {
+      SID: { name: 'SID', value: 'inbox-session', domain: '.google.com' },
+    });
+    await navigate('https://antigravity.google.com/r/workstation-1?p=c%2Factive-1', false);
+
+    // 1. Bridge messages from untrusted or auth origins must be ignored
+    const spoofedPayload = JSON.stringify({
+      type: 'AGY_INBOX_SNAPSHOT',
+      fetchedAtMs: 1_762_265_000_000,
+      instances: [
+        {
+          uuid: 'spoofed-box',
+          name: 'Spoofed',
+          status: 1,
+          trajectories: {
+            'spoofed-thread': {
+              summary: 'Spoofed approval',
+              waitingSteps: [{ step: {} }],
+            },
+          },
+        },
+      ],
+    });
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://evil.example/attack',
+          data: spoofedPayload,
+        },
+      });
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://accounts.google.com/v3/signin',
+          data: spoofedPayload,
+        },
+      });
+    });
+
+    const closedHandleBefore = tree.root.findAll(
+      (node) =>
+        node.type === ('TouchableOpacity' as any) &&
+        node.props.accessibilityLabel === 'Open Antigravity drawer',
+    )[0];
+    expect(closedHandleBefore).toBeDefined();
+    expect(closedHandleBefore.props.accessibilityHint).toBe(
+      'Open Antigravity drawer',
+    );
+    expect(controls().props.attentionCount).toBe(0);
+
+    // 2. Receive verified snapshot from antigravity.google.com across 2 workstations
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Factive-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_SNAPSHOT',
+            fetchedAtMs: 1_762_265_000_000,
+            activeUrl:
+              'https://antigravity.google.com/r/workstation-1?p=c%2Factive-1',
+            instances: [
+              {
+                uuid: 'workstation-1',
+                name: 'Primary Laptop',
+                status: 1,
+                trajectories: {
+                  'approval-local': {
+                    summary: 'Deploy mobile release',
+                    waitingSteps: [
+                      {
+                        step: {
+                          runCommand: {
+                            commandLine: './gradlew bundleRelease',
+                          },
+                        },
+                      },
+                    ],
+                    lastModifiedTime: '2026-11-04T14:20:00Z',
+                  },
+                },
+              },
+              {
+                uuid: 'workstation-2',
+                name: 'Cloud GPU Box',
+                status: 1,
+                trajectories: {
+                  'unread-remote': {
+                    summary: 'Evaluate benchmark metrics',
+                    status: 1,
+                    lastModifiedTime: '2026-11-04T14:18:00Z',
+                    lastUserInputTime: '2026-11-04T14:10:00Z',
+                  },
+                },
+              },
+            ],
+          }),
+        },
+      });
+    });
+
+    // Closed handle reflects 2 threads needing attention without any bottom-right pill
+    expect(controls().props.attentionCount).toBe(2);
+    const closedHandleAfter = tree.root.findAll(
+      (node) =>
+        node.type === ('TouchableOpacity' as any) &&
+        node.props.accessibilityLabel === 'Open Antigravity drawer',
+    )[0];
+    expect(closedHandleAfter.props.accessibilityHint).toBe(
+      'Open Antigravity drawer (2 need attention)',
+    );
+
+    // 3. Pull the left drawer open via horizontal drag gesture on the closed handle zone
+    const closedDragZone = tree.root.findAll(
+      (node) =>
+        node.type === ('View' as any) &&
+        typeof node.props.onMoveShouldSetPanResponder === 'function',
+    )[0];
+    expect(closedDragZone).toBeDefined();
+    expect(
+      closedDragZone.props.onMoveShouldSetPanResponder({}, { dx: 18, dy: 2 }),
+    ).toBe(true);
+
+    await act(async () => {
+      closedDragZone.props.onPanResponderGrant();
+      closedDragZone.props.onPanResponderMove({}, { dx: 180, dy: 4, vx: 0.6 });
+      closedDragZone.props.onPanResponderRelease(
+        {},
+        { dx: 180, dy: 4, vx: 0.6 },
+      );
+    });
+
+    // Open drawer displays Inbox mode with count badge '2' and matching 4px × 112px inner-right handle
+    const inboxModeBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((node) => node.props.accessibilityLabel === 'Drawer mode Inbox')!;
+    expect(
+      inboxModeBtn.findAllByType('Text' as any).map((t) => t.props.children),
+    ).toEqual(['Inbox', '2']);
+
+    const innerRightHandle = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find(
+        (node) => node.props.accessibilityLabel === 'Close Antigravity drawer',
+      )!;
+    expect(innerRightHandle).toBeDefined();
+    const innerHandleBar = innerRightHandle.findByType('View' as any);
+    const flatBarStyle = Object.assign(
+      {},
+      ...(Array.isArray(innerHandleBar.props.style)
+        ? innerHandleBar.props.style.filter(Boolean)
+        : [innerHandleBar.props.style]),
+    );
+    expect(flatBarStyle.width).toBe(HANDLE_LINE_WIDTH);
+    expect(flatBarStyle.height).toBe(HANDLE_LINE_HEIGHT);
+
+    // Mark the unread thread as read
+    const markReadBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find(
+        (node) =>
+          node.props.accessibilityLabel ===
+          'Mark Evaluate benchmark metrics as read',
+      )!;
+    expect(markReadBtn).toBeDefined();
+
+    mockWebViewInjectJavaScript.mockClear();
+    await act(async () => {
+      markReadBtn.props.onPress();
+    });
+
+    expect(
+      mockWebViewInjectJavaScript.mock.calls.some(
+        ([script]) =>
+          typeof script === 'string' &&
+          script.includes('markThreadRead') &&
+          script.includes('unread-remote'),
+      ),
+    ).toBe(true);
+
+    // Badge drops to 1 (`approval-local` still awaits command approval)
+    expect(
+      inboxModeBtn.findAllByType('Text' as any).map((t) => t.props.children),
+    ).toEqual(['Inbox', '1']);
+
+    // 4. Select `approval-local` on the same workstation -> uses fast iframe switch without remounting WebView
+    const mountsBeforeFastSwitch = mockWebViewMountCount;
+    mockWebViewInjectJavaScript.mockClear();
+
+    const approvalCard = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find(
+        (node) =>
+          node.props.accessibilityLabel === 'Open thread Deploy mobile release',
+      )!;
+    await act(async () => {
+      approvalCard.props.onPress();
+    });
+
+    const fastSwitchCall = mockWebViewInjectJavaScript.mock.calls.find(
+      ([script]) =>
+        typeof script === 'string' && script.includes('fastNavigate'),
+    );
+    expect(fastSwitchCall).toBeDefined();
+    const requestIdMatch = /"requestId":"([^"]+)"/.exec(fastSwitchCall![0]);
+    expect(requestIdMatch).not.toBeNull();
+
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Factive-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_FAST_NAV_RESULT',
+            requestId: requestIdMatch![1],
+            handled: true,
+            targetUrl:
+              'https://antigravity.google.com/r/workstation-1?p=c%2Fapproval-local',
+          }),
+        },
+      });
+    });
+    expect(mockWebViewMountCount).toBe(mountsBeforeFastSwitch);
+
+    // Unsolicited or replayed AGY_INBOX_FAST_NAV_RESULT messages must be ignored
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fapproval-local',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_FAST_NAV_RESULT',
+            requestId: 'unsolicited-request-id',
+            handled: false,
+            targetUrl: 'https://antigravity.google.com/r/spoofed-workstation',
+          }),
+        },
+      });
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fapproval-local',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_FAST_NAV_RESULT',
+            requestId: requestIdMatch![1],
+            handled: false,
+            targetUrl: 'https://antigravity.google.com/r/spoofed-workstation',
+          }),
+        },
+      });
+    });
+    expect(mockWebViewMountCount).toBe(mountsBeforeFastSwitch);
+    expect(webView().props.source.uri).not.toContain('spoofed-workstation');
+
+    // 5. Reopen drawer, verify keyboard inset while open, and verify Android hardware Back closes drawer before WebView history
+    mockWebViewGoBack.mockClear();
+    const reopenHandle = tree.root.findAll(
+      (node) =>
+        node.type === ('TouchableOpacity' as any) &&
+        node.props.accessibilityLabel === 'Open Antigravity drawer',
+    )[0];
+    await act(async () => {
+      reopenHandle.props.onPress();
+    });
+    expect(controls().props.visible).toBe(true);
+
+    await act(async () => {
+      for (const listener of mockKeyboardShowListeners) {
+        listener({ endCoordinates: { height: 312 } });
+      }
+    });
+    expect(controls().props.visible).toBe(true);
+    expect(controls().props.keyboardBottomPadding).toBeGreaterThan(0);
+
+    await act(async () => {
+      for (const listener of mockKeyboardHideListeners) {
+        listener();
+      }
+    });
+
+    let backConsumedWhileOpen = false;
+    await act(async () => {
+      for (const listener of mockBackPressListeners) {
+        backConsumedWhileOpen = listener() || backConsumedWhileOpen;
+      }
+    });
+    expect(backConsumedWhileOpen).toBe(true);
+    expect(controls().props.visible).toBe(false);
+    expect(mockWebViewGoBack).not.toHaveBeenCalled();
+
+    // 6. Reopen drawer, switch to 'All' tab, and select `unread-remote` on `workstation-2` -> navigates WebView across machines
+    const reopenHandle2 = tree.root.findAll(
+      (node) =>
+        node.type === ('TouchableOpacity' as any) &&
+        node.props.accessibilityLabel === 'Open Antigravity drawer',
+    )[0];
+    await act(async () => {
+      reopenHandle2.props.onPress();
+    });
+    const allTab = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((node) => node.props.accessibilityLabel === 'Inbox tab All')!;
+    await act(async () => {
+      allTab.props.onPress();
+    });
+    const crossMachineCard = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find(
+        (node) =>
+          node.props.accessibilityLabel ===
+          'Open thread Evaluate benchmark metrics',
+      )!;
+    await act(async () => {
+      crossMachineCard.props.onPress();
+    });
+    expect(webView().props.source.uri).toBe(
+      'https://antigravity.google.com/r/workstation-2?p=c%2Funread-remote',
+    );
+
+    // 7. Sign Out wipes all Inbox state immediately
+    await act(async () => {
+      await controls().props.onSignOut();
+    });
+    expect(controls().props.attentionCount).toBe(0);
+    expect(controls().props.snapshot.threads).toHaveLength(0);
   });
 });

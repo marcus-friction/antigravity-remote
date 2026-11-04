@@ -37,7 +37,7 @@ Select **"All or some functionality in my app is restricted"** → **"Add instru
   ```text
   Antigravity Remote is an open-source mobile companion client wrapper for https://antigravity.google.com.
   1. On launch, the app loads the public https://antigravity.google.com landing page and Google Sign-In flow (https://accounts.google.com).
-  2. Reviewers can test all native wrapper features without a dedicated test account by tapping the floating "Remote" button in the bottom-right corner to open the native Remote Controls sheet:
+  2. Reviewers can test all native wrapper features without a dedicated test account by pulling open or tapping the vertical drawer handle along the left margin to open the native Inbox & Session drawer:
      - View live Session Vault status
      - Test CLI handoff input validation (e.g., entering "devbox-demo-1" or "https://antigravity.google.com/r/devbox-demo-1")
      - Test "Reload & Sync Session Cookies"

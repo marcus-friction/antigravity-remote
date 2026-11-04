@@ -1,5 +1,5 @@
 import * as Linking from 'expo-linking';
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   AppState,
@@ -16,12 +16,22 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { WebView, WebViewNavigation } from 'react-native-webview';
+import {
+  WebView,
+  WebViewMessageEvent,
+  WebViewNavigation,
+} from 'react-native-webview';
 import { ShouldStartLoadRequest } from 'react-native-webview/lib/WebViewTypes';
 import {
   ANTIGRAVITY_DASHBOARD_URL,
   DEFAULT_KEEP_ALIVE_MINUTES,
 } from '../constants/config';
+import {
+  INBOX_BRIDGE_SCRIPT,
+  buildFastThreadSwitchScript,
+  buildInboxRefreshScript,
+  buildMarkThreadReadScript,
+} from '../services/inboxBridge';
 import {
   backupCookiesFromWebView,
   clearSession,
@@ -35,16 +45,23 @@ import {
   resumeSessionPersistence,
 } from '../services/sessionVault';
 import { configureNativeKeepAlive } from '../services/webData';
+import { InboxSnapshot, InboxThreadItem } from '../types/inbox';
 import { AuthFlowStage, KeepAliveMinutes } from '../types/session';
+import {
+  applyLocalStateToSnapshot,
+  buildInboxSnapshot,
+  extractActiveRouteFromUrl,
+  parseInboxBridgeMessage,
+} from '../utils/inboxParser';
 import {
   isGoogleCookieErrorUrl,
   isAllowedAuthSubframeUrl,
+  isAllowedRemoteClientSubframeUrl,
   isInternalWebViewSchemeUrl,
   validateNavigationUrl,
 } from '../utils/urlValidator';
 import { getCleanMobileUserAgent } from '../utils/userAgent';
-import { FloatingControlPill } from './FloatingControlPill';
-import { HandoffModal } from './HandoffModal';
+import { DrawerMode, LeftNavigationDrawer } from './LeftNavigationDrawer';
 import { TopStatusBanner } from './TopStatusBanner';
 
 /**
@@ -163,6 +180,38 @@ function buildKeepAliveWebLockScript(acquire: boolean): string {
 
 const MAX_RENDER_RECOVERY_ATTEMPTS = 3;
 const RENDER_RECOVERY_WINDOW_MS = 30_000;
+const FAST_THREAD_NAV_FALLBACK_MS = 450;
+const INBOX_REFRESH_TIMEOUT_MS = 9_000;
+const MAX_LOCALLY_READ_ENTRIES = 500;
+
+function recordBoundedLocalRead(
+  map: Record<string, number>,
+  threadKey: string,
+  readAtMs: number,
+): void {
+  if (Object.prototype.hasOwnProperty.call(map, threadKey)) {
+    delete map[threadKey];
+  }
+  map[threadKey] = readAtMs;
+  const keys = Object.keys(map);
+  if (keys.length > MAX_LOCALLY_READ_ENTRIES) {
+    const excess = keys.length - MAX_LOCALLY_READ_ENTRIES;
+    for (let i = 0; i < excess; i++) {
+      delete map[keys[i]];
+    }
+  }
+}
+
+const COMBINED_INJECTED_SCRIPT = `${KEYBOARD_ADAPTATION_SCRIPT}\n${INBOX_BRIDGE_SCRIPT}`;
+
+const EMPTY_INBOX_SNAPSHOT: InboxSnapshot = {
+  instances: [],
+  threads: [],
+  fetchedAtMs: 0,
+  activeInstanceUuid: null,
+  activeCascadeId: null,
+  error: null,
+};
 
 /**
  * Push-notification 2-Step Verification and cookie-sync paths where the user
@@ -215,6 +264,14 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const keepAliveMinutesRef = useRef<KeepAliveMinutes>(
     DEFAULT_KEEP_ALIVE_MINUTES,
   );
+  const locallyReadMapRef = useRef<Record<string, number>>({});
+  const pendingFastNavRef = useRef<
+    Map<string, { timer: ReturnType<typeof setTimeout>; targetUrl: string }>
+  >(new Map());
+  const inboxRefreshTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const isDrawerOpenRef = useRef<boolean>(false);
 
   const [isHydrated, setIsHydrated] = useState<boolean>(false);
   const [keepAliveMinutes, setKeepAliveMinutes] = useState<KeepAliveMinutes>(
@@ -225,7 +282,12 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   );
   const [stage, setStage] = useState<AuthFlowStage>('hydrating');
   const [hasNetworkError, setHasNetworkError] = useState<boolean>(false);
-  const [isModalVisible, setIsModalVisible] = useState<boolean>(false);
+  const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
+  const [drawerInitialMode, setDrawerInitialMode] =
+    useState<DrawerMode>('inbox');
+  const [isInboxRefreshing, setIsInboxRefreshing] = useState<boolean>(false);
+  const [inboxSnapshot, setInboxSnapshot] =
+    useState<InboxSnapshot>(EMPTY_INBOX_SNAPSHOT);
   const [lastSyncedCookieCount, setLastSyncedCookieCount] = useState<number>(0);
   const [webViewInstanceKey, setWebViewInstanceKey] = useState<number>(1);
   const [resetRequest, setResetRequest] = useState<{
@@ -414,11 +476,23 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     stage,
   ]);
 
+  const clearInboxTimers = useCallback(() => {
+    for (const pending of pendingFastNavRef.current.values()) {
+      clearTimeout(pending.timer);
+    }
+    pendingFastNavRef.current.clear();
+    if (inboxRefreshTimeoutRef.current) {
+      clearTimeout(inboxRefreshTimeoutRef.current);
+      inboxRefreshTimeoutRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     return () => {
+      clearInboxTimers();
       void configureNativeKeepAlive?.(false, 0, false);
     };
-  }, []);
+  }, [clearInboxTimers]);
 
   // Step 3: Flush & back up cookies whenever the app transitions to background/inactive,
   // and wake up active sessions + 2-Step Verification immediately when returning to active
@@ -450,6 +524,9 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
                     stageRef.current === 'authenticated',
                 ),
               );
+            }
+            if (stageRef.current === 'authenticated') {
+              webViewRef.current?.injectJavaScript(buildInboxRefreshScript());
             }
           }
           void syncCookiesToVault();
@@ -539,13 +616,18 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     };
   }, []);
 
-  // Step 5: Android hardware Back button navigation within WebView history
+  // Step 5: Android hardware Back button closes the left drawer first, then navigates WebView history
   useEffect(() => {
     if (Platform.OS !== 'android') {
       return;
     }
 
     const onHardwareBackPress = (): boolean => {
+      if (isDrawerOpenRef.current) {
+        isDrawerOpenRef.current = false;
+        setIsDrawerOpen(false);
+        return true;
+      }
       if (canGoBackRef.current && webViewRef.current) {
         webViewRef.current.goBack();
         return true;
@@ -596,18 +678,26 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
 
   const isKeyboardVisible = rawKeyboardHeight > 0;
 
-  const beginSessionReset = useCallback((reason: 'signout' | 'recovery') => {
-    if (isResettingSessionRef.current) return;
-    isResettingSessionRef.current = true;
-    suspendSessionPersistence();
-    void configureNativeKeepAlive?.(false, 0, false);
-    webViewRef.current?.stopLoading();
-    stageRef.current = 'hydrating';
-    setStage('hydrating');
-    setIsModalVisible(false);
-    setResetError(null);
-    setResetRequest({ reason, attempt: 0 });
-  }, []);
+  const beginSessionReset = useCallback(
+    (reason: 'signout' | 'recovery') => {
+      if (isResettingSessionRef.current) return;
+      isResettingSessionRef.current = true;
+      suspendSessionPersistence();
+      void configureNativeKeepAlive?.(false, 0, false);
+      clearInboxTimers();
+      locallyReadMapRef.current = {};
+      webViewRef.current?.stopLoading();
+      stageRef.current = 'hydrating';
+      setStage('hydrating');
+      isDrawerOpenRef.current = false;
+      setIsDrawerOpen(false);
+      setIsInboxRefreshing(false);
+      setInboxSnapshot(EMPTY_INBOX_SNAPSHOT);
+      setResetError(null);
+      setResetRequest({ reason, attempt: 0 });
+    },
+    [clearInboxTimers],
+  );
 
   // Effects run after the reset screen has unmounted the old WebView. No page
   // may repopulate native cookies or DOM storage while cleanup is in progress.
@@ -652,7 +742,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     if (isResettingSessionRef.current) return;
     if (cookieRecoveryAttemptsRef.current >= 2) {
       setPageError(
-        'Automatic sign-in recovery stopped. Open Remote controls and sign out to start again.',
+        'Automatic sign-in recovery stopped. Pull open the left Session drawer and sign out to start again.',
       );
       setHasNetworkError(true);
       setStage('offline');
@@ -671,6 +761,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       const validation = validateNavigationUrl(request.url);
       if (!validation.isValid || !validation.normalizedUrl) return false;
       if (request.isTopFrame === false && isAllowedAuthSubframeUrl(request.url))
+        return true;
+      if (
+        request.isTopFrame === false &&
+        isAllowedRemoteClientSubframeUrl(request.url)
+      )
         return true;
       if (
         request.isTopFrame !== false &&
@@ -708,6 +803,23 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         new URL(validation.normalizedUrl).hostname === 'antigravity.google.com'
       ) {
         void saveLastActiveUrl(validation.normalizedUrl);
+        const route = extractActiveRouteFromUrl(validation.normalizedUrl);
+        if (route.instanceUuid && route.cascadeId) {
+          recordBoundedLocalRead(
+            locallyReadMapRef.current,
+            `${route.instanceUuid}:${route.cascadeId}`,
+            Date.now(),
+          );
+        }
+        setInboxSnapshot((previous) =>
+          previous.threads.length === 0
+            ? previous
+            : applyLocalStateToSnapshot(previous, {
+                activeInstanceUuid: route.instanceUuid,
+                activeCascadeId: route.cascadeId,
+                locallyReadAtByThreadId: locallyReadMapRef.current,
+              }),
+        );
         if (!navState.loading) {
           setHasNetworkError(false);
           setPageError(null);
@@ -724,6 +836,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
               renderRecoveryTimestampsRef.current = [];
               renderProcessDeadRef.current = false;
               setStage('authenticated');
+              webViewRef.current?.injectJavaScript(INBOX_BRIDGE_SCRIPT);
             }
           });
         }
@@ -739,6 +852,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const handleLoadEnd = useCallback(() => {
     void syncCookiesToVault();
     webViewRef.current?.injectJavaScript(KEYBOARD_ADAPTATION_SCRIPT);
+    webViewRef.current?.injectJavaScript(INBOX_BRIDGE_SCRIPT);
     webViewRef.current?.injectJavaScript(
       buildKeepAliveWebLockScript(
         keepAliveMinutesRef.current > 0 && stageRef.current === 'authenticated',
@@ -824,6 +938,278 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     [beginSessionReset],
   );
 
+  const armInboxRefreshTimeout = useCallback(() => {
+    if (inboxRefreshTimeoutRef.current) {
+      clearTimeout(inboxRefreshTimeoutRef.current);
+    }
+    inboxRefreshTimeoutRef.current = setTimeout(() => {
+      inboxRefreshTimeoutRef.current = null;
+      setIsInboxRefreshing(false);
+    }, INBOX_REFRESH_TIMEOUT_MS);
+    (inboxRefreshTimeoutRef.current as { unref?: () => void })?.unref?.();
+  }, []);
+
+  const handleRefreshInbox = useCallback(() => {
+    if (isResettingSessionRef.current) return;
+    setIsInboxRefreshing(true);
+    armInboxRefreshTimeout();
+    webViewRef.current?.injectJavaScript(INBOX_BRIDGE_SCRIPT);
+    webViewRef.current?.injectJavaScript(buildInboxRefreshScript());
+  }, [armInboxRefreshTimeout]);
+
+  const handleOpenDrawer = useCallback(
+    (preferredMode?: DrawerMode) => {
+      if (isResettingSessionRef.current) return;
+      const resolvedMode: DrawerMode =
+        preferredMode ??
+        (stageRef.current === 'authenticated' ? 'inbox' : 'session');
+      setDrawerInitialMode(resolvedMode);
+      isDrawerOpenRef.current = true;
+      setIsDrawerOpen(true);
+      if (stageRef.current === 'authenticated') {
+        handleRefreshInbox();
+      }
+    },
+    [handleRefreshInbox],
+  );
+
+  const handleCloseDrawer = useCallback(() => {
+    isDrawerOpenRef.current = false;
+    setIsDrawerOpen(false);
+  }, []);
+
+  const handleMarkThreadRead = useCallback((thread: InboxThreadItem) => {
+    if (isResettingSessionRef.current) return;
+    const readAtMs = Math.max(Date.now(), thread.lastModifiedAtMs + 1);
+    recordBoundedLocalRead(locallyReadMapRef.current, thread.id, readAtMs);
+    setInboxSnapshot((previous) =>
+      applyLocalStateToSnapshot(previous, {
+        activeInstanceUuid: previous.activeInstanceUuid,
+        activeCascadeId: previous.activeCascadeId,
+        locallyReadAtByThreadId: locallyReadMapRef.current,
+      }),
+    );
+    if (thread.source === 'remote-control') {
+      webViewRef.current?.injectJavaScript(
+        buildMarkThreadReadScript({
+          instanceUuid: thread.instanceUuid,
+          cascadeId: thread.cascadeId,
+          readAtIso: new Date(readAtMs).toISOString(),
+        }),
+      );
+    }
+  }, []);
+
+  const handleMarkAllRead = useCallback(() => {
+    if (isResettingSessionRef.current) return;
+    const nowMs = Date.now();
+    for (const thread of inboxSnapshot.threads) {
+      if (
+        thread.attentionKind !== 'unread' &&
+        thread.attentionKind !== 'error'
+      ) {
+        continue;
+      }
+      const readAtMs = Math.max(nowMs, thread.lastModifiedAtMs + 1);
+      recordBoundedLocalRead(locallyReadMapRef.current, thread.id, readAtMs);
+      if (thread.source === 'remote-control') {
+        webViewRef.current?.injectJavaScript(
+          buildMarkThreadReadScript({
+            instanceUuid: thread.instanceUuid,
+            cascadeId: thread.cascadeId,
+            readAtIso: new Date(readAtMs).toISOString(),
+          }),
+        );
+      }
+    }
+    setInboxSnapshot((previous) =>
+      applyLocalStateToSnapshot(previous, {
+        activeInstanceUuid: previous.activeInstanceUuid,
+        activeCascadeId: previous.activeCascadeId,
+        locallyReadAtByThreadId: locallyReadMapRef.current,
+      }),
+    );
+  }, [inboxSnapshot.threads]);
+
+  const handleSelectInboxThread = useCallback(
+    (thread: InboxThreadItem) => {
+      if (isResettingSessionRef.current) return;
+      handleCloseDrawer();
+
+      const readAtMs = Math.max(Date.now(), thread.lastModifiedAtMs + 1);
+      recordBoundedLocalRead(locallyReadMapRef.current, thread.id, readAtMs);
+      if (thread.source === 'remote-control' && thread.attentionKind === 'unread') {
+        webViewRef.current?.injectJavaScript(
+          buildMarkThreadReadScript({
+            instanceUuid: thread.instanceUuid,
+            cascadeId: thread.cascadeId,
+            readAtIso: new Date(readAtMs).toISOString(),
+          }),
+        );
+      }
+
+      setInboxSnapshot((previous) =>
+        applyLocalStateToSnapshot(previous, {
+          activeInstanceUuid: thread.instanceUuid,
+          activeCascadeId: thread.cascadeId,
+          locallyReadAtByThreadId: locallyReadMapRef.current,
+        }),
+      );
+
+      const currentRoute = extractActiveRouteFromUrl(currentNavUrlRef.current);
+      if (
+        thread.source === 'remote-control' &&
+        currentRoute.instanceUuid === thread.instanceUuid &&
+        webViewRef.current
+      ) {
+        const requestId = `nav-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const fallbackTimer = setTimeout(() => {
+          pendingFastNavRef.current.delete(requestId);
+          handleNavigateToUrl(thread.targetUrl);
+        }, FAST_THREAD_NAV_FALLBACK_MS);
+        (fallbackTimer as { unref?: () => void })?.unref?.();
+        pendingFastNavRef.current.set(requestId, {
+          timer: fallbackTimer,
+          targetUrl: thread.targetUrl,
+        });
+
+        webViewRef.current.injectJavaScript(
+          buildFastThreadSwitchScript({
+            requestId,
+            instanceUuid: thread.instanceUuid,
+            childPath: thread.childPath,
+            targetUrl: thread.targetUrl,
+          }),
+        );
+        return;
+      }
+
+      handleNavigateToUrl(thread.targetUrl);
+    },
+    [handleCloseDrawer, handleNavigateToUrl],
+  );
+
+  const handleWebViewMessage = useCallback(
+    (event: WebViewMessageEvent) => {
+      if (isResettingSessionRef.current) return;
+      const senderUrl = event?.nativeEvent?.url;
+      if (typeof senderUrl !== 'string' || !senderUrl) return;
+      const senderValidation = validateNavigationUrl(senderUrl);
+      if (!senderValidation.isValid || !senderValidation.normalizedUrl) return;
+      if (
+        new URL(senderValidation.normalizedUrl).hostname !==
+        'antigravity.google.com'
+      ) {
+        return;
+      }
+
+      const message = parseInboxBridgeMessage(event.nativeEvent.data);
+      if (!message) return;
+
+      switch (message.type) {
+        case 'AGY_INBOX_SNAPSHOT': {
+          if (inboxRefreshTimeoutRef.current) {
+            clearTimeout(inboxRefreshTimeoutRef.current);
+            inboxRefreshTimeoutRef.current = null;
+          }
+          setIsInboxRefreshing(false);
+          const built = buildInboxSnapshot(
+            message,
+            locallyReadMapRef.current,
+            currentNavUrlRef.current,
+          );
+          if (built.activeInstanceUuid && built.activeCascadeId) {
+            const activeKey = `${built.activeInstanceUuid}:${built.activeCascadeId}`;
+            recordBoundedLocalRead(
+              locallyReadMapRef.current,
+              activeKey,
+              Math.max(locallyReadMapRef.current[activeKey] ?? 0, Date.now()),
+            );
+          }
+          setInboxSnapshot(built);
+          break;
+        }
+
+        case 'AGY_INBOX_ACTIVE_ROUTE': {
+          const fallbackRoute = extractActiveRouteFromUrl(
+            message.activeUrl ?? currentNavUrlRef.current,
+          );
+          const activeInstanceUuid =
+            message.activeInstanceUuid ?? fallbackRoute.instanceUuid;
+          const activeCascadeId =
+            message.activeCascadeId ?? fallbackRoute.cascadeId;
+          if (activeInstanceUuid && activeCascadeId) {
+            recordBoundedLocalRead(
+              locallyReadMapRef.current,
+              `${activeInstanceUuid}:${activeCascadeId}`,
+              Date.now(),
+            );
+          }
+          setInboxSnapshot((previous) =>
+            applyLocalStateToSnapshot(previous, {
+              activeInstanceUuid,
+              activeCascadeId,
+              locallyReadAtByThreadId: locallyReadMapRef.current,
+            }),
+          );
+          break;
+        }
+
+        case 'AGY_INBOX_REALTIME_HINT': {
+          setIsInboxRefreshing(true);
+          armInboxRefreshTimeout();
+          break;
+        }
+
+        case 'AGY_INBOX_FAST_NAV_RESULT': {
+          const pending = pendingFastNavRef.current.get(message.requestId);
+          if (!pending) {
+            break;
+          }
+          clearTimeout(pending.timer);
+          pendingFastNavRef.current.delete(message.requestId);
+          if (!message.handled) {
+            handleNavigateToUrl(pending.targetUrl);
+          } else {
+            const targetValidation = validateNavigationUrl(pending.targetUrl);
+            if (
+              targetValidation.isAllowedInApp &&
+              targetValidation.normalizedUrl &&
+              new URL(targetValidation.normalizedUrl).hostname ===
+                'antigravity.google.com'
+            ) {
+              currentNavUrlRef.current = targetValidation.normalizedUrl;
+              void saveLastActiveUrl(targetValidation.normalizedUrl);
+            }
+          }
+          break;
+        }
+      }
+    },
+    [armInboxRefreshTimeout, handleNavigateToUrl],
+  );
+
+  const inboxCounts = useMemo(() => {
+    let attention = 0;
+    let urgent = 0;
+    let running = 0;
+    for (const thread of inboxSnapshot.threads) {
+      if (thread.needsAttention) {
+        attention++;
+      }
+      if (
+        thread.attentionKind === 'approval' ||
+        thread.attentionKind === 'error'
+      ) {
+        urgent++;
+      }
+      if (thread.attentionKind === 'running') {
+        running++;
+      }
+    }
+    return { attention, urgent, running };
+  }, [inboxSnapshot.threads]);
+
   if (resetRequest) {
     return (
       <View style={styles.loadingScreen}>
@@ -905,11 +1291,12 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           setSupportMultipleWindows={false}
           allowsBackForwardNavigationGestures={true}
           pullToRefreshEnabled={true}
-          injectedJavaScript={KEYBOARD_ADAPTATION_SCRIPT}
+          injectedJavaScript={COMBINED_INJECTED_SCRIPT}
           originWhitelist={['*']}
           onShouldStartLoadWithRequest={handleShouldStartLoadWithRequest}
           onNavigationStateChange={handleNavigationStateChange}
           onLoadEnd={handleLoadEnd}
+          onMessage={handleWebViewMessage}
           onRenderProcessGone={handleWebProcessTerminated}
           onContentProcessDidTerminate={handleWebProcessTerminated}
           onError={() => {
@@ -943,20 +1330,26 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         ) : null}
       </View>
 
-      {!isKeyboardVisible ? (
-        <FloatingControlPill
-          stage={stage}
-          onPress={() => setIsModalVisible(true)}
-        />
-      ) : null}
-
-      <HandoffModal
-        visible={isModalVisible}
+      <LeftNavigationDrawer
+        visible={isDrawerOpen}
+        initialMode={drawerInitialMode}
+        isKeyboardVisible={isKeyboardVisible}
+        keyboardBottomPadding={keyboardBottomPadding}
         stage={stage}
+        snapshot={inboxSnapshot}
+        isRefreshing={isInboxRefreshing}
+        attentionCount={inboxCounts.attention}
+        urgentAttentionCount={inboxCounts.urgent}
+        runningCount={inboxCounts.running}
         lastSyncedCookieCount={lastSyncedCookieCount}
         keepAliveMinutes={keepAliveMinutes}
+        onOpen={handleOpenDrawer}
+        onClose={handleCloseDrawer}
+        onRefreshInbox={handleRefreshInbox}
+        onSelectThread={handleSelectInboxThread}
+        onMarkThreadRead={handleMarkThreadRead}
+        onMarkAllRead={handleMarkAllRead}
         onChangeKeepAliveMinutes={handleChangeKeepAliveMinutes}
-        onClose={() => setIsModalVisible(false)}
         onNavigateToUrl={handleNavigateToUrl}
         onReloadSession={handleReloadSession}
         onSignOut={handleSignOut}

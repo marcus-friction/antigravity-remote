@@ -18,7 +18,9 @@ Opt-in background session keep-alive (`Off` by default) uses a non-exported Andr
 
 All schemes enter the application navigation callback through `originWhitelist=['*']`; this prevents react-native-webview from automatically launching unapproved schemes. Only validated external HTTPS documents can be handed to the OS. Internal blank/srcdoc/blob documents are limited to subframes; blob origins must themselves be trusted.
 
-Top-level trust uses exact application/account hosts and an explicit list of regional Google domains with account-sync paths. Arbitrary Google subdomains, Cloud Storage HTML, Google Sites, lookalike account hosts, credentials in URLs, and non-default ports do not receive in-app trust. Allow-listing navigation does not control every subresource requested by the remote page; the browser's TLS, same-origin, and content-security policies still apply.
+Top-level trust uses exact application/account hosts and an explicit list of regional Google domains with account-sync paths. Arbitrary Google subdomains, Cloud Storage HTML, Google Sites, lookalike account hosts, credentials in URLs, and non-default ports do not receive in-app trust. Embedded reCAPTCHA challenges and Antigravity's `https://antigravity.static.usercontent.goog/web/` workspace client are permitted strictly in subframes (`isTopFrame === false`), never as top-level documents. Allow-listing navigation does not control every subresource requested by the remote page; the browser's TLS, same-origin, and content-security policies still apply.
+
+The Thread Inbox bridge executes only on `https://antigravity.google.com` without Trusted-Types-restricted DOM sinks, and `WebView.onMessage` accepts bounded JSON payloads solely when `nativeEvent.url` validates as `https://antigravity.google.com`. All in-memory Inbox snapshots and read markers are purged immediately when sign-out or session recovery begins.
 
 Destructive cookie recovery matches exact error paths on validated Google account origins and only main-frame navigation. Recovery stops after two attempts. A completed application page with Google session cookies is required to restore the automatic retry budget.
 

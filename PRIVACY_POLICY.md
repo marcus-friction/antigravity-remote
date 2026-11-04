@@ -30,7 +30,7 @@ To keep you signed in across app restarts and support `/remote-control` session 
 
 You have full control over all locally stored session data at any time:
 
-1. **In-App Sign Out**: Tap the floating **Remote** button in the bottom-right corner, select **Sign Out of Google Account**, and tap **Confirm Sign Out**. This immediately unmounts the WebView and deletes all saved cookies, DOM storage, WebView cache, and Keychain/SecureStore snapshots from your device.
+1. **In-App Sign Out**: Pull open the left navigation drawer (via the vertical handle along the left margin), switch to **Session**, select **Sign Out of Google Account**, and tap **Confirm Sign Out**. This immediately unmounts the WebView and deletes all saved cookies, DOM storage, WebView cache, and Keychain/SecureStore snapshots from your device.
 2. **Operating System Settings**: Clearing storage or uninstalling **Antigravity Remote** through your Android or iOS system settings permanently deletes all local application data from your device.
 
 ## 5. Permissions
