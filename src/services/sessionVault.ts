@@ -479,6 +479,13 @@ export function saveLastActiveUrl(url: string): Promise<void> {
 
 export async function getLastActiveUrl(): Promise<string> {
   try {
+    const pendingSignOut = await SecureStore.getItemAsync(
+      SECURE_STORE_SIGN_OUT_KEY,
+      SECURE_STORE_OPTIONS,
+    );
+    if (pendingSignOut) {
+      return ANTIGRAVITY_DASHBOARD_URL;
+    }
     const saved = await SecureStore.getItemAsync(
       SECURE_STORE_LAST_URL_KEY,
       SECURE_STORE_OPTIONS,
@@ -518,6 +525,13 @@ export function saveKeepAliveMinutes(minutes: KeepAliveMinutes): Promise<void> {
 
 export async function getKeepAliveMinutes(): Promise<KeepAliveMinutes> {
   try {
+    const pendingSignOut = await SecureStore.getItemAsync(
+      SECURE_STORE_SIGN_OUT_KEY,
+      SECURE_STORE_OPTIONS,
+    );
+    if (pendingSignOut) {
+      return DEFAULT_KEEP_ALIVE_MINUTES;
+    }
     const saved = await SecureStore.getItemAsync(
       SECURE_STORE_KEEP_ALIVE_MINUTES_KEY,
       SECURE_STORE_OPTIONS,

@@ -18,8 +18,9 @@ public class RemoteSessionModule: Module {
 
   private func endBackgroundKeepAliveTask() {
     if backgroundTaskId != .invalid {
-      UIApplication.shared.endBackgroundTask(backgroundTaskId)
+      let taskToEnd = backgroundTaskId
       backgroundTaskId = .invalid
+      UIApplication.shared.endBackgroundTask(taskToEnd)
     }
   }
 
@@ -28,10 +29,31 @@ public class RemoteSessionModule: Module {
     guard keepAliveEnabled, keepAliveMinutes > 0, sessionActive else {
       return
     }
-    backgroundTaskId = UIApplication.shared.beginBackgroundTask(
+    var expiredSynchronously = false
+    var newTaskId: UIBackgroundTaskIdentifier = .invalid
+    newTaskId = UIApplication.shared.beginBackgroundTask(
       withName: "AntigravityRemoteSessionKeepAlive"
     ) { [weak self] in
-      self?.endBackgroundKeepAliveTask()
+      let capturedId = newTaskId
+      self?.runOnMain {
+        expiredSynchronously = true
+        if capturedId != .invalid {
+          UIApplication.shared.endBackgroundTask(capturedId)
+        }
+        if self?.backgroundTaskId == capturedId {
+          self?.backgroundTaskId = .invalid
+        } else {
+          self?.endBackgroundKeepAliveTask()
+        }
+      }
+    }
+    if expiredSynchronously {
+      if newTaskId != .invalid {
+        UIApplication.shared.endBackgroundTask(newTaskId)
+      }
+      backgroundTaskId = .invalid
+    } else {
+      backgroundTaskId = newTaskId
     }
   }
 

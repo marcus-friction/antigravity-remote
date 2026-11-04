@@ -122,7 +122,7 @@
 
     <h2>5. Permissions</h2>
     <p>
-      Antigravity Remote requests standard network access (<code>android.permission.INTERNET</code>) required to load <code>https://antigravity.google.com</code>, along with foreground-service, wake-lock, and notification permissions (<code>FOREGROUND_SERVICE</code>, <code>FOREGROUND_SERVICE_SPECIAL_USE</code>, <code>WAKE_LOCK</code>, and <code>POST_NOTIFICATIONS</code>) used solely to keep active remote sessions connected for a bounded user-selected duration (<code>15m</code>, <code>30m</code>, <code>60m</code>, or <code>Off</code>) while multitasking, with an ongoing status notification and <strong>Stop Keep-Alive</strong> control. It does not request access to your camera, microphone, contacts, location, photos, or external storage.
+      Antigravity Remote requests standard network access (<code>android.permission.INTERNET</code>) required to load <code>https://antigravity.google.com</code>, along with foreground-service, wake-lock, and notification permissions (<code>FOREGROUND_SERVICE</code>, <code>FOREGROUND_SERVICE_SPECIAL_USE</code>, <code>WAKE_LOCK</code>, and <code>POST_NOTIFICATIONS</code>) used solely to keep active signed-in remote sessions connected for a bounded configurable duration (<code>30m</code> by default; <code>15m</code>, <code>30m</code>, <code>60m</code>, or <code>Off</code> in Remote controls) while multitasking, with an ongoing status notification and <strong>Stop Keep-Alive</strong> control. It does not request access to your camera, microphone, contacts, location, photos, or external storage.
     </p>
 
     <h2>6. Changes to This Privacy Policy</h2>

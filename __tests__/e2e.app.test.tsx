@@ -13,6 +13,10 @@ const mockKeyboardHideListeners = new Set<() => void>();
 const mockLinkingListeners = new Set<(event: { url: string }) => void>();
 let mockInitialUrl: string | null = null;
 const mockOpenURL = jest.fn(async (_url: string) => true);
+const mockPermissionsCheck = jest.fn(async (_permission: string) => false);
+const mockPermissionsRequest = jest.fn(
+  async (_permission: string) => 'granted',
+);
 
 jest.mock('react-native', () => {
   const ReactLib = require('react');
@@ -22,13 +26,19 @@ jest.mock('react-native', () => {
     );
 
   return {
-    Platform: { OS: 'ios' },
+    Platform: { OS: 'ios', Version: 34 },
+    PermissionsAndroid: {
+      check: (permission: string) => mockPermissionsCheck(permission),
+      request: (permission: string) => mockPermissionsRequest(permission),
+      RESULTS: { GRANTED: 'granted', DENIED: 'denied' },
+    },
     StyleSheet: {
       create: (styles: any) => styles,
       hairlineWidth: 1,
       absoluteFillObject: {},
     },
     View: mockComponent('View'),
+    ScrollView: mockComponent('ScrollView'),
     Text: mockComponent('Text'),
     TextInput: mockComponent('TextInput'),
     TouchableOpacity: mockComponent('TouchableOpacity'),
@@ -451,6 +461,11 @@ describe('Session and navigation regressions', () => {
     mockOpenURL.mockClear();
     mockWebViewReload.mockClear();
     mockWebViewInjectJavaScript.mockClear();
+    mockPermissionsCheck.mockReset().mockResolvedValue(false);
+    mockPermissionsRequest.mockReset().mockResolvedValue('granted');
+    const RNPlatform = require('react-native').Platform;
+    RNPlatform.OS = 'ios';
+    RNPlatform.Version = 34;
     (clearWebData as jest.Mock).mockReset().mockResolvedValue(undefined);
     (configureNativeKeepAlive as jest.Mock)
       .mockReset()
@@ -716,13 +731,40 @@ describe('Session and navigation regressions', () => {
   });
 
   it('wakes authenticated sessions immediately on foreground resume and syncs keep-alive controls', async () => {
+    const RNPlatform = require('react-native').Platform;
+    RNPlatform.OS = 'android';
+    RNPlatform.Version = 34;
+
+    // While unauthenticated on Google Sign-In, native keep-alive and POST_NOTIFICATIONS stay inactive
+    await navigate('https://accounts.google.com/v3/signin/identifier', false);
+    expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(false, 0, false);
+    expect(mockPermissionsRequest).not.toHaveBeenCalled();
+
     mockCookieStore.set('https://antigravity.google.com', {
       SID: { name: 'SID', value: 'live-session', domain: '.google.com' },
     });
     await navigate('https://antigravity.google.com/r/workstation-1', false);
 
     expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(true, 30, true);
+    expect(mockPermissionsCheck).toHaveBeenCalledWith(
+      'android.permission.POST_NOTIFICATIONS',
+    );
+    expect(mockPermissionsRequest).toHaveBeenCalledWith(
+      'android.permission.POST_NOTIFICATIONS',
+    );
     mockWebViewInjectJavaScript.mockClear();
+
+    // Brief iOS/Android inactive peek without backgrounding does not spam wakeup events on authenticated pages
+    await act(async () => {
+      for (const listener of mockAppStateListeners) listener('inactive');
+      for (const listener of mockAppStateListeners) listener('active');
+    });
+    expect(
+      mockWebViewInjectJavaScript.mock.calls.some(
+        ([script]) =>
+          typeof script === 'string' && script.includes("new Event('online')"),
+      ),
+    ).toBe(false);
 
     await act(async () => {
       for (const listener of mockAppStateListeners) listener('background');
@@ -734,21 +776,67 @@ describe('Session and navigation regressions', () => {
         ([script]) =>
           typeof script === 'string' &&
           script.includes("new Event('online')") &&
-          script.includes("new Event('focus')"),
+          script.includes("new Event('focus')") &&
+          !script.includes('pageshow'),
       ),
     ).toBe(true);
 
-    // Disable keep-alive via HandoffModal callback and verify native controller stops it
+    // Open HandoffModal and tap actual rendered Android Keep-Alive chips ('Off' -> '60m')
+    const menuPill = tree.root.findAll(
+      (node) =>
+        node.type === ('TouchableOpacity' as any) &&
+        node.props.accessibilityLabel === 'Open Antigravity Remote controls',
+    )[0];
     await act(async () => {
-      controls().props.onChangeKeepAliveMinutes?.(0);
+      menuPill.props.onPress();
+    });
+
+    const offChip = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((node) => node.props.accessibilityLabel === 'Keep-alive Off')!;
+    expect(offChip).toBeDefined();
+    await act(async () => {
+      offChip.props.onPress();
     });
     expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(false, 0, false);
 
-    // Re-enable to 60 minutes
+    const sixtyChip = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((node) => node.props.accessibilityLabel === 'Keep-alive 60m')!;
+    expect(sixtyChip).toBeDefined();
     await act(async () => {
-      controls().props.onChangeKeepAliveMinutes?.(60);
+      sixtyChip.props.onPress();
     });
     expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(true, 60, true);
+
+    // Sign Out stops keep-alive and resets preference back to default 30m
+    await act(async () => {
+      await controls().props.onSignOut();
+    });
+    expect(controls().props.keepAliveMinutes).toBe(30);
+    expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(false, 0, false);
+  });
+
+  it('wipes stale workstation URL and keep-alive settings before mounting when recovering an interrupted sign-out', async () => {
+    await act(async () => {
+      tree.unmount();
+    });
+    mockSecureStoreData.set('agy_session_cleanup_pending', 'true');
+    mockSecureStoreData.set(
+      'agy_last_active_url_v1',
+      'https://antigravity.google.com/r/wiped-workstation',
+    );
+    mockSecureStoreData.set('agy_keep_alive_minutes_v1', '60');
+
+    await act(async () => {
+      tree = renderer.create(<App />);
+    });
+
+    expect(webView().props.source.uri).toBe('https://antigravity.google.com');
+    expect(controls().props.keepAliveMinutes).toBe(30);
+    expect(mockSecureStoreData.has('agy_session_cleanup_pending')).toBe(false);
+    expect(mockSecureStoreData.has('agy_last_active_url_v1')).toBe(false);
+    expect(mockSecureStoreData.has('agy_keep_alive_minutes_v1')).toBe(false);
   });
 
   it('auto-recovers killed WebView render processes at the active URL and caps crash loops', async () => {
@@ -796,5 +884,22 @@ describe('Session and navigation regressions', () => {
     expect(webView().props.source.uri).toBe(
       'https://antigravity.google.com/r/resilient-box',
     );
+
+    // Trigger another 4-crash halt and verify manual HandoffModal navigation also clears dead-renderer state
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      await act(async () => {
+        webView().props.onRenderProcessGone({ nativeEvent: { didCrash: true } });
+      });
+    }
+    const mountsAfterSecondHalt = mockWebViewMountCount;
+    await act(async () => {
+      controls().props.onNavigateToUrl('https://antigravity.google.com');
+    });
+    expect(mockWebViewMountCount).toBe(mountsAfterSecondHalt + 1);
+    mockWebViewReload.mockClear();
+    await act(async () => {
+      controls().props.onReloadSession();
+    });
+    expect(mockWebViewReload).toHaveBeenCalledTimes(1);
   });
 });

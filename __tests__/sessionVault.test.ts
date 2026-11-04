@@ -329,6 +329,13 @@ describe('sessionVault', () => {
     await saveKeepAliveMinutes(15);
     expect(await getKeepAliveMinutes()).toBe(15);
 
+    // Pending sign-out marker immediately blocks reading stale URL or keep-alive preferences
+    await saveLastActiveUrl('https://antigravity.google.com/r/stale-session');
+    mockSecureStoreData.set(SECURE_STORE_SIGN_OUT_KEY, 'true');
+    expect(await getLastActiveUrl()).toBe('https://antigravity.google.com');
+    expect(await getKeepAliveMinutes()).toBe(30);
+    mockSecureStoreData.delete(SECURE_STORE_SIGN_OUT_KEY);
+
     await clearSession();
     expect(await getKeepAliveMinutes()).toBe(30);
   });

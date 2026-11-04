@@ -74,6 +74,14 @@ function checkNative(root) {
       `Missing keep-alive manifest setting: ${snippet}`,
     );
   }
+  const keepAliveIcon = read(
+    'modules/remote-session/android/src/main/res/drawable/ic_stat_keep_alive.xml',
+  );
+  assert(
+    keepAliveIcon.includes('<vector') &&
+      keepAliveIcon.includes('#FFFFFFFF'),
+    'Missing monochrome keep-alive notification icon',
+  );
   return true;
 }
 

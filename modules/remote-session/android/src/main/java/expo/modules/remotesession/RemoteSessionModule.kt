@@ -1,6 +1,9 @@
 package expo.modules.remotesession
 
+import android.app.Activity
+import android.app.Application
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.View
@@ -20,6 +23,63 @@ class RemoteSessionModule : Module() {
   @Volatile private var keepAliveMinutes: Int = 30
   @Volatile private var sessionActive: Boolean = false
   @Volatile private var stoppedForCurrentBackgroundStay: Boolean = false
+  private var registeredApplication: Application? = null
+
+  private val activityLifecycleCallbacks = object : Application.ActivityLifecycleCallbacks {
+    override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
+
+    override fun onActivityStarted(activity: Activity) {
+      val current = appContext.currentActivity
+      if (current != null && activity !== current) return
+      stoppedForCurrentBackgroundStay = false
+      runOnMain {
+        stopKeepAliveServiceIfRunning()
+        applyWebViewKeepAlivePolicy(
+          protectInBackground = shouldKeepAlive(),
+          wakeTimers = true,
+          hostActivity = activity
+        )
+      }
+    }
+
+    override fun onActivityResumed(activity: Activity) = Unit
+    override fun onActivityPaused(activity: Activity) = Unit
+
+    override fun onActivityStopped(activity: Activity) {
+      // Ignore configuration changes (e.g. screen rotation) and unrelated activities;
+      // unlike Activity.onPause, onStop only runs when the window is no longer visible
+      // (avoiding permission-dialog and split-screen focus churn).
+      if (activity.isChangingConfigurations) return
+      val current = appContext.currentActivity
+      if (current != null && activity !== current) return
+      runOnMain {
+        if (shouldKeepAlive() && !stoppedForCurrentBackgroundStay) {
+          applyWebViewKeepAlivePolicy(
+            protectInBackground = true,
+            hostActivity = activity
+          )
+          val context = appContext.reactContext ?: activity.applicationContext
+          if (!RemoteKeepAliveService.start(context, keepAliveMinutes)) {
+            applyWebViewKeepAlivePolicy(
+              protectInBackground = false,
+              releaseWebLock = true,
+              hostActivity = activity
+            )
+          }
+        } else {
+          applyWebViewKeepAlivePolicy(
+            protectInBackground = false,
+            releaseWebLock = true,
+            hostActivity = activity
+          )
+          stopKeepAliveServiceIfRunning()
+        }
+      }
+    }
+
+    override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
+    override fun onActivityDestroyed(activity: Activity) = Unit
+  }
 
   private fun runOnMain(block: () -> Unit) {
     if (Looper.myLooper() == Looper.getMainLooper()) {
@@ -27,6 +87,19 @@ class RemoteSessionModule : Module() {
     } else {
       mainHandler.post(block)
     }
+  }
+
+  private fun registerActivityLifecycleObserverIfNeeded() {
+    if (registeredApplication != null) return
+    val app = (appContext.reactContext?.applicationContext ?: appContext.currentActivity?.application)
+      as? Application ?: return
+    app.registerActivityLifecycleCallbacks(activityLifecycleCallbacks)
+    registeredApplication = app
+  }
+
+  private fun unregisterActivityLifecycleObserver() {
+    registeredApplication?.unregisterActivityLifecycleCallbacks(activityLifecycleCallbacks)
+    registeredApplication = null
   }
 
   private fun findWebView(root: View?): WebView? {
@@ -45,14 +118,22 @@ class RemoteSessionModule : Module() {
     return keepAliveEnabled && keepAliveMinutes > 0 && sessionActive
   }
 
-  private fun applyWebViewKeepAlivePolicy(protectInBackground: Boolean, wakeTimers: Boolean = false) {
-    val activity = appContext.currentActivity ?: return
+  private fun applyWebViewKeepAlivePolicy(
+    protectInBackground: Boolean,
+    wakeTimers: Boolean = false,
+    releaseWebLock: Boolean = false,
+    hostActivity: Activity? = null
+  ) {
+    val activity = hostActivity ?: appContext.currentActivity ?: return
     val webView = findWebView(activity.window?.decorView) ?: return
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
       webView.setRendererPriorityPolicy(
         WebView.RENDERER_PRIORITY_IMPORTANT,
         /* waivedWhenNotVisible = */ !protectInBackground
       )
+    }
+    if (releaseWebLock) {
+      webView.evaluateJavascript(RELEASE_WEB_LOCK_SCRIPT, null)
     }
     if (wakeTimers) {
       webView.onResume()
@@ -61,7 +142,7 @@ class RemoteSessionModule : Module() {
   }
 
   private fun stopKeepAliveServiceIfRunning() {
-    val context = appContext.reactContext ?: return
+    val context = appContext.reactContext ?: appContext.currentActivity?.applicationContext ?: return
     RemoteKeepAliveService.stop(context)
   }
 
@@ -69,10 +150,16 @@ class RemoteSessionModule : Module() {
     Name("RemoteSession")
 
     OnCreate {
-      RemoteKeepAliveService.onUserStoppedCallback = {
-        stoppedForCurrentBackgroundStay = true
+      registerActivityLifecycleObserverIfNeeded()
+      RemoteKeepAliveService.registerKeepAliveEndedListener(this@RemoteSessionModule) { stoppedByUser ->
+        if (stoppedByUser) {
+          stoppedForCurrentBackgroundStay = true
+        }
         runOnMain {
-          applyWebViewKeepAlivePolicy(protectInBackground = false)
+          applyWebViewKeepAlivePolicy(
+            protectInBackground = false,
+            releaseWebLock = true
+          )
         }
       }
     }
@@ -82,53 +169,45 @@ class RemoteSessionModule : Module() {
         sessionActive = false
         stoppedForCurrentBackgroundStay = false
         stopKeepAliveServiceIfRunning()
-        applyWebViewKeepAlivePolicy(protectInBackground = false)
+        applyWebViewKeepAlivePolicy(
+          protectInBackground = false,
+          releaseWebLock = true
+        )
 
         val context = appContext.reactContext ?: throw IllegalStateException("Application unavailable")
         WebView(context).apply { clearCache(true); destroy() }
         val storage = WebStorage.getInstance()
         if (WebViewFeature.isFeatureSupported(WebViewFeature.DELETE_BROWSING_DATA)) {
-          WebStorageCompat.deleteBrowsingData(storage) { promise.resolve(null) }
+          WebStorageCompat.deleteBrowsingData(storage, Runnable::run) { promise.resolve(null) }
         } else {
-          // Legacy WebViews expose no completion callback for DOM storage removal.
           storage.deleteAllData()
           promise.resolve(null)
         }
-      } catch (error: Exception) {
+      } catch (error: Throwable) {
         promise.reject("ERR_WEB_DATA_CLEANUP", "Unable to clear website data", error)
       }
     }.runOnQueue(Queues.MAIN)
 
     AsyncFunction("configureKeepAlive") { enabled: Boolean, durationMinutes: Int, active: Boolean ->
+      registerActivityLifecycleObserverIfNeeded()
       keepAliveEnabled = enabled
       keepAliveMinutes = durationMinutes.coerceIn(0, 60)
       sessionActive = active
 
       val keepAlive = shouldKeepAlive()
-      applyWebViewKeepAlivePolicy(protectInBackground = keepAlive)
+      applyWebViewKeepAlivePolicy(
+        protectInBackground = keepAlive,
+        releaseWebLock = !keepAlive
+      )
       if (!keepAlive) {
         stopKeepAliveServiceIfRunning()
       }
     }.runOnQueue(Queues.MAIN)
 
-    OnActivityEntersBackground {
-      runOnMain {
-        if (shouldKeepAlive() && !stoppedForCurrentBackgroundStay) {
-          applyWebViewKeepAlivePolicy(protectInBackground = true)
-          val context = appContext.reactContext
-          if (context != null) {
-            RemoteKeepAliveService.start(context, keepAliveMinutes)
-          }
-        } else {
-          applyWebViewKeepAlivePolicy(protectInBackground = false)
-          stopKeepAliveServiceIfRunning()
-        }
-      }
-    }
-
     OnActivityEntersForeground {
       stoppedForCurrentBackgroundStay = false
       runOnMain {
+        registerActivityLifecycleObserverIfNeeded()
         stopKeepAliveServiceIfRunning()
         applyWebViewKeepAlivePolicy(
           protectInBackground = shouldKeepAlive(),
@@ -138,12 +217,21 @@ class RemoteSessionModule : Module() {
     }
 
     OnActivityDestroys {
-      stopKeepAliveServiceIfRunning()
+      val activity = appContext.currentActivity
+      if (activity == null || !activity.isChangingConfigurations) {
+        stopKeepAliveServiceIfRunning()
+      }
     }
 
     OnDestroy {
-      RemoteKeepAliveService.onUserStoppedCallback = null
+      unregisterActivityLifecycleObserver()
+      RemoteKeepAliveService.unregisterKeepAliveEndedListener(this@RemoteSessionModule)
       stopKeepAliveServiceIfRunning()
     }
+  }
+
+  companion object {
+    private const val RELEASE_WEB_LOCK_SCRIPT =
+      "(function(){try{window.__agyKeepAliveLockDesired=false;if(typeof window.__agyReleaseKeepAliveLock==='function'){window.__agyReleaseKeepAliveLock();}window.__agyKeepAliveLockHeld=false;}catch(_){}})();"
   }
 }

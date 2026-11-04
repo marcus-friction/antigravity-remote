@@ -100,11 +100,6 @@ const RESUME_WAKEUP_SCRIPT = `
   try {
     window.dispatchEvent(new Event('online'));
     window.dispatchEvent(new Event('focus'));
-    if (typeof PageTransitionEvent === 'function') {
-      window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: false }));
-    } else {
-      window.dispatchEvent(new Event('pageshow'));
-    }
     document.dispatchEvent(new Event('visibilitychange'));
   } catch (_) {}
   return true;
@@ -121,18 +116,29 @@ function buildKeepAliveWebLockScript(acquire: boolean): string {
     return `
 (function() {
   try {
-    if (window.__agyKeepAliveLockHeld) return true;
+    window.__agyKeepAliveLockDesired = true;
+    if (window.__agyKeepAliveLockHeld || window.__agyKeepAliveLockPending) return true;
     if (navigator && navigator.locks && typeof navigator.locks.request === 'function') {
-      window.__agyKeepAliveLockHeld = true;
+      window.__agyKeepAliveLockPending = true;
       navigator.locks.request('__agy_remote_keep_alive', function() {
+        window.__agyKeepAliveLockPending = false;
+        if (!window.__agyKeepAliveLockDesired) {
+          window.__agyKeepAliveLockHeld = false;
+          return Promise.resolve();
+        }
+        window.__agyKeepAliveLockHeld = true;
         return new Promise(function(resolve) {
           window.__agyReleaseKeepAliveLock = function() {
             window.__agyKeepAliveLockHeld = false;
             window.__agyReleaseKeepAliveLock = null;
             resolve();
           };
+          if (!window.__agyKeepAliveLockDesired) {
+            window.__agyReleaseKeepAliveLock();
+          }
         });
       }).catch(function() {
+        window.__agyKeepAliveLockPending = false;
         window.__agyKeepAliveLockHeld = false;
       });
     }
@@ -144,6 +150,7 @@ function buildKeepAliveWebLockScript(acquire: boolean): string {
   return `
 (function() {
   try {
+    window.__agyKeepAliveLockDesired = false;
     if (typeof window.__agyReleaseKeepAliveLock === 'function') {
       window.__agyReleaseKeepAliveLock();
     }
@@ -204,6 +211,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const renderRecoveryTimestampsRef = useRef<number[]>([]);
   const renderProcessDeadRef = useRef<boolean>(false);
   const notificationPermissionRequestedRef = useRef<boolean>(false);
+  const wasBackgroundedRef = useRef<boolean>(false);
   const keepAliveMinutesRef = useRef<KeepAliveMinutes>(
     DEFAULT_KEEP_ALIVE_MINUTES,
   );
@@ -281,12 +289,13 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     let isMounted = true;
 
     async function initializeSession() {
-      const [restoredCount, savedUrl, savedKeepAliveMinutes] =
-        await Promise.all([
-          hydrateCookiesToWebView(),
-          getLastActiveUrl(),
-          getKeepAliveMinutes(),
-        ]);
+      // Complete hydration (including any interrupted-sign-out wipe) before reading
+      // persisted URL or keep-alive preferences.
+      const restoredCount = await hydrateCookiesToWebView();
+      const [savedUrl, savedKeepAliveMinutes] = await Promise.all([
+        getLastActiveUrl(),
+        getKeepAliveMinutes(),
+      ]);
 
       if (!isMounted) {
         return;
@@ -335,6 +344,12 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       validation.normalizedUrl !== currentNavUrlRef.current
     ) {
       setHasNetworkError(false);
+      setPageError(null);
+      renderProcessDeadRef.current = false;
+      renderRecoveryTimestampsRef.current = [];
+      if (stageRef.current === 'offline') {
+        setStage('authenticating');
+      }
       setCurrentSourceUrl(validation.normalizedUrl);
       setWebViewInstanceKey((prev) => prev + 1);
       currentNavUrlRef.current = validation.normalizedUrl;
@@ -350,24 +365,18 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       !isResettingSessionRef.current &&
       !resetRequest &&
       keepAliveMinutes > 0 &&
-      (stage === 'authenticated' || stage === 'authenticating');
-    const effectiveMinutes = keepAliveEligible
-      ? stage === 'authenticating'
-        ? Math.min(keepAliveMinutes, 3)
-        : keepAliveMinutes
-      : 0;
+      stage === 'authenticated';
+    const effectiveMinutes = keepAliveEligible ? keepAliveMinutes : 0;
 
     void configureNativeKeepAlive?.(
-      keepAliveEligible && effectiveMinutes > 0,
+      keepAliveEligible,
       effectiveMinutes,
       keepAliveEligible,
     );
 
     if (isHydrated && !resetRequest) {
       webViewRef.current?.injectJavaScript(
-        buildKeepAliveWebLockScript(
-          keepAliveEligible && stage === 'authenticated',
-        ),
+        buildKeepAliveWebLockScript(keepAliveEligible),
       );
     }
 
@@ -375,16 +384,21 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       Platform.OS === 'android' &&
       typeof Platform.Version === 'number' &&
       Platform.Version >= 33 &&
-      isHydrated &&
-      !resetRequest &&
-      stage === 'authenticated' &&
-      keepAliveMinutes > 0 &&
+      keepAliveEligible &&
       !notificationPermissionRequestedRef.current
     ) {
       notificationPermissionRequestedRef.current = true;
-      void PermissionsAndroid?.request?.(
-        'android.permission.POST_NOTIFICATIONS' as any,
-      )?.catch?.(() => undefined);
+      const permission = 'android.permission.POST_NOTIFICATIONS' as any;
+      void (async () => {
+        try {
+          const alreadyGranted = await PermissionsAndroid?.check?.(permission);
+          if (!alreadyGranted) {
+            await PermissionsAndroid?.request?.(permission);
+          }
+        } catch {
+          // Ignore permission request errors on restricted profiles/ROMs.
+        }
+      })();
     }
   }, [isHydrated, keepAliveMinutes, resetRequest, stage]);
 
@@ -403,10 +417,28 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       'change',
       (nextAppState: AppStateStatus) => {
         if (nextAppState === 'background' || nextAppState === 'inactive') {
+          if (nextAppState === 'background') {
+            wasBackgroundedRef.current = true;
+          }
           void syncCookiesToVault();
         } else if (nextAppState === 'active') {
+          const returningFromBackground = wasBackgroundedRef.current;
+          wasBackgroundedRef.current = false;
           if (hydratedRef.current && !isResettingSessionRef.current) {
-            webViewRef.current?.injectJavaScript(RESUME_WAKEUP_SCRIPT);
+            if (
+              returningFromBackground ||
+              stageRef.current === 'authenticating'
+            ) {
+              webViewRef.current?.injectJavaScript(RESUME_WAKEUP_SCRIPT);
+            }
+            if (returningFromBackground) {
+              webViewRef.current?.injectJavaScript(
+                buildKeepAliveWebLockScript(
+                  keepAliveMinutesRef.current > 0 &&
+                    stageRef.current === 'authenticated',
+                ),
+              );
+            }
           }
           void syncCookiesToVault();
           if (stageRef.current === 'authenticating') {
@@ -758,6 +790,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     if (!validation.isAllowedInApp || !validation.normalizedUrl) return;
     setHasNetworkError(false);
     setPageError(null);
+    renderProcessDeadRef.current = false;
+    renderRecoveryTimestampsRef.current = [];
+    if (stageRef.current === 'offline') {
+      setStage('authenticating');
+    }
     setCurrentSourceUrl(validation.normalizedUrl);
     currentNavUrlRef.current = validation.normalizedUrl;
     // Explicit native navigation must work even when the source prop already

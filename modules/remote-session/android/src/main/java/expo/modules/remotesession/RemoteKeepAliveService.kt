@@ -13,25 +13,36 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 
 /**
  * Bounded foreground service that prevents Android's Cached Apps Freezer and Doze
  * from suspending active Antigravity Remote WebSocket sessions while multitasking.
  *
- * Strictly time-bounded (1..60 minutes) and never exported to other apps.
+ * Strictly wall-clock bounded (1..60 minutes via elapsedRealtime) and never exported.
  */
 class RemoteKeepAliveService : Service() {
   private val handler = Handler(Looper.getMainLooper())
   private var wakeLock: PowerManager.WakeLock? = null
-  private val autoStopRunnable = Runnable {
-    stopKeepAliveAndSelf()
+  private var deadlineElapsedRealtimeMs: Long = 0L
+
+  private val deadlineCheckRunnable = object : Runnable {
+    override fun run() {
+      val remainingMs = deadlineElapsedRealtimeMs - SystemClock.elapsedRealtime()
+      if (remainingMs <= 0L) {
+        notifyKeepAliveEnded(stoppedByUser = false)
+        stopKeepAliveAndSelf()
+      } else {
+        handler.postDelayed(this, minOf(remainingMs, DEADLINE_CHECK_INTERVAL_MS))
+      }
+    }
   }
 
   override fun onBind(intent: Intent?): IBinder? = null
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     if (intent?.action == ACTION_STOP_KEEP_ALIVE) {
-      onUserStoppedCallback?.invoke()
+      notifyKeepAliveEnded(stoppedByUser = true)
       stopKeepAliveAndSelf()
       return START_NOT_STICKY
     }
@@ -42,7 +53,7 @@ class RemoteKeepAliveService : Service() {
     val durationMs = clampedMinutes * 60_000L
 
     ensureNotificationChannel()
-    val notification = buildNotification(clampedMinutes)
+    val notification = buildNotification(clampedMinutes, durationMs)
 
     try {
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -55,38 +66,46 @@ class RemoteKeepAliveService : Service() {
         startForeground(NOTIFICATION_ID, notification)
       }
     } catch (_: Exception) {
+      notifyKeepAliveEnded(stoppedByUser = false)
       stopKeepAliveAndSelf()
       return START_NOT_STICKY
     }
 
+    deadlineElapsedRealtimeMs = SystemClock.elapsedRealtime() + durationMs
     acquireBoundedWakeLock(durationMs)
-    handler.removeCallbacks(autoStopRunnable)
-    handler.postDelayed(autoStopRunnable, durationMs)
+    handler.removeCallbacks(deadlineCheckRunnable)
+    handler.postDelayed(
+      deadlineCheckRunnable,
+      minOf(durationMs, DEADLINE_CHECK_INTERVAL_MS)
+    )
 
     return START_NOT_STICKY
   }
 
   override fun onTaskRemoved(rootIntent: Intent?) {
+    notifyKeepAliveEnded(stoppedByUser = false)
     stopKeepAliveAndSelf()
     super.onTaskRemoved(rootIntent)
   }
 
   override fun onTimeout(startId: Int) {
+    notifyKeepAliveEnded(stoppedByUser = false)
     stopKeepAliveAndSelf()
   }
 
   override fun onTimeout(startId: Int, fgsType: Int) {
+    notifyKeepAliveEnded(stoppedByUser = false)
     stopKeepAliveAndSelf()
   }
 
   override fun onDestroy() {
-    handler.removeCallbacks(autoStopRunnable)
+    handler.removeCallbacks(deadlineCheckRunnable)
     releaseWakeLock()
     super.onDestroy()
   }
 
   private fun stopKeepAliveAndSelf() {
-    handler.removeCallbacks(autoStopRunnable)
+    handler.removeCallbacks(deadlineCheckRunnable)
     releaseWakeLock()
     try {
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -146,16 +165,13 @@ class RemoteKeepAliveService : Service() {
     manager.createNotificationChannel(channel)
   }
 
-  private fun buildNotification(durationMinutes: Int): Notification {
+  private fun buildNotification(durationMinutes: Int, durationMs: Long): Notification {
     val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      Notification.Builder(this, CHANNEL_ID)
+      Notification.Builder(this, CHANNEL_ID).setTimeoutAfter(durationMs)
     } else {
       @Suppress("DEPRECATION")
       Notification.Builder(this)
     }
-
-    val smallIcon = applicationInfo.icon.takeIf { it != 0 }
-      ?: android.R.drawable.stat_notify_sync
 
     val launchIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
       addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
@@ -186,7 +202,7 @@ class RemoteKeepAliveService : Service() {
     ).build()
 
     builder
-      .setSmallIcon(smallIcon)
+      .setSmallIcon(R.drawable.ic_stat_keep_alive)
       .setContentTitle("Antigravity Remote connected")
       .setContentText("Keeping session open in background (up to ${durationMinutes}m)")
       .setOngoing(true)
@@ -206,11 +222,34 @@ class RemoteKeepAliveService : Service() {
     private const val NOTIFICATION_ID = 4201
     private const val DEFAULT_MINUTES = 30
     private const val MAX_MINUTES = 60
+    private const val DEADLINE_CHECK_INTERVAL_MS = 60_000L
     const val ACTION_STOP_KEEP_ALIVE = "expo.modules.remotesession.STOP_KEEP_ALIVE"
     const val EXTRA_DURATION_MINUTES = "duration_minutes"
 
-    @Volatile
-    var onUserStoppedCallback: (() -> Unit)? = null
+    private val listenerLock = Any()
+    private var listenerOwner: Any? = null
+    private var onKeepAliveEndedListener: ((Boolean) -> Unit)? = null
+
+    fun registerKeepAliveEndedListener(owner: Any, listener: (stoppedByUser: Boolean) -> Unit) {
+      synchronized(listenerLock) {
+        listenerOwner = owner
+        onKeepAliveEndedListener = listener
+      }
+    }
+
+    fun unregisterKeepAliveEndedListener(owner: Any) {
+      synchronized(listenerLock) {
+        if (listenerOwner === owner) {
+          listenerOwner = null
+          onKeepAliveEndedListener = null
+        }
+      }
+    }
+
+    private fun notifyKeepAliveEnded(stoppedByUser: Boolean) {
+      val callback = synchronized(listenerLock) { onKeepAliveEndedListener }
+      callback?.invoke(stoppedByUser)
+    }
 
     fun start(context: Context, durationMinutes: Int): Boolean {
       val clamped = durationMinutes.coerceIn(1, MAX_MINUTES)

@@ -5,6 +5,7 @@ import {
   Modal,
   Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -129,6 +130,11 @@ export const HandoffModal: React.FC<HandoffModalProps> = ({
             </TouchableOpacity>
           </View>
 
+          <ScrollView
+            bounces={false}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+          >
           <View style={styles.statusCard}>
             <Text style={styles.statusLabel}>SESSION VAULT STATUS</Text>
             <Text style={styles.statusValue}>{statusText}</Text>
@@ -327,6 +333,7 @@ export const HandoffModal: React.FC<HandoffModalProps> = ({
               with Google LLC
             </Text>
           </View>
+          </ScrollView>
         </View>
       </KeyboardAvoidingView>
     </Modal>
@@ -343,6 +350,7 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(2, 6, 23, 0.65)',
   },
   sheet: {
+    maxHeight: '88%',
     backgroundColor: '#0F172A',
     borderTopLeftRadius: 22,
     borderTopRightRadius: 22,
