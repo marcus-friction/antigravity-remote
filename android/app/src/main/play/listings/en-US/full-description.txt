@@ -1,7 +1,8 @@
 Antigravity Remote is an open-source mobile companion wrapper for accessing https://antigravity.google.com on Android devices.
 
 KEY FEATURES
-• Persistent Session Management: Sign in with your Google account once and resume your active Antigravity workspace automatically across app restarts.
+• Cross-Workstation Thread Inbox: Monitor pending tool/question approvals (including subagent prompts), execution errors, and unread completions across all connected workstations from a pull-in left navigation drawer, with instant same-workstation switching and one-tap Mark read.
+• Persistent Session Management & Optional Keep-Alive: Sign in once to resume your workspace across restarts, and optionally hold active workstation connections open across app switches (Off, 5m, 15m, 30m, or 60m) with a Stop Keep-Alive notification button.
 • Instant CLI & Desktop Handoff: Paste any /remote-control output link (https://antigravity.google.com/r/<instance-id>), instance ID, or open antigravity-remote://r/<instance-id> deep links directly into your active mobile session.
 • Adaptive Mobile Keyboard & Viewport: Automatically adjusts the viewport and keeps the bottom chat prompt visible above the software keyboard on Android 15/16 edge-to-edge screens.
 • One-Tap Session Hygiene: Unmounts the WebView and wipes all cookies, DOM storage, and WebView cache cleanly whenever you sign out.
