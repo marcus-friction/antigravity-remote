@@ -1,3 +1,4 @@
-• Fix left-drawer pull/drag gesture responder stability and Inbox card thread switching (JSON JSPB iframe handshake + automatic full-URL fallback).
-• Cross-workstation Thread Inbox for approvals, subagent prompts, errors, and unread completions inside an edge-back-safe left navigation drawer.
-• Optional bounded background session keep-alive (Off, 5m, 15m, 30m, 60m) with a Stop Keep-Alive notification button.
+• Configurable Action Notifications (Off, Approvals, All Attention) with live open-action count and smart routing (opens single thread directly or Inbox when 2+ actions wait).
+• New Sidebar Usage tab showing live quota pools, model limits, reset timers, and credits.
+• Preserve Project Overview and Inbox scroll position when switching into and back out of threads.
+• Default Inbox filter to All, streamline the Settings drawer, and fix left-drawer close freezes.
