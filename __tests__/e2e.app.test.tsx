@@ -13,6 +13,7 @@ const mockKeyboardHideListeners = new Set<() => void>();
 const mockLinkingListeners = new Set<(event: { url: string }) => void>();
 const mockBackPressListeners = new Set<() => boolean>();
 let mockInitialUrl: string | null = null;
+let mockNextTimingInterrupted = false;
 const mockOpenURL = jest.fn(async (_url: string) => true);
 const mockPermissionsCheck = jest.fn(async (_permission: string) => false);
 const mockPermissionsRequest = jest.fn(
@@ -60,6 +61,11 @@ jest.mock('react-native', () => {
       View: mockComponent('Animated.View'),
       timing: (val: any, config: any) => ({
         start: (cb?: (result: { finished: boolean }) => void) => {
+          if (mockNextTimingInterrupted) {
+            mockNextTimingInterrupted = false;
+            cb?.({ finished: false });
+            return;
+          }
           if (val && typeof val.setValue === 'function' && typeof config?.toValue === 'number') {
             val.setValue(config.toValue);
           }
@@ -235,6 +241,7 @@ describe('End-to-End <App /> Flow', () => {
     mockLinkingListeners.clear();
     mockBackPressListeners.clear();
     mockInitialUrl = null;
+    mockNextTimingInterrupted = false;
     mockOpenURL.mockClear();
     mockWebViewReload.mockClear();
     mockWebViewGoBack.mockClear();
@@ -344,7 +351,7 @@ describe('End-to-End <App /> Flow', () => {
       'Google Sign-In active — your session will be saved automatically',
     );
 
-    // 6. Open unified left-hand navigation drawer, switch to Session mode, and paste CLI output
+    // 6. Open unified left-hand navigation drawer, switch to Settings mode, expand machine link input, and paste CLI output
     expect(
       tree.root.findAll(
         (node) =>
@@ -364,19 +371,47 @@ describe('End-to-End <App /> Flow', () => {
       drawerHandleButton.props.onPress();
     });
 
-    const sessionModeBtn = tree.root.findAll(
+    const settingsModeBtn = tree.root.findAll(
       (node) =>
         node.type === ('TouchableOpacity' as any) &&
-        node.props.accessibilityLabel === 'Drawer mode Session',
+        node.props.accessibilityLabel === 'Drawer mode Settings',
     )[0];
     await act(async () => {
-      sessionModeBtn.props.onPress();
+      settingsModeBtn.props.onPress();
+    });
+
+    // Cookie-plumbing jargon is removed; machine link input starts collapsed until tapped
+    const settingsTexts = tree.root
+      .findAllByType('Text' as any)
+      .map((node) => node.props.children);
+    expect(settingsTexts).not.toContain('SESSION VAULT STATUS');
+    expect(
+      settingsTexts.some(
+        (text) =>
+          typeof text === 'string' && text.includes('cookies on this device'),
+      ),
+    ).toBe(false);
+    expect(
+      tree.root.findAll(
+        (node) =>
+          node.type === ('TextInput' as any) &&
+          node.props.accessibilityLabel === 'Machine link or ID',
+      ),
+    ).toHaveLength(0);
+
+    const toggleHandoffBtn = tree.root.findAll(
+      (node) =>
+        node.type === ('TouchableOpacity' as any) &&
+        node.props.accessibilityLabel === 'Toggle machine link input',
+    )[0];
+    await act(async () => {
+      toggleHandoffBtn.props.onPress();
     });
 
     const handoffInput = tree.root.findAll(
       (node) =>
         node.type === ('TextInput' as any) &&
-        node.props.accessibilityLabel === 'CLI handoff link or instance ID',
+        node.props.accessibilityLabel === 'Machine link or ID',
     )[0];
     await act(async () => {
       handoffInput.props.onChangeText(
@@ -387,7 +422,7 @@ describe('End-to-End <App /> Flow', () => {
     const goButton = tree.root.findAll(
       (node) =>
         node.type === ('TouchableOpacity' as any) &&
-        node.props.accessibilityLabel === 'Connect to handoff instance',
+        node.props.accessibilityLabel === 'Connect to machine',
     )[0];
 
     await act(async () => {
@@ -464,13 +499,13 @@ describe('End-to-End <App /> Flow', () => {
       restoredDrawerHandle.props.onPress();
     });
 
-    const sessionModeBtnForSignOut = tree.root.findAll(
+    const settingsModeBtnForSignOut = tree.root.findAll(
       (node) =>
         node.type === ('TouchableOpacity' as any) &&
-        node.props.accessibilityLabel === 'Drawer mode Session',
+        node.props.accessibilityLabel === 'Drawer mode Settings',
     )[0];
     await act(async () => {
-      sessionModeBtnForSignOut.props.onPress();
+      settingsModeBtnForSignOut.props.onPress();
     });
 
     const signOutTrigger = tree.root.findAll(
@@ -484,6 +519,16 @@ describe('End-to-End <App /> Flow', () => {
     await act(async () => {
       signOutTrigger.props.onPress();
     });
+
+    expect(
+      tree.root
+        .findAllByType('Text' as any)
+        .some(
+          (t) =>
+            t.props.children ===
+            'Sign out of your Google account on this device?',
+        ),
+    ).toBe(true);
 
     const confirmSignOutBtn = tree.root.findAll(
       (node) =>
@@ -878,7 +923,7 @@ describe('Session and navigation regressions', () => {
       ),
     ).toBe(true);
 
-    // Open left drawer, switch to Session mode, verify explanatory guidance, and opt in ('5m' -> '60m' -> 'Off')
+    // Open left drawer, switch to Settings mode, verify concise guidance, and opt in ('5m' -> '60m' -> 'Off')
     const drawerHandle = tree.root.findAll(
       (node) =>
         node.type === ('TouchableOpacity' as any) &&
@@ -887,11 +932,11 @@ describe('Session and navigation regressions', () => {
     await act(async () => {
       drawerHandle.props.onPress();
     });
-    const sessionModeBtn = tree.root
+    const settingsModeBtn = tree.root
       .findAllByType('TouchableOpacity' as any)
-      .find((node) => node.props.accessibilityLabel === 'Drawer mode Session')!;
+      .find((node) => node.props.accessibilityLabel === 'Drawer mode Settings')!;
     await act(async () => {
-      sessionModeBtn.props.onPress();
+      settingsModeBtn.props.onPress();
     });
 
     expect(
@@ -901,7 +946,7 @@ describe('Session and navigation regressions', () => {
           (node) =>
             typeof node.props.children === 'string' &&
             node.props.children.includes(
-              'Keeps your live workstation stream connected',
+              'Avoid reconnecting while switching to 2FA',
             ),
         ),
     ).toBe(true);
@@ -970,6 +1015,138 @@ describe('Session and navigation regressions', () => {
     });
     expect(controls().props.keepAliveMinutes).toBe(0);
     expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(false, 0, false);
+  });
+
+  it('connects Inbox empty-state link action, Inbox Machines shortcut, Reload Current Page, and human connection status', async () => {
+    mockCookieStore.set('https://antigravity.google.com', {
+      SID: { name: 'SID', value: 'ux-session', domain: '.google.com' },
+    });
+    await navigate('https://antigravity.google.com/r/studio-mac', false);
+
+    // 1. Deliver an empty snapshot (`instances: []`), open drawer in Inbox ->
+    // tapping "Open Link or Machine ID" switches to Settings with the link input already expanded.
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/studio-mac',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_SNAPSHOT',
+            fetchedAtMs: 1_762_264_000_000,
+            instances: [],
+          }),
+        },
+      });
+    });
+
+    const openBtn1 = tree.root.findAll(
+      (node) =>
+        node.type === ('TouchableOpacity' as any) &&
+        node.props.accessibilityLabel === 'Open Antigravity drawer',
+    )[0];
+    await act(async () => {
+      openBtn1.props.onPress();
+    });
+    // Complete refresh response with 0 connected machines
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/studio-mac',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_SNAPSHOT',
+            fetchedAtMs: 1_762_264_500_000,
+            instances: [],
+          }),
+        },
+      });
+    });
+
+    const emptyLinkBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find(
+        (node) =>
+          node.props.accessibilityLabel === 'Open machine link from Inbox',
+      )!;
+    expect(emptyLinkBtn).toBeDefined();
+    await act(async () => {
+      emptyLinkBtn.props.onPress();
+    });
+
+    expect(
+      tree.root.findAll(
+        (node) =>
+          node.type === ('TextInput' as any) &&
+          node.props.accessibilityLabel === 'Machine link or ID',
+      ),
+    ).toHaveLength(1);
+
+    // 2. Tapping "Reload Current Page" reloads WebView and closes the drawer
+    mockWebViewReload.mockClear();
+    const reloadBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((node) => node.props.accessibilityLabel === 'Reload current page')!;
+    await act(async () => {
+      reloadBtn.props.onPress();
+    });
+    expect(mockWebViewReload).toHaveBeenCalledTimes(1);
+    expect(controls().props.visible).toBe(false);
+
+    // 3. Deliver 1 connected machine snapshot -> verify human status in Settings
+    // and one-tap "Machines" navigation right inside Inbox.
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/studio-mac',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_SNAPSHOT',
+            fetchedAtMs: 1_762_265_000_000,
+            instances: [{ uuid: 'studio-mac', name: 'Studio Mac', status: 1 }],
+          }),
+        },
+      });
+    });
+
+    const openBtn2 = tree.root.findAll(
+      (node) =>
+        node.type === ('TouchableOpacity' as any) &&
+        node.props.accessibilityLabel === 'Open Antigravity drawer',
+    )[0];
+    await act(async () => {
+      openBtn2.props.onPress();
+    });
+
+    const settingsModeBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((node) => node.props.accessibilityLabel === 'Drawer mode Settings')!;
+    await act(async () => {
+      settingsModeBtn.props.onPress();
+    });
+    expect(
+      tree.root
+        .findAllByType('Text' as any)
+        .some(
+          (node) =>
+            node.props.children === 'Signed in • 1 machine online (Studio Mac)',
+        ),
+    ).toBe(true);
+
+    // Switch back to Inbox and tap the header "Machines" shortcut
+    const inboxModeBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((node) => node.props.accessibilityLabel === 'Drawer mode Inbox')!;
+    await act(async () => {
+      inboxModeBtn.props.onPress();
+    });
+    const inboxMachinesBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find(
+        (node) =>
+          node.props.accessibilityLabel === 'Open All Machines overview',
+      )!;
+    await act(async () => {
+      inboxMachinesBtn.props.onPress();
+    });
+    expect(controls().props.visible).toBe(false);
+    expect(webView().props.source.uri).toBe('https://antigravity.google.com/');
   });
 
   it('wipes stale workstation URL and keep-alive settings before mounting when recovering an interrupted sign-out', async () => {
@@ -1152,6 +1329,12 @@ describe('Session and navigation regressions', () => {
                     ],
                     lastModifiedTime: '2026-11-04T14:20:00Z',
                   },
+                  'idle-local': {
+                    summary: 'Refactor auth helper',
+                    status: 1,
+                    lastModifiedTime: '2026-11-04T14:05:00Z',
+                    lastUserViewTime: '2026-11-04T14:06:00Z',
+                  },
                 },
               },
               {
@@ -1190,8 +1373,7 @@ describe('Session and navigation regressions', () => {
       tree.root.findAll(
         (node) =>
           node.type === ('View' as any) &&
-          typeof node.props.onMoveShouldSetPanResponder === 'function' &&
-          node.props.onMoveShouldSetPanResponder({}, { dx: 18, dy: 2 }) === true,
+          node.props.testID === 'closed-drawer-handle-zone',
       )[0];
 
     const closedDragZoneInitial = findClosedDragZone();
@@ -1276,6 +1458,58 @@ describe('Session and navigation regressions', () => {
       inboxModeBtn.findAllByType('Text' as any).map((t) => t.props.children),
     ).toEqual(['Inbox', '2']);
 
+    // Default Inbox filter tab MUST be 'All' ([All, Attention, Running] order),
+    // showing all 3 threads sorted with attention items first, and only filtering down when selected.
+    const inboxTabs = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .filter(
+        (node) =>
+          typeof node.props.accessibilityLabel === 'string' &&
+          node.props.accessibilityLabel.startsWith('Inbox tab '),
+      );
+    expect(inboxTabs.map((t) => t.props.accessibilityLabel)).toEqual([
+      'Inbox tab All',
+      'Inbox tab Needs Attention',
+      'Inbox tab Running',
+    ]);
+    expect(inboxTabs[0].props.accessibilityState?.selected).toBe(true);
+    expect(inboxTabs[1].props.accessibilityState?.selected).toBe(false);
+
+    const visibleThreadLabelsInAll = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .filter(
+        (node) =>
+          typeof node.props.accessibilityLabel === 'string' &&
+          node.props.accessibilityLabel.startsWith('Open thread '),
+      )
+      .map((node) => node.props.accessibilityLabel);
+    expect(visibleThreadLabelsInAll).toEqual([
+      'Open thread Deploy mobile release',
+      'Open thread Evaluate benchmark metrics',
+      'Open thread Refactor auth helper',
+    ]);
+
+    // Tapping 'Attention' filters down to only the 2 attention threads; tapping 'All' restores all 3
+    await act(async () => {
+      inboxTabs[1].props.onPress();
+    });
+    expect(
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .filter(
+          (node) =>
+            typeof node.props.accessibilityLabel === 'string' &&
+            node.props.accessibilityLabel.startsWith('Open thread '),
+        )
+        .map((node) => node.props.accessibilityLabel),
+    ).toEqual([
+      'Open thread Deploy mobile release',
+      'Open thread Evaluate benchmark metrics',
+    ]);
+    await act(async () => {
+      inboxTabs[0].props.onPress();
+    });
+
     const innerRightHandle = tree.root
       .findAllByType('TouchableOpacity' as any)
       .find(
@@ -1328,6 +1562,27 @@ describe('Session and navigation regressions', () => {
     const mountsBeforeFastSwitch = mockWebViewMountCount;
     mockWebViewInjectJavaScript.mockClear();
 
+    const findDrawerAnimatedPanel = () =>
+      tree.root.findAll(
+        (node) =>
+          node.type === ('Animated.View' as any) &&
+          typeof node.props.onPanResponderTerminate === 'function',
+      )[0];
+    const extractTranslateXValue = (panelNode: any): number => {
+      const stylesList = Array.isArray(panelNode.props.style)
+        ? panelNode.props.style.filter(Boolean)
+        : [panelNode.props.style];
+      const transformStyle = stylesList.find((s: any) => Array.isArray(s?.transform));
+      return transformStyle.transform[0].translateX._value;
+    };
+
+    const drawerPanelBeforeClose = findDrawerAnimatedPanel();
+    expect(drawerPanelBeforeClose).toBeDefined();
+    expect(extractTranslateXValue(drawerPanelBeforeClose)).toBe(0);
+
+    // Simulate an interrupted close animation (`{ finished: false }`, e.g. microtask detach or screenshot):
+    // drawerPanel MUST stay permanently mounted AND immediately park off-screen (`<= -296`) with `pointerEvents="none"`.
+    mockNextTimingInterrupted = true;
     const approvalCard = tree.root
       .findAllByType('TouchableOpacity' as any)
       .find(
@@ -1337,6 +1592,23 @@ describe('Session and navigation regressions', () => {
     await act(async () => {
       approvalCard.props.onPress();
     });
+
+    const drawerPanelAfterClose = findDrawerAnimatedPanel();
+    expect(drawerPanelAfterClose).toBe(drawerPanelBeforeClose);
+    expect(controls().props.visible).toBe(false);
+    expect(findBackdropOverlayContainer()?.props.pointerEvents).toBe('none');
+    expect(findClosedDragZone().props.pointerEvents).toBe('auto');
+    expect(extractTranslateXValue(drawerPanelAfterClose)).toBeLessThanOrEqual(
+      -296,
+    );
+
+    // Screenshot / multi-touch cancelling a gesture while closed MUST NOT spring `translateX` back to 0:
+    await act(async () => {
+      drawerPanelAfterClose.props.onPanResponderTerminate();
+    });
+    expect(extractTranslateXValue(drawerPanelAfterClose)).toBeLessThanOrEqual(
+      -296,
+    );
 
     const fastSwitchCall = mockWebViewInjectJavaScript.mock.calls.find(
       ([script]) =>

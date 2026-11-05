@@ -3,6 +3,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Animated,
+  AppState,
   PanResponder,
   Platform,
   Pressable,
@@ -33,7 +34,7 @@ import { AuthFlowStage, KeepAliveMinutes } from '../types/session';
 import { formatRelativeTime } from '../utils/inboxParser';
 import { parseHandoffInput } from '../utils/urlValidator';
 
-export type DrawerMode = 'inbox' | 'session';
+export type DrawerMode = 'inbox' | 'settings';
 
 /**
  * Shared handle line geometry so the closed pull-in handle and the inner-right
@@ -52,6 +53,7 @@ const HANDLE_ALIGNMENT_OFFSET =
   CLOSED_HANDLE_BAR_INSET +
   OPEN_HANDLE_RIGHT_INSET +
   HANDLE_LINE_WIDTH; // 36dp so bar starts at exact 22dp when pulling open
+const CLOSED_PARK_EXTRA_OFFSET = 16; // Extra off-screen margin so no subpixel border peeks at x=0
 
 export interface LeftNavigationDrawerProps {
   visible: boolean;
@@ -64,7 +66,6 @@ export interface LeftNavigationDrawerProps {
   attentionCount: number;
   urgentAttentionCount: number;
   runningCount: number;
-  lastSyncedCookieCount: number;
   keepAliveMinutes?: KeepAliveMinutes;
   onOpen: (preferredMode?: DrawerMode) => void;
   onClose: () => void;
@@ -187,7 +188,6 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   attentionCount,
   urgentAttentionCount,
   runningCount,
-  lastSyncedCookieCount,
   keepAliveMinutes = DEFAULT_KEEP_ALIVE_MINUTES,
   onOpen,
   onClose,
@@ -211,35 +211,44 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   drawerWidthRef.current = drawerWidth;
 
   const defaultMode: DrawerMode =
-    initialMode ?? (stage === 'authenticated' ? 'inbox' : 'session');
+    initialMode ?? (stage === 'authenticated' ? 'inbox' : 'settings');
   const defaultModeRef = useRef<DrawerMode>(defaultMode);
   defaultModeRef.current = defaultMode;
   const [activeMode, setActiveMode] = useState<DrawerMode>(defaultMode);
-  const [selectedTab, setSelectedTab] = useState<InboxFilterTab>('attention');
+  const [selectedTab, setSelectedTab] = useState<InboxFilterTab>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [handoffText, setHandoffText] = useState('');
+  const [isHandoffExpanded, setIsHandoffExpanded] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [confirmingSignOut, setConfirmingSignOut] = useState(false);
   const [isDraggingOpen, setIsDraggingOpen] = useState(false);
-  const [isAnimatingOut, setIsAnimatingOut] = useState(false);
 
+  const visibleRef = useRef<boolean>(visible);
+  visibleRef.current = visible;
+  const isDraggingOpenRef = useRef<boolean>(isDraggingOpen);
+  isDraggingOpenRef.current = isDraggingOpen;
   const wasVisibleRef = useRef<boolean>(visible);
+  const searchInputRef = useRef<TextInput | null>(null);
+  const handoffInputRef = useRef<TextInput | null>(null);
+  const closedParkX = -(drawerWidth + CLOSED_PARK_EXTRA_OFFSET);
   const translateX = useRef(
-    new Animated.Value(visible ? 0 : -drawerWidth),
+    new Animated.Value(visible ? 0 : closedParkX),
   ).current;
 
   useEffect(() => {
     if (visible && !wasVisibleRef.current) {
       const nextMode =
-        initialMode ?? (stage === 'authenticated' ? 'inbox' : 'session');
+        initialMode ?? (stage === 'authenticated' ? 'inbox' : 'settings');
       setActiveMode(nextMode);
     }
   }, [initialMode, stage, visible]);
 
   useEffect(() => {
+    const parkedX = -(drawerWidth + CLOSED_PARK_EXTRA_OFFSET);
+    let closeSafetyTimer: ReturnType<typeof setTimeout> | null = null;
     if (visible) {
+      isDraggingOpenRef.current = false;
       setIsDraggingOpen(false);
-      setIsAnimatingOut(false);
       translateX.stopAnimation?.();
       Animated.spring(translateX, {
         toValue: 0,
@@ -247,36 +256,78 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
         stiffness: 280,
         mass: 0.9,
         useNativeDriver: true,
-      }).start();
-    } else if (wasVisibleRef.current) {
-      setIsDraggingOpen(false);
-      setIsAnimatingOut(true);
-      translateX.stopAnimation?.();
-      Animated.timing(translateX, {
-        toValue: -drawerWidth,
-        duration: 180,
-        useNativeDriver: true,
       }).start((result) => {
-        if (!result || result.finished !== false) {
-          setIsAnimatingOut(false);
+        if (result && result.finished === false && visibleRef.current) {
+          translateX.setValue(0);
         }
       });
-    } else if (!isDraggingOpen) {
-      translateX.setValue(-drawerWidth);
+    } else if (wasVisibleRef.current) {
+      searchInputRef.current?.blur?.();
+      handoffInputRef.current?.blur?.();
+      isDraggingOpenRef.current = false;
+      setIsDraggingOpen(false);
+      translateX.stopAnimation?.();
+      Animated.timing(translateX, {
+        toValue: parkedX,
+        duration: 180,
+        useNativeDriver: true,
+      }).start(() => {
+        if (!visibleRef.current && !isDraggingOpenRef.current) {
+          translateX.setValue(
+            -(drawerWidthRef.current + CLOSED_PARK_EXTRA_OFFSET),
+          );
+        }
+      });
+      closeSafetyTimer = setTimeout(() => {
+        if (!visibleRef.current && !isDraggingOpenRef.current) {
+          translateX.stopAnimation?.();
+          translateX.setValue(
+            -(drawerWidthRef.current + CLOSED_PARK_EXTRA_OFFSET),
+          );
+        }
+      }, 260);
+      (closeSafetyTimer as { unref?: () => void })?.unref?.();
+    } else if (!isDraggingOpenRef.current) {
+      translateX.setValue(parkedX);
     }
     wasVisibleRef.current = visible;
-  }, [drawerWidth, isDraggingOpen, translateX, visible]);
+    return () => {
+      if (closeSafetyTimer) {
+        clearTimeout(closeSafetyTimer);
+      }
+    };
+  }, [drawerWidth, translateX, visible]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', () => {
+      if (!visibleRef.current) {
+        isDraggingOpenRef.current = false;
+        setIsDraggingOpen(false);
+        translateX.stopAnimation?.();
+        translateX.setValue(
+          -(drawerWidthRef.current + CLOSED_PARK_EXTRA_OFFSET),
+        );
+      } else {
+        translateX.stopAnimation?.();
+        translateX.setValue(0);
+      }
+    });
+    return () => {
+      subscription.remove();
+    };
+  }, [translateX]);
 
   const resetTransientInputs = useCallback(() => {
     setSearchQuery('');
     setValidationError(null);
     setConfirmingSignOut(false);
-  }, []);
+    setIsHandoffExpanded((prev) => (handoffText.trim().length > 0 ? prev : false));
+  }, [handoffText]);
 
   const handleClose = useCallback(() => {
     resetTransientInputs();
+    isDraggingOpenRef.current = false;
     setIsDraggingOpen(false);
-    setIsAnimatingOut(false);
     onClose();
   }, [onClose, resetTransientInputs]);
 
@@ -294,6 +345,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   // the inner TouchableOpacity while preserving simple taps.
   const closedHandlePanResponder = useMemo(() => {
     const shouldClaimPullRight = (gestureState: { dx: number; dy: number }) =>
+      !visibleRef.current &&
       gestureState.dx > 6 &&
       Math.abs(gestureState.dx) > Math.abs(gestureState.dy) * 1.15;
 
@@ -306,6 +358,8 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
         shouldClaimPullRight(gestureState),
       onPanResponderTerminationRequest: () => false,
       onPanResponderGrant: () => {
+        if (visibleRef.current) return;
+        isDraggingOpenRef.current = true;
         translateX.stopAnimation?.();
         setActiveMode(defaultModeRef.current);
         const width = drawerWidthRef.current;
@@ -313,6 +367,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
         setIsDraggingOpen(true);
       },
       onPanResponderMove: (_evt, gestureState) => {
+        if (visibleRef.current) return;
         const width = drawerWidthRef.current;
         const clampedX = Math.max(
           -width,
@@ -326,27 +381,35 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
           gestureState.dx > width * 0.24 ||
           (gestureState.dx > 22 && gestureState.vx > 0.35);
         if (shouldOpen) {
+          isDraggingOpenRef.current = false;
           setIsDraggingOpen(false);
           onOpen();
         } else {
+          const parkedX = -(width + CLOSED_PARK_EXTRA_OFFSET);
           Animated.timing(translateX, {
-            toValue: -width,
+            toValue: parkedX,
             duration: 150,
             useNativeDriver: true,
           }).start(() => {
+            isDraggingOpenRef.current = false;
             setIsDraggingOpen(false);
+            if (!visibleRef.current) {
+              translateX.setValue(
+                -(drawerWidthRef.current + CLOSED_PARK_EXTRA_OFFSET),
+              );
+            }
           });
         }
       },
       onPanResponderTerminate: () => {
-        const width = drawerWidthRef.current;
-        Animated.timing(translateX, {
-          toValue: -width,
-          duration: 150,
-          useNativeDriver: true,
-        }).start(() => {
-          setIsDraggingOpen(false);
-        });
+        isDraggingOpenRef.current = false;
+        setIsDraggingOpen(false);
+        if (!visibleRef.current) {
+          translateX.stopAnimation?.();
+          translateX.setValue(
+            -(drawerWidthRef.current + CLOSED_PARK_EXTRA_OFFSET),
+          );
+        }
       },
     });
   }, [onOpen, translateX]);
@@ -354,6 +417,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   // Push/swipe-left gesture on the open drawer or its inner-right handle line.
   const openDrawerPanResponder = useMemo(() => {
     const shouldClaimSwipeLeft = (gestureState: { dx: number; dy: number }) =>
+      visibleRef.current &&
       gestureState.dx < -8 &&
       Math.abs(gestureState.dx) > Math.abs(gestureState.dy) * 1.2;
 
@@ -366,14 +430,17 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
         shouldClaimSwipeLeft(gestureState),
       onPanResponderTerminationRequest: () => false,
       onPanResponderGrant: () => {
+        if (!visibleRef.current) return;
         translateX.stopAnimation?.();
       },
       onPanResponderMove: (_evt, gestureState) => {
+        if (!visibleRef.current) return;
         const width = drawerWidthRef.current;
         const clampedX = Math.max(-width, Math.min(0, gestureState.dx));
         translateX.setValue(clampedX);
       },
       onPanResponderRelease: (_evt, gestureState) => {
+        if (!visibleRef.current) return;
         const width = drawerWidthRef.current;
         const shouldClose =
           gestureState.dx < -width * 0.22 ||
@@ -387,17 +454,32 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
             stiffness: 280,
             mass: 0.9,
             useNativeDriver: true,
-          }).start();
+          }).start((result) => {
+            if (result && result.finished === false && visibleRef.current) {
+              translateX.setValue(0);
+            }
+          });
         }
       },
       onPanResponderTerminate: () => {
-        Animated.spring(translateX, {
-          toValue: 0,
-          damping: 26,
-          stiffness: 280,
-          mass: 0.9,
-          useNativeDriver: true,
-        }).start();
+        if (visibleRef.current) {
+          Animated.spring(translateX, {
+            toValue: 0,
+            damping: 26,
+            stiffness: 280,
+            mass: 0.9,
+            useNativeDriver: true,
+          }).start((result) => {
+            if (result && result.finished === false && visibleRef.current) {
+              translateX.setValue(0);
+            }
+          });
+        } else {
+          translateX.stopAnimation?.();
+          translateX.setValue(
+            -(drawerWidthRef.current + CLOSED_PARK_EXTRA_OFFSET),
+          );
+        }
       },
     });
   }, [handleClose, translateX]);
@@ -479,14 +561,17 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     const parsedUrl = parseHandoffInput(handoffText);
     if (!parsedUrl) {
       setValidationError(
-        'Enter a valid antigravity.google.com/r/<instance-id> link or instance name.',
+        'Enter a valid antigravity.google.com/r/<machine> link or machine ID.',
       );
       return;
     }
 
     setValidationError(null);
     setHandoffText('');
+    setIsHandoffExpanded(false);
     setConfirmingSignOut(false);
+    isDraggingOpenRef.current = false;
+    setIsDraggingOpen(false);
     onNavigateToUrl(parsedUrl);
     onClose();
   };
@@ -494,6 +579,8 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   const handleOpenDashboard = () => {
     setValidationError(null);
     setConfirmingSignOut(false);
+    isDraggingOpenRef.current = false;
+    setIsDraggingOpen(false);
     onNavigateToUrl(ANTIGRAVITY_DASHBOARD_URL);
     onClose();
   };
@@ -501,34 +588,51 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   const handleConfirmSignOut = () => {
     setConfirmingSignOut(false);
     setHandoffText('');
+    setIsHandoffExpanded(false);
     setValidationError(null);
     setSearchQuery('');
+    setSelectedTab('all');
+    isDraggingOpenRef.current = false;
+    setIsDraggingOpen(false);
     onSignOut();
     onClose();
   };
 
-  const sessionStatusDotColor =
+  const accountStatusDotColor =
     stage === 'authenticated'
       ? '#34D399'
       : stage === 'authenticating'
         ? '#60A5FA'
         : '#F87171';
 
-  const sessionStatusText =
-    stage === 'authenticated'
-      ? `Session active (${lastSyncedCookieCount} cookies on this device)`
-      : stage === 'authenticating'
-        ? 'Google Sign-In in progress'
-        : 'Waiting for connection';
+  const accountStatusText = useMemo(() => {
+    if (stage === 'authenticating') {
+      return 'Google Sign-In in progress';
+    }
+    if (stage === 'offline') {
+      return 'Connection interrupted';
+    }
+    if (stage !== 'authenticated') {
+      return 'Restoring session…';
+    }
+    const machineCount = connectedInstances.length;
+    if (machineCount === 1) {
+      return `Signed in • 1 machine online (${connectedInstances[0].name})`;
+    }
+    if (machineCount > 1) {
+      return `Signed in • ${machineCount} machines online`;
+    }
+    return 'Signed in with Google';
+  }, [connectedInstances, stage]);
 
   const isAndroid = Platform.OS === 'android';
   const keepAliveHint = isAndroid
     ? keepAliveMinutes > 0
-      ? `Active for up to ${keepAliveMinutes}m in background: shows a silent ongoing notification with a Stop Keep-Alive button and uses slightly more battery until the timer expires.`
-      : 'Off by default (no background battery use): sessions pause in the background and reconnect when you return. Choosing a timer shows a silent ongoing notification with a Stop Keep-Alive button.'
+      ? `Active for up to ${keepAliveMinutes}m • Shows a silent stoppable notification and uses slightly more battery.`
+      : 'Off by default (no background battery use) • Pauses in background and reconnects on return.'
     : keepAliveMinutes > 0
-      ? 'Active: holds the connection across quick app switches (up to the ~30s iOS background limit) using slightly more battery during switches.'
-      : 'Off by default (no background battery use): sessions pause immediately when switching apps and reconnect when you return.';
+      ? 'Active across quick app switches (~30s iOS limit) • Uses slightly more battery.'
+      : 'Off by default (no background battery use) • Pauses when switching apps and reconnects on return.';
 
   const handleVisuals = getHandleVisualState({
     stage,
@@ -537,7 +641,9 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     runningCount,
   });
 
-  const isDrawerRendered = visible || isDraggingOpen || isAnimatingOut;
+  const isDrawerInteractiveOrDragging = visible || isDraggingOpen;
+  const isClosedHandleHidden =
+    visible || isDraggingOpen || Boolean(isKeyboardVisible);
 
   const backdropOpacity = useMemo(
     () =>
@@ -548,10 +654,6 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
       }),
     [drawerWidth, translateX],
   );
-
-  if (!isDrawerRendered && isKeyboardVisible) {
-    return null;
-  }
 
   const badgeCountLabel =
     attentionCount > 99
@@ -567,39 +669,40 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
 
   return (
     <View style={styles.overlayRoot} pointerEvents="box-none">
-      {isDrawerRendered ? (
-        <View
-          style={styles.openOverlay}
-          pointerEvents={visible ? 'auto' : 'none'}
+      <View
+        style={styles.openOverlay}
+        pointerEvents={visible ? 'auto' : 'none'}
+        importantForAccessibility={visible ? 'yes' : 'no-hide-descendants'}
+      >
+        <Animated.View
+          style={[styles.backdrop, { opacity: backdropOpacity }]}
         >
-          <Animated.View
-            style={[styles.backdrop, { opacity: backdropOpacity }]}
-          >
-            <Pressable
-              style={StyleSheet.absoluteFillObject}
-              onPress={handleClose}
-              accessibilityRole="button"
-              accessibilityLabel="Close drawer backdrop"
-            />
-          </Animated.View>
+          <Pressable
+            style={StyleSheet.absoluteFillObject}
+            onPress={handleClose}
+            accessibilityRole="button"
+            accessibilityLabel="Close drawer backdrop"
+          />
+        </Animated.View>
 
-          <Animated.View
-            style={[
-              styles.drawerPanel,
-              {
-                width: drawerWidth,
-                bottom: keyboardBottomPadding,
-                paddingTop: Math.max(insets.top + 12, 20),
-                paddingBottom:
-                  keyboardBottomPadding > 0
-                    ? 12
-                    : Math.max(insets.bottom + 14, 20),
-                transform: [{ translateX }],
-              },
-            ]}
-            {...openDrawerPanResponder.panHandlers}
-          >
-            {/* Segmented Mode Switcher: Inbox vs Session */}
+        <Animated.View
+          style={[
+            styles.drawerPanel,
+            isDrawerInteractiveOrDragging ? styles.drawerPanelElevated : null,
+            {
+              width: drawerWidth,
+              bottom: keyboardBottomPadding,
+              paddingTop: Math.max(insets.top + 12, 20),
+              paddingBottom:
+                keyboardBottomPadding > 0
+                  ? 12
+                  : Math.max(insets.bottom + 14, 20),
+              transform: [{ translateX }],
+            },
+          ]}
+          {...openDrawerPanResponder.panHandlers}
+        >
+            {/* Segmented Mode Switcher: Inbox vs Settings */}
             <View style={styles.modeSwitchTrack}>
               <TouchableOpacity
                 style={[
@@ -648,28 +751,22 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
               <TouchableOpacity
                 style={[
                   styles.modeSwitchBtn,
-                  activeMode === 'session' ? styles.modeSwitchBtnActive : null,
+                  activeMode === 'settings' ? styles.modeSwitchBtnActive : null,
                 ]}
-                onPress={() => setActiveMode('session')}
+                onPress={() => setActiveMode('settings')}
                 accessibilityRole="button"
-                accessibilityState={{ selected: activeMode === 'session' }}
-                accessibilityLabel="Drawer mode Session"
+                accessibilityState={{ selected: activeMode === 'settings' }}
+                accessibilityLabel="Drawer mode Settings"
               >
-                <View
-                  style={[
-                    styles.modeStatusDot,
-                    { backgroundColor: sessionStatusDotColor },
-                  ]}
-                />
                 <Text
                   style={[
                     styles.modeSwitchText,
-                    activeMode === 'session'
+                    activeMode === 'settings'
                       ? styles.modeSwitchTextActive
                       : null,
                   ]}
                 >
-                  Session
+                  Settings
                 </Text>
               </TouchableOpacity>
             </View>
@@ -680,21 +777,39 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                   <Text style={styles.inboxSubtitle} numberOfLines={1}>
                     {inboxSubtitleText}
                   </Text>
-                  <TouchableOpacity
-                    onPress={onRefreshInbox}
-                    style={styles.refreshMiniBtn}
-                    accessibilityRole="button"
-                    accessibilityLabel="Refresh Thread Inbox"
-                  >
-                    <Text style={styles.refreshMiniBtnText}>
-                      {isRefreshing ? 'Syncing…' : 'Refresh'}
-                    </Text>
-                  </TouchableOpacity>
+                  <View style={styles.inboxHeaderActions}>
+                    {stage === 'authenticated' ? (
+                      <TouchableOpacity
+                        onPress={handleOpenDashboard}
+                        style={styles.refreshMiniBtn}
+                        accessibilityRole="button"
+                        accessibilityLabel="Open All Machines overview"
+                      >
+                        <Text style={styles.refreshMiniBtnText}>Machines</Text>
+                      </TouchableOpacity>
+                    ) : null}
+                    <TouchableOpacity
+                      onPress={onRefreshInbox}
+                      style={styles.refreshMiniBtn}
+                      accessibilityRole="button"
+                      accessibilityLabel="Refresh Thread Inbox"
+                    >
+                      <Text style={styles.refreshMiniBtnText}>
+                        {isRefreshing ? 'Syncing…' : 'Refresh'}
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
                 </View>
 
                 <View style={styles.tabsRow}>
                   {(
                     [
+                      {
+                        key: 'all' as const,
+                        label: 'All',
+                        a11yLabel: 'All',
+                        count: counts.all,
+                      },
                       {
                         key: 'attention' as const,
                         label: 'Attention',
@@ -706,12 +821,6 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                         label: 'Running',
                         a11yLabel: 'Running',
                         count: counts.running,
-                      },
-                      {
-                        key: 'all' as const,
-                        label: 'All',
-                        a11yLabel: 'All',
-                        count: counts.all,
                       },
                     ] as const
                   ).map((tab) => {
@@ -760,6 +869,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                 {counts.all > 0 ? (
                   <View style={styles.toolbarRow}>
                     <TextInput
+                      ref={searchInputRef}
                       style={styles.searchInput}
                       value={searchQuery}
                       onChangeText={setSearchQuery}
@@ -818,7 +928,12 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                               : null,
                           ]}
                           activeOpacity={0.82}
-                          onPress={() => onSelectThread(thread)}
+                          onPress={() => {
+                            resetTransientInputs();
+                            isDraggingOpenRef.current = false;
+                            setIsDraggingOpen(false);
+                            onSelectThread(thread);
+                          }}
                           accessibilityRole="button"
                           accessibilityLabel={`Open thread ${thread.title}`}
                         >
@@ -912,16 +1027,16 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                           </Text>
                           <Text style={styles.emptySubtitle}>
                             Complete Google Sign-In in the workspace or open
-                            Session controls to manage your connection.
+                            Settings to reload or manage your connection.
                           </Text>
                           <TouchableOpacity
                             style={styles.emptyActionBtn}
-                            onPress={() => setActiveMode('session')}
+                            onPress={() => setActiveMode('settings')}
                             accessibilityRole="button"
-                            accessibilityLabel="Open Session controls from Inbox"
+                            accessibilityLabel="Open Settings from Inbox"
                           >
                             <Text style={styles.emptyActionBtnText}>
-                              Session & Handoff
+                              Open Settings
                             </Text>
                           </TouchableOpacity>
                         </>
@@ -943,17 +1058,20 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                             No connected workstations
                           </Text>
                           <Text style={styles.emptySubtitle}>
-                            Run agy --remote-control on your computer or paste a
-                            handoff link in Session controls.
+                            Run agy --remote-control on your computer, or open a
+                            machine link directly.
                           </Text>
                           <TouchableOpacity
                             style={styles.emptyActionBtn}
-                            onPress={() => setActiveMode('session')}
+                            onPress={() => {
+                              setActiveMode('settings');
+                              setIsHandoffExpanded(true);
+                            }}
                             accessibilityRole="button"
-                            accessibilityLabel="Open Session controls from Inbox"
+                            accessibilityLabel="Open machine link from Inbox"
                           >
                             <Text style={styles.emptyActionBtnText}>
-                              Open Session Controls
+                              Open Link or Machine ID
                             </Text>
                           </TouchableOpacity>
                         </>
@@ -1014,17 +1132,13 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                 keyboardShouldPersistTaps="handled"
                 showsVerticalScrollIndicator={false}
               >
-                <View style={styles.statusCard}>
-                  <Text style={styles.statusLabel}>SESSION VAULT STATUS</Text>
-                  <Text style={styles.statusValue}>{sessionStatusText}</Text>
-                </View>
-
                 <View style={styles.keepAliveSection}>
-                  <Text style={styles.sectionLabel}>Background Keep-Alive</Text>
+                  <Text style={styles.sectionLabel}>
+                    Stay Connected in Background
+                  </Text>
                   <Text style={styles.keepAliveDescription}>
-                    Keeps your live workstation stream connected while you switch
-                    to other apps (2FA, browser, chat) so returning is instant
-                    instead of reconnecting.
+                    Avoid reconnecting while switching to 2FA, chat, or browser
+                    apps.
                   </Text>
                   <View style={styles.keepAliveRow}>
                     {isAndroid
@@ -1106,71 +1220,122 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                   <Text style={styles.keepAliveHint}>{keepAliveHint}</Text>
                 </View>
 
+                <View style={styles.sectionDivider} />
+
                 <Text style={styles.sectionLabel}>
-                  CLI / Desktop Handoff
+                  Workspace & Troubleshooting
                 </Text>
-                <Text style={styles.sectionHint}>
-                  Paste a /remote-control link or enter your instance ID:
-                </Text>
-
-                <View style={styles.inputRow}>
-                  <TextInput
-                    style={styles.handoffInput}
-                    value={handoffText}
-                    onChangeText={(text) => {
-                      setHandoffText(text);
-                      if (validationError) {
-                        setValidationError(null);
-                      }
-                    }}
-                    placeholder="antigravity.google.com/r/devbox-..."
-                    placeholderTextColor="#64748B"
-                    autoCapitalize="none"
-                    autoCorrect={false}
-                    returnKeyType="go"
-                    onSubmitEditing={handleConnectHandoff}
-                    accessibilityLabel="CLI handoff link or instance ID"
-                  />
-                  <TouchableOpacity
-                    style={styles.connectButton}
-                    onPress={handleConnectHandoff}
-                    accessibilityRole="button"
-                    accessibilityLabel="Connect to handoff instance"
-                  >
-                    <Text style={styles.connectButtonText}>Go</Text>
-                  </TouchableOpacity>
-                </View>
-
-                {validationError ? (
-                  <Text style={styles.errorText}>{validationError}</Text>
-                ) : null}
 
                 <View style={styles.actionsGroup}>
                   <TouchableOpacity
-                    style={styles.actionButton}
-                    onPress={handleOpenDashboard}
-                    accessibilityRole="button"
-                  >
-                    <Text style={styles.actionButtonText}>
-                      All Machines Dashboard
-                    </Text>
-                  </TouchableOpacity>
-
-                  <TouchableOpacity
-                    style={styles.actionButton}
+                    style={styles.settingActionRow}
                     onPress={() => {
                       onReloadSession();
                       handleClose();
                     }}
                     accessibilityRole="button"
+                    accessibilityLabel="Reload current page"
                   >
-                    <Text style={styles.actionButtonText}>
-                      Reload & Sync Session Cookies
+                    <Text style={styles.settingActionIcon}>↻</Text>
+                    <Text style={styles.settingActionText}>
+                      Reload Current Page
                     </Text>
                   </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={styles.settingActionRow}
+                    onPress={handleOpenDashboard}
+                    accessibilityRole="button"
+                    accessibilityLabel="Open All Machines overview"
+                  >
+                    <Text style={styles.settingActionIcon}>⊞</Text>
+                    <Text style={styles.settingActionText}>
+                      All Machines Overview
+                    </Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[
+                      styles.settingActionRow,
+                      isHandoffExpanded ? styles.settingActionRowExpanded : null,
+                    ]}
+                    onPress={() => {
+                      setIsHandoffExpanded((prev) => {
+                        const next = !prev;
+                        if (!next) {
+                          setValidationError(null);
+                          handoffInputRef.current?.blur?.();
+                        }
+                        return next;
+                      });
+                    }}
+                    accessibilityRole="button"
+                    accessibilityState={{ expanded: isHandoffExpanded }}
+                    accessibilityLabel="Toggle machine link input"
+                  >
+                    <Text style={styles.settingActionIcon}>🔗</Text>
+                    <Text style={styles.settingActionText}>
+                      Open Link or Machine ID
+                    </Text>
+                    <Text style={styles.settingActionChevron}>
+                      {isHandoffExpanded ? '▾' : '›'}
+                    </Text>
+                  </TouchableOpacity>
+
+                  {isHandoffExpanded ? (
+                    <View style={styles.handoffExpandedCard}>
+                      <Text style={styles.sectionHint}>
+                        Paste a /remote-control link or machine ID:
+                      </Text>
+                      <View style={styles.inputRow}>
+                        <TextInput
+                          ref={handoffInputRef}
+                          style={styles.handoffInput}
+                          value={handoffText}
+                          onChangeText={(text) => {
+                            setHandoffText(text);
+                            if (validationError) {
+                              setValidationError(null);
+                            }
+                          }}
+                          placeholder="antigravity.google.com/r/devbox-..."
+                          placeholderTextColor="#64748B"
+                          autoCapitalize="none"
+                          autoCorrect={false}
+                          autoFocus={visible}
+                          returnKeyType="go"
+                          onSubmitEditing={handleConnectHandoff}
+                          accessibilityLabel="Machine link or ID"
+                        />
+                        <TouchableOpacity
+                          style={styles.connectButton}
+                          onPress={handleConnectHandoff}
+                          accessibilityRole="button"
+                          accessibilityLabel="Connect to machine"
+                        >
+                          <Text style={styles.connectButtonText}>Go</Text>
+                        </TouchableOpacity>
+                      </View>
+                      {validationError ? (
+                        <Text style={styles.errorText}>{validationError}</Text>
+                      ) : null}
+                    </View>
+                  ) : null}
                 </View>
 
                 <View style={styles.sessionBottomSection}>
+                  <View style={styles.accountStatusRow}>
+                    <View
+                      style={[
+                        styles.accountStatusDot,
+                        { backgroundColor: accountStatusDotColor },
+                      ]}
+                    />
+                    <Text style={styles.accountStatusText} numberOfLines={1}>
+                      {accountStatusText}
+                    </Text>
+                  </View>
+
                   {!confirmingSignOut ? (
                     <TouchableOpacity
                       style={styles.signOutButton}
@@ -1184,7 +1349,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                   ) : (
                     <View style={styles.confirmBox}>
                       <Text style={styles.confirmTitle}>
-                        Wipe saved Google session cookies from this device?
+                        Sign out of your Google account on this device?
                       </Text>
                       <View style={styles.confirmButtonsRow}>
                         <TouchableOpacity
@@ -1270,21 +1435,23 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
               />
             </TouchableOpacity>
           </Animated.View>
-        </View>
-      ) : null}
+      </View>
 
       <View
+        testID="closed-drawer-handle-zone"
         style={[
           styles.closedHandleZone,
-          isDrawerRendered ? styles.closedHandleZoneHidden : null,
+          isClosedHandleHidden ? styles.closedHandleZoneHidden : null,
         ]}
-        pointerEvents={visible && !isDraggingOpen ? 'none' : 'auto'}
+        pointerEvents={
+          (visible && !isDraggingOpen) || isKeyboardVisible ? 'none' : 'auto'
+        }
         importantForAccessibility={
-          isDrawerRendered ? 'no-hide-descendants' : 'auto'
+          isClosedHandleHidden ? 'no-hide-descendants' : 'auto'
         }
         {...closedHandlePanResponder.panHandlers}
       >
-        {!visible || isDraggingOpen ? (
+        {(!visible || isDraggingOpen) && !isKeyboardVisible ? (
           <TouchableOpacity
             style={styles.closedHandleButton}
             activeOpacity={0.8}
@@ -1360,6 +1527,8 @@ const styles = StyleSheet.create({
     borderRightColor: '#1E293B',
     paddingLeft: 16,
     paddingRight: 26,
+  },
+  drawerPanelElevated: {
     shadowColor: '#000',
     shadowOffset: { width: 8, height: 0 },
     shadowOpacity: 0.5,
@@ -1441,6 +1610,11 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 10,
     gap: 8,
+  },
+  inboxHeaderActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
   },
   inboxSubtitle: {
     flex: 1,
@@ -1696,40 +1870,20 @@ const styles = StyleSheet.create({
   sessionScrollContent: {
     flexGrow: 1,
   },
-  statusCard: {
-    backgroundColor: '#1E293B',
-    borderRadius: 11,
-    padding: 11,
-    marginBottom: 13,
-    borderWidth: 1,
-    borderColor: '#334155',
-  },
-  statusLabel: {
-    color: '#94A3B8',
-    fontSize: 10,
-    fontWeight: '700',
-    letterSpacing: 0.7,
-    marginBottom: 3,
-  },
-  statusValue: {
-    color: '#E2E8F0',
-    fontSize: 12.5,
-    fontWeight: '500',
-  },
   keepAliveSection: {
-    marginBottom: 13,
+    marginBottom: 4,
   },
   keepAliveDescription: {
     color: '#94A3B8',
     fontSize: 11.5,
     lineHeight: 16,
-    marginBottom: 6,
+    marginBottom: 8,
   },
   keepAliveRow: {
     flexDirection: 'row',
     gap: 5,
     marginTop: 2,
-    marginBottom: 6,
+    marginBottom: 7,
   },
   keepAliveChip: {
     flex: 1,
@@ -1759,6 +1913,11 @@ const styles = StyleSheet.create({
     fontSize: 11,
     lineHeight: 15,
   },
+  sectionDivider: {
+    height: 1,
+    backgroundColor: '#1E293B',
+    marginVertical: 14,
+  },
   sectionLabel: {
     color: '#F1F5F9',
     fontSize: 13,
@@ -1773,7 +1932,6 @@ const styles = StyleSheet.create({
   inputRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: 8,
     gap: 7,
   },
   handoffInput: {
@@ -1801,29 +1959,76 @@ const styles = StyleSheet.create({
   errorText: {
     color: '#F87171',
     fontSize: 11.5,
-    marginBottom: 8,
+    marginTop: 7,
   },
   actionsGroup: {
     marginTop: 6,
     gap: 8,
   },
-  actionButton: {
+  settingActionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
     backgroundColor: '#1E293B',
     paddingVertical: 11,
     paddingHorizontal: 12,
     borderRadius: 9,
     borderWidth: 1,
     borderColor: '#334155',
-    alignItems: 'center',
+    gap: 9,
   },
-  actionButtonText: {
+  settingActionRowExpanded: {
+    borderBottomLeftRadius: 0,
+    borderBottomRightRadius: 0,
+    borderColor: '#475569',
+  },
+  settingActionIcon: {
+    color: '#93C5FD',
+    fontSize: 13.5,
+    width: 18,
+    textAlign: 'center',
+  },
+  settingActionText: {
+    flex: 1,
     color: '#E2E8F0',
     fontSize: 13,
     fontWeight: '600',
   },
+  settingActionChevron: {
+    color: '#94A3B8',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  handoffExpandedCard: {
+    marginTop: -8,
+    backgroundColor: '#0B1120',
+    paddingHorizontal: 11,
+    paddingVertical: 10,
+    borderBottomLeftRadius: 9,
+    borderBottomRightRadius: 9,
+    borderWidth: 1,
+    borderTopWidth: 0,
+    borderColor: '#475569',
+  },
   sessionBottomSection: {
     marginTop: 'auto',
-    paddingTop: 14,
+    paddingTop: 16,
+  },
+  accountStatusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    marginBottom: 9,
+  },
+  accountStatusDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 999,
+  },
+  accountStatusText: {
+    color: '#94A3B8',
+    fontSize: 11.5,
+    fontWeight: '500',
   },
   signOutButton: {
     paddingVertical: 11,

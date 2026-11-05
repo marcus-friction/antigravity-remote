@@ -30,12 +30,12 @@ To keep you signed in across app restarts and support `/remote-control` session 
 
 You have full control over all locally stored session data at any time:
 
-1. **In-App Sign Out**: Pull open the left navigation drawer (via the vertical handle along the left margin), switch to **Session**, select **Sign Out of Google Account**, and tap **Confirm Sign Out**. This immediately unmounts the WebView and deletes all saved cookies, DOM storage, WebView cache, and Keychain/SecureStore snapshots from your device.
+1. **In-App Sign Out**: Pull open the left navigation drawer (via the vertical handle along the left margin), switch to **Settings**, select **Sign Out of Google Account**, and tap **Confirm Sign Out**. This immediately unmounts the WebView and deletes all saved cookies, DOM storage, WebView cache, and Keychain/SecureStore snapshots from your device.
 2. **Operating System Settings**: Clearing storage or uninstalling **Antigravity Remote** through your Android or iOS system settings permanently deletes all local application data from your device.
 
 ## 5. Permissions
 
-Antigravity Remote requests standard network access (`android.permission.INTERNET`) to load `https://antigravity.google.com`, along with foreground-service, wake-lock, and notification permissions (`FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_SPECIAL_USE`, `WAKE_LOCK`, and `POST_NOTIFICATIONS`) used solely when you opt in to keep your active signed-in remote session connected for a bounded configurable duration (`Off` by default; user-configurable in Session controls to `5m`, `15m`, `30m`, or `60m`) while multitasking, with an ongoing status notification and **Stop Keep-Alive** control. It does not request access to your camera, microphone, contacts, location, photos, or external storage.
+Antigravity Remote requests standard network access (`android.permission.INTERNET`) to load `https://antigravity.google.com`, along with foreground-service, wake-lock, and notification permissions (`FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_SPECIAL_USE`, `WAKE_LOCK`, and `POST_NOTIFICATIONS`) used solely when you opt in to keep your active signed-in remote session connected for a bounded configurable duration (`Off` by default; user-configurable in Settings to `5m`, `15m`, `30m`, or `60m`) while multitasking, with an ongoing status notification and **Stop Keep-Alive** control. It does not request access to your camera, microphone, contacts, location, photos, or external storage.
 
 ## 6. Changes to This Privacy Policy
 

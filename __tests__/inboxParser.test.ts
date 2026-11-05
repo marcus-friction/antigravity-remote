@@ -567,6 +567,51 @@ describe('inboxParser', () => {
       'https://antigravity.google.com/r/box-alpha?p=c%2Fcascade-42',
     );
 
+    // Simulate `URL_CHANGE` (field 1 / index 0) confirming `fastNavigate`:
+    // completes `pendingFastNav` and reports updated `activeUrl` to native WITHOUT
+    // clobbering `history.replaceState` before Angular's `RemoteControlComponent` syncs router state.
+    postedToIframe.length = 0;
+    vm.runInContext(
+      buildFastThreadSwitchScript({
+        requestId: 'fast-url-change',
+        instanceUuid: 'box-alpha',
+        childPath: 'c/cascade-55',
+        targetUrl: 'https://antigravity.google.com/r/box-alpha?p=c%2Fcascade-55',
+      }),
+      context,
+    );
+    for (const listener of windowListeners.get('message') ?? []) {
+      listener({
+        origin: 'https://antigravity.static.usercontent.goog',
+        data: {
+          jspbPayload: JSON.stringify([
+            ['/web/1.0.20260910010023/c/cascade-55'],
+          ]),
+        },
+      });
+    }
+    expect(
+      postedToNative.some(
+        (m) =>
+          m.type === 'AGY_INBOX_FAST_NAV_RESULT' &&
+          m.requestId === 'fast-url-change' &&
+          m.handled === true,
+      ),
+    ).toBe(true);
+    expect(
+      postedToNative.some(
+        (m) =>
+          m.type === 'AGY_INBOX_ACTIVE_ROUTE' &&
+          m.activeInstanceUuid === 'box-alpha' &&
+          m.activeCascadeId === 'cascade-55' &&
+          m.activeUrl ===
+            'https://antigravity.google.com/r/box-alpha?p=c%2Fcascade-55',
+      ),
+    ).toBe(true);
+    expect(sandboxWindow.location.href).toBe(
+      'https://antigravity.google.com/r/box-alpha?p=c%2Fcascade-42',
+    );
+
     // Test unready/stalled iframe fallback: if the iframe does not confirm within 380ms,
     // `fastNavigate` reports `handled: false` so native falls back to full URL navigation.
     postedToIframe.length = 0;

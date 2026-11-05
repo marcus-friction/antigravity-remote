@@ -37,10 +37,10 @@ Select **"All or some functionality in my app is restricted"** → **"Add instru
   ```text
   Antigravity Remote is an open-source mobile companion client wrapper for https://antigravity.google.com.
   1. On launch, the app loads the public https://antigravity.google.com landing page and Google Sign-In flow (https://accounts.google.com).
-  2. Reviewers can test all native wrapper features without a dedicated test account by pulling open or tapping the vertical drawer handle along the left margin to open the native Inbox & Session drawer:
-     - View live Session Vault status
-     - Test CLI handoff input validation (e.g., entering "devbox-demo-1" or "https://antigravity.google.com/r/devbox-demo-1")
-     - Test "Reload & Sync Session Cookies"
+  2. Reviewers can test all native wrapper features without a dedicated test account by pulling open or tapping the vertical drawer handle along the left margin to open the native Inbox & Settings drawer:
+     - Configure bounded background connection timers ("Stay Connected in Background")
+     - Expand "Open Link or Machine ID" to test machine link/ID validation (e.g., entering "devbox-demo-1" or "https://antigravity.google.com/r/devbox-demo-1")
+     - Test "Reload Current Page" and "All Machines Overview"
      - Test "Sign Out of Google Account" -> "Confirm Sign Out" (which unmounts the WebView and wipes local cookies/cache)
      - Open the in-app Privacy Policy and Open Source (MIT) links
   3. Signing into an active Antigravity workspace uses standard Google Account authentication on accounts.google.com.
@@ -76,5 +76,5 @@ Select **"All or some functionality in my app is restricted"** → **"Add instru
 - **Foreground service type**: `specialUse`
 - **Use-case justification (Copy-Paste)**:
   ```text
-  Antigravity Remote connects the signed-in user's mobile device to an active remote workstation CLI/IDE session on https://antigravity.google.com/r/<instance-id> over persistent HTTPS/WebSocket streams. Users routinely switch between Antigravity Remote and companion apps (2FA authenticators, password managers, documentation browsers, or team chat) while monitoring or steering a live remote coding session. Standard FGS types (dataSync, connectedDevice, remoteMessaging) do not apply to interactive remote workstation terminal/IDE streaming over WebSockets without local Bluetooth/USB hardware or VoIP/chat messaging. Background keep-alive is Off by default and runs only when the signed-in user explicitly selects a timer (5m, 15m, 30m, or 60m) in Session controls while an authenticated session is active. While enabled, a non-exported wall-clock-bounded foreground service prevents Android's Cached Apps Freezer from dropping the live workstation stream when the app leaves the screen, displays a silent ongoing notification with an immediate "Stop Keep-Alive" button, and stops automatically when the selected timer expires or the user returns to the app.
+  Antigravity Remote connects the signed-in user's mobile device to an active remote workstation CLI/IDE session on https://antigravity.google.com/r/<instance-id> over persistent HTTPS/WebSocket streams. Users routinely switch between Antigravity Remote and companion apps (2FA authenticators, password managers, documentation browsers, or team chat) while monitoring or steering a live remote coding session. Standard FGS types (dataSync, connectedDevice, remoteMessaging) do not apply to interactive remote workstation terminal/IDE streaming over WebSockets without local Bluetooth/USB hardware or VoIP/chat messaging. Background keep-alive is Off by default and runs only when the signed-in user explicitly selects a timer (5m, 15m, 30m, or 60m) in Settings while an authenticated session is active. While enabled, a non-exported wall-clock-bounded foreground service prevents Android's Cached Apps Freezer from dropping the live workstation stream when the app leaves the screen, displays a silent ongoing notification with an immediate "Stop Keep-Alive" button, and stops automatically when the selected timer expires or the user returns to the app.
   ```

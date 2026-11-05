@@ -289,7 +289,6 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const [isInboxRefreshing, setIsInboxRefreshing] = useState<boolean>(false);
   const [inboxSnapshot, setInboxSnapshot] =
     useState<InboxSnapshot>(EMPTY_INBOX_SNAPSHOT);
-  const [lastSyncedCookieCount, setLastSyncedCookieCount] = useState<number>(0);
   const [webViewInstanceKey, setWebViewInstanceKey] = useState<number>(1);
   const [resetRequest, setResetRequest] = useState<{
     reason: 'signout' | 'recovery';
@@ -304,10 +303,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
 
   const syncCookiesToVault = useCallback(async () => {
     if (!hydratedRef.current || isResettingSessionRef.current) return;
-    const count = await backupCookiesFromWebView();
-    if (count > 0) {
-      setLastSyncedCookieCount(count);
-    }
+    await backupCookiesFromWebView();
   }, []);
 
   useEffect(() => {
@@ -365,7 +361,6 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       }
 
       const initialTarget = incomingDeepLinkUrl ?? savedUrl;
-      setLastSyncedCookieCount(restoredCount);
       setKeepAliveMinutes(savedKeepAliveMinutes);
       keepAliveMinutesRef.current = savedKeepAliveMinutes;
       setCurrentSourceUrl(initialTarget);
@@ -709,7 +704,6 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     clearSession()
       .then(() => {
         if (!mounted) return;
-        setLastSyncedCookieCount(0);
         setHasNetworkError(false);
         setPageError(null);
         renderProcessDeadRef.current = false;
@@ -744,7 +738,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     if (isResettingSessionRef.current) return;
     if (cookieRecoveryAttemptsRef.current >= 2) {
       setPageError(
-        'Automatic sign-in recovery stopped. Pull open the left Session drawer and sign out to start again.',
+        'Automatic sign-in recovery stopped. Pull open the left Settings drawer and sign out to start again.',
       );
       setHasNetworkError(true);
       setStage('offline');
@@ -892,7 +886,9 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     if (isResettingSessionRef.current) return;
     setHasNetworkError(false);
     setPageError(null);
-    setStage('authenticating');
+    if (stageRef.current === 'offline') {
+      setStage('authenticating');
+    }
     void syncCookiesToVault();
     if (renderProcessDeadRef.current) {
       renderProcessDeadRef.current = false;
@@ -968,7 +964,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       if (isResettingSessionRef.current) return;
       const resolvedMode: DrawerMode =
         preferredMode ??
-        (stageRef.current === 'authenticated' ? 'inbox' : 'session');
+        (stageRef.current === 'authenticated' ? 'inbox' : 'settings');
       setDrawerInitialMode(resolvedMode);
       isDrawerOpenRef.current = true;
       setIsDrawerOpen(true);
@@ -1362,7 +1358,6 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         attentionCount={inboxCounts.attention}
         urgentAttentionCount={inboxCounts.urgent}
         runningCount={inboxCounts.running}
-        lastSyncedCookieCount={lastSyncedCookieCount}
         keepAliveMinutes={keepAliveMinutes}
         onOpen={handleOpenDrawer}
         onClose={handleCloseDrawer}

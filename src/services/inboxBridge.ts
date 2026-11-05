@@ -751,7 +751,7 @@ export const INBOX_BRIDGE_SCRIPT = `
       } catch (_) {}
     }
 
-    function completePendingFastNavIfMatched(confirmedCascadeId) {
+    function completePendingFastNavIfMatched(confirmedCascadeId, hostHandlesUrlSync) {
       if (!pendingFastNav || !confirmedCascadeId) {
         return false;
       }
@@ -760,7 +760,9 @@ export const INBOX_BRIDGE_SCRIPT = `
       }
       var completed = pendingFastNav;
       clearPendingFastNav();
-      syncHostLocationUrl(completed.targetUrl);
+      if (!hostHandlesUrlSync) {
+        syncHostLocationUrl(completed.targetUrl);
+      }
       setIframeCascadeOverride(confirmedCascadeId);
       postToNative({
         type: 'AGY_INBOX_FAST_NAV_RESULT',
@@ -770,7 +772,7 @@ export const INBOX_BRIDGE_SCRIPT = `
       });
       postToNative({
         type: 'AGY_INBOX_ACTIVE_ROUTE',
-        activeUrl: window.location.href,
+        activeUrl: completed.targetUrl || window.location.href,
         activeInstanceUuid: completed.instanceUuid,
         activeCascadeId: confirmedCascadeId
       });
@@ -879,7 +881,7 @@ export const INBOX_BRIDGE_SCRIPT = `
 
         if (data.type === 'URL_CHANGED' && typeof data.path === 'string') {
           var changedCascadeId = extractCascadeIdFromIframePath(data.path, frameSrc);
-          if (completePendingFastNavIfMatched(changedCascadeId)) {
+          if (completePendingFastNavIfMatched(changedCascadeId, true)) {
             return;
           }
           setIframeCascadeOverride(changedCascadeId);
@@ -897,18 +899,19 @@ export const INBOX_BRIDGE_SCRIPT = `
         if (!jspb) return;
 
         // Field 1 (index 0): URL_CHANGE, or Field 4 (index 3): URL_RESPONSE
-        var reportedPath =
-          Array.isArray(jspb[0]) && typeof jspb[0][0] === 'string'
-            ? jspb[0][0]
-            : Array.isArray(jspb[3]) && typeof jspb[3][0] === 'string'
-              ? jspb[3][0]
-              : null;
+        var isUrlChangeEvent =
+          Array.isArray(jspb[0]) && typeof jspb[0][0] === 'string';
+        var reportedPath = isUrlChangeEvent
+          ? jspb[0][0]
+          : Array.isArray(jspb[3]) && typeof jspb[3][0] === 'string'
+            ? jspb[3][0]
+            : null;
         if (reportedPath !== null) {
           var extractedCascadeId = extractCascadeIdFromIframePath(reportedPath, frameSrc);
-          if (completePendingFastNavIfMatched(extractedCascadeId)) {
+          if (completePendingFastNavIfMatched(extractedCascadeId, isUrlChangeEvent)) {
             return;
           }
-          if (Array.isArray(jspb[0])) {
+          if (isUrlChangeEvent) {
             setIframeCascadeOverride(extractedCascadeId);
             var currentRoute = parseRouteFromLocation();
             postToNative({
