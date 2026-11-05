@@ -12,7 +12,9 @@ import android.view.ViewGroup
 import java.util.WeakHashMap
 import android.webkit.WebStorage
 import android.webkit.WebView
+import androidx.webkit.ScriptHandler
 import androidx.webkit.WebStorageCompat
+import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import expo.modules.kotlin.Promise
 import expo.modules.kotlin.functions.Queues
@@ -20,13 +22,21 @@ import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 
 class RemoteSessionModule : Module() {
+  private data class InstalledDocumentStartScript(
+    val script: String,
+    val handler: ScriptHandler
+  )
+
   private val mainHandler = Handler(Looper.getMainLooper())
   @Volatile private var keepAliveEnabled: Boolean = false
   @Volatile private var keepAliveMinutes: Int = 0
   @Volatile private var sessionActive: Boolean = false
   @Volatile private var stoppedForCurrentBackgroundStay: Boolean = false
+  @Volatile private var desiredDocumentStartScript: String? = null
   private var registeredApplication: Application? = null
   private val observedDecorViews = WeakHashMap<View, View.OnLayoutChangeListener>()
+  private val installedDocumentStartScripts =
+    WeakHashMap<WebView, InstalledDocumentStartScript>()
 
   private val activityLifecycleCallbacks = object : Application.ActivityLifecycleCallbacks {
     override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
@@ -38,6 +48,7 @@ class RemoteSessionModule : Module() {
       runOnMain {
         stopKeepAliveServiceIfRunning()
         applyDrawerGestureExclusion(activity)
+        applyDocumentStartScriptIfNeeded(activity)
         applyWebViewKeepAlivePolicy(
           protectInBackground = shouldKeepAlive(),
           wakeTimers = true,
@@ -153,11 +164,11 @@ class RemoteSessionModule : Module() {
   }
 
   private fun applyDrawerGestureExclusion(hostActivity: Activity? = null) {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
     val activity = hostActivity ?: appContext.currentActivity ?: return
     val decorView = activity.window?.decorView ?: return
 
     fun updateExclusionRects(view: View) {
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
       val height = view.height
       if (height <= 0) return
       val density = view.resources.displayMetrics.density
@@ -177,11 +188,54 @@ class RemoteSessionModule : Module() {
     if (!observedDecorViews.containsKey(decorView)) {
       val listener = View.OnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
         updateExclusionRects(v)
+        applyDocumentStartScriptIfNeeded(activity)
       }
       observedDecorViews[decorView] = listener
       decorView.addOnLayoutChangeListener(listener)
     }
-    decorView.post { updateExclusionRects(decorView) }
+    decorView.post {
+      updateExclusionRects(decorView)
+      applyDocumentStartScriptIfNeeded(activity)
+    }
+  }
+
+  private fun applyDocumentStartScriptIfNeeded(hostActivity: Activity? = null): Boolean {
+    val script = desiredDocumentStartScript
+    if (script.isNullOrEmpty()) {
+      removeInstalledDocumentStartScripts()
+      return false
+    }
+    if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+      return false
+    }
+    val activity = hostActivity ?: appContext.currentActivity ?: return false
+    val webView = findWebView(activity.window?.decorView) ?: return false
+    val existing = installedDocumentStartScripts[webView]
+    if (existing != null && existing.script == script) {
+      return true
+    }
+    existing?.handler?.let { handler ->
+      runCatching { handler.remove() }
+    }
+    return try {
+      val handler = WebViewCompat.addDocumentStartJavaScript(
+        webView,
+        script,
+        ALLOWED_DOCUMENT_START_ORIGINS
+      )
+      installedDocumentStartScripts[webView] =
+        InstalledDocumentStartScript(script, handler)
+      true
+    } catch (_: Throwable) {
+      false
+    }
+  }
+
+  private fun removeInstalledDocumentStartScripts() {
+    for ((_, installed) in installedDocumentStartScripts) {
+      runCatching { installed.handler.remove() }
+    }
+    installedDocumentStartScripts.clear()
   }
 
   private fun clearDrawerGestureExclusionObservers() {
@@ -219,6 +273,8 @@ class RemoteSessionModule : Module() {
       try {
         sessionActive = false
         stoppedForCurrentBackgroundStay = false
+        desiredDocumentStartScript = null
+        removeInstalledDocumentStartScripts()
         stopKeepAliveServiceIfRunning()
         applyWebViewKeepAlivePolicy(
           protectInBackground = false,
@@ -255,12 +311,23 @@ class RemoteSessionModule : Module() {
       }
     }.runOnQueue(Queues.MAIN)
 
+    AsyncFunction("installDocumentStartScript") { script: String ->
+      registerActivityLifecycleObserverIfNeeded()
+      desiredDocumentStartScript = script
+      applyDrawerGestureExclusion()
+      if (!applyDocumentStartScriptIfNeeded() && script.isNotEmpty()) {
+        mainHandler.postDelayed({ applyDocumentStartScriptIfNeeded() }, 50L)
+        mainHandler.postDelayed({ applyDocumentStartScriptIfNeeded() }, 200L)
+      }
+    }.runOnQueue(Queues.MAIN)
+
     OnActivityEntersForeground {
       stoppedForCurrentBackgroundStay = false
       runOnMain {
         registerActivityLifecycleObserverIfNeeded()
         stopKeepAliveServiceIfRunning()
         applyDrawerGestureExclusion()
+        applyDocumentStartScriptIfNeeded()
         applyWebViewKeepAlivePolicy(
           protectInBackground = shouldKeepAlive(),
           wakeTimers = true
@@ -276,7 +343,10 @@ class RemoteSessionModule : Module() {
     }
 
     OnDestroy {
-      runOnMain { clearDrawerGestureExclusionObservers() }
+      runOnMain {
+        clearDrawerGestureExclusionObservers()
+        removeInstalledDocumentStartScripts()
+      }
       unregisterActivityLifecycleObserver()
       RemoteKeepAliveService.unregisterKeepAliveEndedListener(this@RemoteSessionModule)
       stopKeepAliveServiceIfRunning()
@@ -284,6 +354,10 @@ class RemoteSessionModule : Module() {
   }
 
   companion object {
+    private val ALLOWED_DOCUMENT_START_ORIGINS = setOf(
+      "https://antigravity.google.com",
+      "https://antigravity.static.usercontent.goog"
+    )
     private const val RELEASE_WEB_LOCK_SCRIPT =
       "(function(){try{window.__agyKeepAliveLockDesired=false;if(typeof window.__agyReleaseKeepAliveLock==='function'){window.__agyReleaseKeepAliveLock();}window.__agyKeepAliveLockHeld=false;}catch(_){}})();"
   }

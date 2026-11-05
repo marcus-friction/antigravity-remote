@@ -4,6 +4,8 @@ import {
   ActivityIndicator,
   Animated,
   AppState,
+  NativeScrollEvent,
+  NativeSyntheticEvent,
   PanResponder,
   Platform,
   Pressable,
@@ -230,10 +232,64 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   const wasVisibleRef = useRef<boolean>(visible);
   const searchInputRef = useRef<TextInput | null>(null);
   const handoffInputRef = useRef<TextInput | null>(null);
+  const inboxScrollViewRef = useRef<ScrollView | null>(null);
+  const inboxScrollOffsetsRef = useRef<Record<InboxFilterTab, number>>({
+    all: 0,
+    attention: 0,
+    running: 0,
+  });
+  const pendingInboxScrollRestoreRef = useRef<number | null>(null);
   const closedParkX = -(drawerWidth + CLOSED_PARK_EXTRA_OFFSET);
   const translateX = useRef(
     new Animated.Value(visible ? 0 : closedParkX),
   ).current;
+
+  const resetInboxScrollState = useCallback(() => {
+    inboxScrollOffsetsRef.current = { all: 0, attention: 0, running: 0 };
+    pendingInboxScrollRestoreRef.current = null;
+    inboxScrollViewRef.current?.scrollTo?.({ y: 0, animated: false });
+  }, []);
+
+  useEffect(() => {
+    if (stage === 'hydrating') {
+      resetInboxScrollState();
+    }
+  }, [resetInboxScrollState, stage]);
+
+  useEffect(() => {
+    if (activeMode !== 'inbox' || searchQuery.trim().length > 0) {
+      pendingInboxScrollRestoreRef.current = null;
+      return;
+    }
+    const targetY = inboxScrollOffsetsRef.current[selectedTab] ?? 0;
+    pendingInboxScrollRestoreRef.current = targetY > 0 ? targetY : null;
+    inboxScrollViewRef.current?.scrollTo?.({ y: targetY, animated: false });
+  }, [activeMode, searchQuery, selectedTab, visible]);
+
+  const handleInboxScroll = useCallback(
+    (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+      if (searchQuery.trim().length > 0) {
+        return;
+      }
+      const nextY = event?.nativeEvent?.contentOffset?.y;
+      if (typeof nextY === 'number' && Number.isFinite(nextY)) {
+        pendingInboxScrollRestoreRef.current = null;
+        inboxScrollOffsetsRef.current[selectedTab] = Math.max(0, nextY);
+      }
+    },
+    [searchQuery, selectedTab],
+  );
+
+  const handleInboxContentSizeChange = useCallback(
+    (_contentWidth: number, contentHeight: number) => {
+      const targetY = pendingInboxScrollRestoreRef.current;
+      if (targetY !== null && contentHeight > 0) {
+        pendingInboxScrollRestoreRef.current = null;
+        inboxScrollViewRef.current?.scrollTo?.({ y: targetY, animated: false });
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     if (visible && !wasVisibleRef.current) {
@@ -592,6 +648,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     setValidationError(null);
     setSearchQuery('');
     setSelectedTab('all');
+    resetInboxScrollState();
     isDraggingOpenRef.current = false;
     setIsDraggingOpen(false);
     onSignOut();
@@ -902,10 +959,14 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                 ) : null}
 
                 <ScrollView
+                  ref={inboxScrollViewRef}
                   style={styles.flexScroll}
                   contentContainerStyle={styles.listContent}
                   keyboardShouldPersistTaps="handled"
                   showsVerticalScrollIndicator={false}
+                  scrollEventThrottle={16}
+                  onScroll={handleInboxScroll}
+                  onContentSizeChange={handleInboxContentSizeChange}
                 >
                   {filteredThreads.length > 0 ? (
                     filteredThreads.map((thread) => {

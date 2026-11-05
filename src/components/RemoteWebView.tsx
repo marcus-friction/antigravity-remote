@@ -33,6 +33,10 @@ import {
   buildMarkThreadReadScript,
 } from '../services/inboxBridge';
 import {
+  PROJECT_OVERVIEW_SCROLL_SCRIPT,
+  buildReturnToOverviewScript,
+} from '../services/scrollRestorationBridge';
+import {
   backupCookiesFromWebView,
   clearSession,
   getGoogleSessionSignature,
@@ -44,7 +48,10 @@ import {
   suspendSessionPersistence,
   resumeSessionPersistence,
 } from '../services/sessionVault';
-import { configureNativeKeepAlive } from '../services/webData';
+import {
+  configureNativeKeepAlive,
+  installNativeDocumentStartScript,
+} from '../services/webData';
 import { InboxSnapshot, InboxThreadItem } from '../types/inbox';
 import { AuthFlowStage, KeepAliveMinutes } from '../types/session';
 import {
@@ -202,7 +209,7 @@ function recordBoundedLocalRead(
   }
 }
 
-const COMBINED_INJECTED_SCRIPT = `${KEYBOARD_ADAPTATION_SCRIPT}\n${INBOX_BRIDGE_SCRIPT}`;
+const COMBINED_INJECTED_SCRIPT = `${KEYBOARD_ADAPTATION_SCRIPT}\n${PROJECT_OVERVIEW_SCROLL_SCRIPT}\n${INBOX_BRIDGE_SCRIPT}`;
 
 const EMPTY_INBOX_SNAPSHOT: InboxSnapshot = {
   instances: [],
@@ -266,6 +273,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   );
   const locallyReadMapRef = useRef<Record<string, number>>({});
   const activeInstanceUuidRef = useRef<string | null>(null);
+  const lastObservedOverviewInstanceRef = useRef<string | null>(null);
+  const canReturnToOverviewRef = useRef<boolean>(false);
   const pendingFastNavRef = useRef<
     Map<string, { timer: ReturnType<typeof setTimeout>; targetUrl: string }>
   >(new Map());
@@ -361,6 +370,12 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       }
 
       const initialTarget = incomingDeepLinkUrl ?? savedUrl;
+      const initialRoute = extractActiveRouteFromUrl(initialTarget);
+      activeInstanceUuidRef.current = initialRoute.instanceUuid;
+      lastObservedOverviewInstanceRef.current = initialRoute.cascadeId
+        ? null
+        : initialRoute.instanceUuid;
+      canReturnToOverviewRef.current = false;
       setKeepAliveMinutes(savedKeepAliveMinutes);
       keepAliveMinutesRef.current = savedKeepAliveMinutes;
       setCurrentSourceUrl(initialTarget);
@@ -411,10 +426,43 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       setCurrentSourceUrl(validation.normalizedUrl);
       setWebViewInstanceKey((prev) => prev + 1);
       currentNavUrlRef.current = validation.normalizedUrl;
+      lastObservedOverviewInstanceRef.current = null;
+      canReturnToOverviewRef.current = false;
       void saveLastActiveUrl(validation.normalizedUrl);
     }
     onDeepLinkConsumed();
   }, [incomingDeepLinkUrl, isHydrated, onDeepLinkConsumed, resetRequest]);
+
+  const recordActiveRouteForBackNavigation = useCallback(
+    (instanceUuid: string | null, cascadeId: string | null) => {
+      if (!instanceUuid) {
+        lastObservedOverviewInstanceRef.current = null;
+        canReturnToOverviewRef.current = false;
+        return;
+      }
+      if (!cascadeId) {
+        lastObservedOverviewInstanceRef.current = instanceUuid;
+        canReturnToOverviewRef.current = false;
+        return;
+      }
+      canReturnToOverviewRef.current =
+        lastObservedOverviewInstanceRef.current === instanceUuid;
+    },
+    [],
+  );
+
+  // Step 2a: Register document-start scroll restoration for cross-origin workstation iframes on Android
+  useEffect(() => {
+    if (
+      Platform.OS !== 'android' ||
+      !isHydrated ||
+      isResettingSessionRef.current ||
+      resetRequest
+    ) {
+      return;
+    }
+    void installNativeDocumentStartScript?.(PROJECT_OVERVIEW_SCROLL_SCRIPT);
+  }, [isHydrated, resetRequest, webViewInstanceKey]);
 
   const requestNotificationPermissionIfNeeded = useCallback(() => {
     if (
@@ -625,7 +673,13 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         return true;
       }
       if (canGoBackRef.current && webViewRef.current) {
+        canReturnToOverviewRef.current = false;
         webViewRef.current.goBack();
+        return true;
+      }
+      if (canReturnToOverviewRef.current && webViewRef.current) {
+        canReturnToOverviewRef.current = false;
+        webViewRef.current.injectJavaScript(buildReturnToOverviewScript());
         return true;
       }
       return false;
@@ -683,6 +737,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       clearInboxTimers();
       locallyReadMapRef.current = {};
       activeInstanceUuidRef.current = null;
+      lastObservedOverviewInstanceRef.current = null;
+      canReturnToOverviewRef.current = false;
       webViewRef.current?.stopLoading();
       stageRef.current = 'hydrating';
       setStage('hydrating');
@@ -801,6 +857,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         void saveLastActiveUrl(validation.normalizedUrl);
         const route = extractActiveRouteFromUrl(validation.normalizedUrl);
         activeInstanceUuidRef.current = route.instanceUuid;
+        recordActiveRouteForBackNavigation(route.instanceUuid, route.cascadeId);
         if (route.instanceUuid && route.cascadeId) {
           recordBoundedLocalRead(
             locallyReadMapRef.current,
@@ -841,14 +898,22 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     },
     [
       checkPost2faSessionAndAdvance,
+      recordActiveRouteForBackNavigation,
       recoverFromCookieMismatch,
       syncCookiesToVault,
     ],
   );
 
+  const handleLoadStart = useCallback(() => {
+    if (Platform.OS === 'android' && !isResettingSessionRef.current) {
+      void installNativeDocumentStartScript?.(PROJECT_OVERVIEW_SCROLL_SCRIPT);
+    }
+  }, []);
+
   const handleLoadEnd = useCallback(() => {
     void syncCookiesToVault();
     webViewRef.current?.injectJavaScript(KEYBOARD_ADAPTATION_SCRIPT);
+    webViewRef.current?.injectJavaScript(PROJECT_OVERVIEW_SCROLL_SCRIPT);
     webViewRef.current?.injectJavaScript(INBOX_BRIDGE_SCRIPT);
     webViewRef.current?.injectJavaScript(
       buildKeepAliveWebLockScript(
@@ -926,9 +991,12 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     }
     setCurrentSourceUrl(validation.normalizedUrl);
     currentNavUrlRef.current = validation.normalizedUrl;
-    activeInstanceUuidRef.current = extractActiveRouteFromUrl(
-      validation.normalizedUrl,
-    ).instanceUuid;
+    const targetRoute = extractActiveRouteFromUrl(validation.normalizedUrl);
+    activeInstanceUuidRef.current = targetRoute.instanceUuid;
+    lastObservedOverviewInstanceRef.current = targetRoute.cascadeId
+      ? null
+      : targetRoute.instanceUuid;
+    canReturnToOverviewRef.current = false;
     // Explicit native navigation must work even when the source prop already
     // contains this URL and the browser has since navigated somewhere else.
     setWebViewInstanceKey((prev) => prev + 1);
@@ -1139,6 +1207,10 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             currentNavUrlRef.current,
           );
           activeInstanceUuidRef.current = built.activeInstanceUuid;
+          recordActiveRouteForBackNavigation(
+            built.activeInstanceUuid,
+            built.activeCascadeId,
+          );
           if (built.activeInstanceUuid && built.activeCascadeId) {
             const activeKey = `${built.activeInstanceUuid}:${built.activeCascadeId}`;
             recordBoundedLocalRead(
@@ -1161,6 +1233,10 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           const activeCascadeId =
             message.activeCascadeId ?? fallbackRoute.cascadeId;
           activeInstanceUuidRef.current = activeInstanceUuid;
+          recordActiveRouteForBackNavigation(
+            activeInstanceUuid,
+            activeCascadeId,
+          );
           if (activeInstanceUuid && activeCascadeId) {
             recordBoundedLocalRead(
               locallyReadMapRef.current,
@@ -1195,15 +1271,23 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             handleNavigateToUrl(pending.targetUrl);
           } else {
             syncVerifiedActiveHostUrl(pending.targetUrl);
-            activeInstanceUuidRef.current = extractActiveRouteFromUrl(
-              pending.targetUrl,
-            ).instanceUuid;
+            const fastRoute = extractActiveRouteFromUrl(pending.targetUrl);
+            activeInstanceUuidRef.current = fastRoute.instanceUuid;
+            recordActiveRouteForBackNavigation(
+              fastRoute.instanceUuid,
+              fastRoute.cascadeId,
+            );
           }
           break;
         }
       }
     },
-    [armInboxRefreshTimeout, handleNavigateToUrl, syncVerifiedActiveHostUrl],
+    [
+      armInboxRefreshTimeout,
+      handleNavigateToUrl,
+      recordActiveRouteForBackNavigation,
+      syncVerifiedActiveHostUrl,
+    ],
   );
 
   const inboxCounts = useMemo(() => {
@@ -1308,10 +1392,13 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           setSupportMultipleWindows={false}
           allowsBackForwardNavigationGestures={true}
           pullToRefreshEnabled={true}
+          injectedJavaScriptBeforeContentLoaded={PROJECT_OVERVIEW_SCROLL_SCRIPT}
+          injectedJavaScriptBeforeContentLoadedForMainFrameOnly={false}
           injectedJavaScript={COMBINED_INJECTED_SCRIPT}
           originWhitelist={['*']}
           onShouldStartLoadWithRequest={handleShouldStartLoadWithRequest}
           onNavigationStateChange={handleNavigationStateChange}
+          onLoadStart={handleLoadStart}
           onLoadEnd={handleLoadEnd}
           onMessage={handleWebViewMessage}
           onRenderProcessGone={handleWebProcessTerminated}

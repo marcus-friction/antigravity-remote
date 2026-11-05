@@ -78,6 +78,11 @@ public class RemoteSessionModule: Module {
       }
     }.runOnQueue(.main)
 
+    AsyncFunction("installDocumentStartScript") { (_: String) in
+      // iOS injects document-start subframe scripts via WKUserScript
+      // (`injectedJavaScriptBeforeContentLoadedForMainFrameOnly={false}`).
+    }.runOnQueue(.main)
+
     OnAppEntersBackground {
       self.runOnMain {
         self.startBackgroundKeepAliveTaskIfNeeded()
