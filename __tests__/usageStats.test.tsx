@@ -564,6 +564,188 @@ describe('Usage Stats Parser & Workstation Bridge', () => {
         .remainingFraction,
     ).toBe(0.25);
   });
+
+  it('never blocks trajectory snapshots when usage RPCs stall, and polls trajectories (without usage RPCs) while hidden only when Keep-Alive is desired', async () => {
+    const rpcCalls: string[] = [];
+    const postedToNative: any[] = [];
+    const budgetTimers: Array<() => void> = [];
+    let pollCallback: (() => void) | null = null;
+    let resolveSlowQuota!: (val: any) => void;
+
+    class MockListInstancesRequest {}
+    class MockProxyCommandRequest {
+      uuid = '';
+      rpcPath = '';
+      setTargetInstanceUuid(u: string) {
+        this.uuid = u;
+      }
+      setRpcPath(p: string) {
+        this.rpcPath = p;
+      }
+      setPayload() {}
+      putHeaders() {}
+    }
+
+    class SlowUsageApiClient {
+      listInstances() {
+        return Promise.resolve({
+          getInstancesList: () => [
+            {
+              getUuid: () => 'box-slow',
+              getStatus: () => 1,
+              getMetadata: () => ({
+                getName: () => 'Slow Usage Host',
+                getVersion: () => '2.1.0',
+              }),
+              getStatusLastUpdatedAt: () => ({ getSeconds: () => 1762365000 }),
+            },
+          ],
+        });
+      }
+      proxyCommand(req: MockProxyCommandRequest) {
+        rpcCalls.push(req.rpcPath);
+        if (req.rpcPath.endsWith('/GetAllCascadeTrajectories')) {
+          const encoded = new TextEncoder().encode(
+            JSON.stringify({
+              trajectorySummaries: {
+                'cascade-urgent': {
+                  summary: 'Waiting on approval',
+                  status: 'CASCADE_RUN_STATUS_WAITING_FOR_USER',
+                },
+              },
+            }),
+          );
+          return Promise.resolve({ getPayload_asU8: () => encoded });
+        }
+        return new Promise((resolve) => {
+          if (req.rpcPath.endsWith('/RetrieveUserQuotaSummary')) {
+            resolveSlowQuota = resolve;
+          } else {
+            const encoded = new TextEncoder().encode(
+              JSON.stringify({
+                userStatus: {
+                  paidTier: { name: 'Google AI Pro' },
+                  cascadeModelConfigData: {
+                    clientModelConfigs: [{ label: 'Gemini 2.5 Pro' }],
+                  },
+                },
+              }),
+            );
+            resolve({ getPayload_asU8: () => encoded });
+          }
+        });
+      }
+    }
+
+    const sandboxWindow: any = {
+      __agyKeepAliveLockDesired: false,
+      location: {
+        hostname: 'antigravity.google.com',
+        origin: 'https://antigravity.google.com',
+        pathname: '/r/box-slow',
+        search: '',
+        href: 'https://antigravity.google.com/r/box-slow',
+      },
+      history: { state: null, replaceState: () => undefined },
+      navigator: { onLine: true },
+      document: {
+        cookie: 'SAPISID=test',
+        visibilityState: 'visible',
+        querySelectorAll: () => [],
+      },
+      default_GoogleAntigravity: {
+        K: {
+          devtools_jetski_boq_api_proto: {
+            ApiServicePromiseClient: SlowUsageApiClient,
+            ListInstancesRequest: MockListInstancesRequest,
+            ProxyCommandRequest: MockProxyCommandRequest,
+          },
+        },
+        pj: {
+          auth_firstparty: {
+            getAuthHeaderValueForFirstParty: () => 'SAPISIDHASH 1_a',
+          },
+        },
+      },
+      ReactNativeWebView: {
+        postMessage: (raw: string) => {
+          postedToNative.push(JSON.parse(raw));
+        },
+      },
+      addEventListener: () => undefined,
+      TextEncoder,
+      TextDecoder,
+      URL,
+      URLSearchParams,
+      setTimeout: (fn: () => void, ms?: number) => {
+        if (ms === 1200) {
+          budgetTimers.push(fn);
+        }
+        return budgetTimers.length;
+      },
+      clearTimeout: () => undefined,
+      setInterval: (fn: () => void) => {
+        pollCallback = fn;
+        return 99;
+      },
+      clearInterval: () => undefined,
+    };
+    sandboxWindow.window = sandboxWindow;
+
+    const context = vm.createContext(sandboxWindow);
+    vm.runInContext(INBOX_BRIDGE_SCRIPT, context);
+
+    const refreshPromise = sandboxWindow.__agyInboxBridge.refresh(false);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Usage RPC is still stalled, so inline budget timer fires and delivers trajectories immediately
+    expect(budgetTimers.length).toBe(1);
+    budgetTimers[0]();
+    await refreshPromise;
+
+    expect(postedToNative).toHaveLength(1);
+    expect(
+      postedToNative[0].instances[0].trajectories['cascade-urgent'].summary,
+    ).toBe('Waiting on approval');
+    expect(postedToNative[0].usage).toBeNull();
+
+    // When the slow quota RPC eventually resolves, a follow-up snapshot updates usage
+    const quotaBytes = new TextEncoder().encode(
+      JSON.stringify({
+        groups: [
+          {
+            groupName: 'Gemini Models',
+            buckets: [{ window: '5h', remainingFraction: 0.5 }],
+          },
+        ],
+      }),
+    );
+    resolveSlowQuota({ getPayload_asU8: () => quotaBytes });
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(postedToNative).toHaveLength(2);
+    expect(postedToNative[1].usage.instanceName).toBe('Slow Usage Host');
+
+    // Background polling: when hidden WITHOUT Keep-Alive, poll interval is a no-op
+    rpcCalls.length = 0;
+    sandboxWindow.document.visibilityState = 'hidden';
+    sandboxWindow.__agyKeepAliveLockDesired = false;
+    expect(pollCallback).not.toBeNull();
+    pollCallback!();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(rpcCalls).toHaveLength(0);
+
+    // When hidden WITH Keep-Alive (`__agyKeepAliveLockDesired = true`), trajectories poll while usage RPCs are skipped
+    sandboxWindow.__agyKeepAliveLockDesired = true;
+    pollCallback!();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(rpcCalls).toEqual([
+      '/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories',
+    ]);
+  });
 });
 
 describe('LeftNavigationDrawer Usage Tab & RemoteWebView E2E', () => {

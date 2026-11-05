@@ -81,14 +81,17 @@ export function buildActionNotificationSyncState(params: {
     };
   }
 
-  const openThreads = threads.filter((thread) => {
-    const matchesMode =
-      mode === 'approvals'
-        ? thread.attentionKind === 'approval'
-        : thread.needsAttention;
-    if (!matchesMode) {
-      return false;
-    }
+  const matchingThreads = threads.filter((thread) =>
+    mode === 'approvals'
+      ? thread.attentionKind === 'approval'
+      : thread.needsAttention,
+  );
+  // Track all matching thread IDs (including any thread currently visible on
+  // screen) so switching apps while viewing an already-open prompt updates the
+  // tray count silently instead of chiming as a newly arrived action.
+  const openThreadIds = new Set(matchingThreads.map((t) => t.id));
+
+  const openThreads = matchingThreads.filter((thread) => {
     // Suppress the thread currently open in the foreground WebView; while
     // backgrounded (`!isAppForeground`), every matching thread counts.
     const isVisibleOnScreenNow = isAppForeground && thread.isActiveThread;
@@ -99,12 +102,11 @@ export function buildActionNotificationSyncState(params: {
     return {
       signature: 'none',
       notification: null,
-      openThreadIds: new Set(),
+      openThreadIds,
     };
   }
 
   const count = openThreads.length;
-  const openThreadIds = new Set(openThreads.map((t) => t.id));
   const hasNewThread = openThreads.some((t) => !previousOpenThreadIds.has(t.id));
   const shouldAlert = hasNewThread && !(isAppForeground && isDrawerOpen);
 

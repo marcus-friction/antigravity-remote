@@ -862,6 +862,63 @@ describe('Android & iOS WebView scroll-restoration wiring and Inbox drawer scrol
 
     expect(mockScrollTo).toHaveBeenCalledWith({ y: 420, animated: false });
 
+    // When list content shrinks below the saved scroll offset, `onContentSizeChange` clamps to `contentHeight - viewportHeight`
+    mockScrollTo.mockClear();
+    await act(async () => {
+      inboxScrollView().props.onLayout({
+        nativeEvent: { layout: { height: 500 } },
+      });
+      settingsModeBtn.props.onPress();
+    });
+    await act(async () => {
+      inboxModeBtn.props.onPress();
+    });
+    mockScrollTo.mockClear();
+    await act(async () => {
+      inboxScrollView().props.onContentSizeChange(320, 620);
+    });
+    expect(mockScrollTo).toHaveBeenCalledWith({ y: 120, animated: false });
+
+    // Entering a thread and exiting via in-iframe Back (`activeCascadeId: null` while `activeUrl` still has `?p=`)
+    // clears `canReturnToOverviewRef` so Android hardware Back does not fire a redundant Overview return
+    await act(async () => {
+      tree.root
+        .findAll(
+          (n) =>
+            n.type === ('TouchableOpacity' as any) &&
+            n.props.accessibilityLabel === 'Close Antigravity drawer',
+        )[0]
+        .props.onPress();
+      webView.props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/machine-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_ACTIVE_ROUTE',
+            activeUrl: 'https://antigravity.google.com/r/machine-1?p=c%2Fthread-99',
+            activeInstanceUuid: 'machine-1',
+            activeCascadeId: 'thread-99',
+          }),
+        },
+      });
+      webView.props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/machine-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_ACTIVE_ROUTE',
+            activeUrl: 'https://antigravity.google.com/r/machine-1?p=c%2Fthread-99',
+            activeInstanceUuid: 'machine-1',
+            activeCascadeId: null,
+          }),
+        },
+      });
+    });
+
+    let backHandledAfterIframeReturn = false;
+    for (const listener of mockBackPressListeners) {
+      backHandledAfterIframeReturn = listener() || backHandledAfterIframeReturn;
+    }
+    expect(backHandledAfterIframeReturn).toBe(false);
+
     await act(async () => {
       tree.unmount();
     });

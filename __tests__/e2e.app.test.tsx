@@ -2013,4 +2013,42 @@ describe('Session and navigation regressions', () => {
     await deliverSnapshot(false, false);
     expect(clearNativeActionNotification).toHaveBeenCalled();
   });
+
+  it('does not prematurely enter authenticated stage or prompt for POST_NOTIFICATIONS when Android only has non-auth cookies', async () => {
+    const RN = require('react-native');
+    const prevOS = RN.Platform.OS;
+    RN.Platform.OS = 'android';
+    try {
+      mockSecureStoreData.set('agy_cookie_migration_v2_done', 'true');
+      mockCookieStore.set('https://antigravity.google.com', {
+        NID: {
+          name: 'NID',
+          value: 'non-auth-nid-cookie',
+          domain: '.google.com',
+          path: '/',
+          secure: true,
+        },
+      });
+      (configureNativeKeepAlive as jest.Mock).mockClear();
+      mockPermissionsRequest.mockClear();
+
+      let unauthTree!: ReactTestRenderer;
+      await act(async () => {
+        unauthTree = renderer.create(<App />);
+      });
+
+      // Stage must stay 'authenticating' (showing Sign-In banner) without requesting notification permissions or enabling Keep-Alive
+      expect(mockPermissionsRequest).not.toHaveBeenCalled();
+      expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(
+        false,
+        0,
+        false,
+      );
+      await act(async () => {
+        unauthTree.unmount();
+      });
+    } finally {
+      RN.Platform.OS = prevOS;
+    }
+  });
 });

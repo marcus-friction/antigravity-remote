@@ -81,7 +81,7 @@ export interface LeftNavigationDrawerProps {
   actionNotificationMode?: ActionNotificationMode;
   onOpen: (preferredMode?: DrawerMode) => void;
   onClose: () => void;
-  onRefreshInbox: () => void;
+  onRefreshInbox: (forceUsage?: boolean) => void;
   onSelectThread: (thread: InboxThreadItem) => void;
   onMarkThreadRead: (thread: InboxThreadItem) => void;
   onMarkAllRead: () => void;
@@ -299,6 +299,9 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   const searchInputRef = useRef<TextInput | null>(null);
   const handoffInputRef = useRef<TextInput | null>(null);
   const inboxScrollViewRef = useRef<ScrollView | null>(null);
+  const inboxScrollViewportHeightRef = useRef<number>(0);
+  const selectedTabRef = useRef<InboxFilterTab>(selectedTab);
+  selectedTabRef.current = selectedTab;
   const inboxScrollOffsetsRef = useRef<Record<InboxFilterTab, number>>({
     all: 0,
     attention: 0,
@@ -332,6 +335,16 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     inboxScrollViewRef.current?.scrollTo?.({ y: targetY, animated: false });
   }, [activeMode, searchQuery, selectedTab, visible]);
 
+  const handleInboxScrollLayout = useCallback(
+    (event: { nativeEvent?: { layout?: { height?: number } } }) => {
+      const measuredHeight = event?.nativeEvent?.layout?.height ?? 0;
+      if (measuredHeight > 0) {
+        inboxScrollViewportHeightRef.current = measuredHeight;
+      }
+    },
+    [],
+  );
+
   const handleInboxScroll = useCallback(
     (event: NativeSyntheticEvent<NativeScrollEvent>) => {
       if (searchQuery.trim().length > 0) {
@@ -351,7 +364,13 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
       const targetY = pendingInboxScrollRestoreRef.current;
       if (targetY !== null && contentHeight > 0) {
         pendingInboxScrollRestoreRef.current = null;
-        inboxScrollViewRef.current?.scrollTo?.({ y: targetY, animated: false });
+        const viewportHeight = inboxScrollViewportHeightRef.current;
+        const clampedY =
+          viewportHeight > 0
+            ? Math.min(targetY, Math.max(0, contentHeight - viewportHeight))
+            : targetY;
+        inboxScrollOffsetsRef.current[selectedTabRef.current] = clampedY;
+        inboxScrollViewRef.current?.scrollTo?.({ y: clampedY, animated: false });
       }
     },
     [],
@@ -909,7 +928,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                 onPress={() => {
                   setActiveMode('inbox');
                   if (stage === 'authenticated' && !isRefreshing) {
-                    onRefreshInbox();
+                    onRefreshInbox(false);
                   }
                 }}
                 accessibilityRole="button"
@@ -954,7 +973,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                 onPress={() => {
                   setActiveMode('usage');
                   if (stage === 'authenticated' && !isRefreshing) {
-                    onRefreshInbox();
+                    onRefreshInbox(true);
                   }
                 }}
                 accessibilityRole="button"
@@ -1022,7 +1041,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                       </TouchableOpacity>
                     ) : null}
                     <TouchableOpacity
-                      onPress={onRefreshInbox}
+                      onPress={() => onRefreshInbox(false)}
                       style={styles.refreshMiniBtn}
                       accessibilityRole="button"
                       accessibilityLabel="Refresh Thread Inbox"
@@ -1141,6 +1160,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                   keyboardShouldPersistTaps="handled"
                   showsVerticalScrollIndicator={false}
                   scrollEventThrottle={16}
+                  onLayout={handleInboxScrollLayout}
                   onScroll={handleInboxScroll}
                   onContentSizeChange={handleInboxContentSizeChange}
                 >
@@ -1369,7 +1389,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                   </Text>
                   <View style={styles.inboxHeaderActions}>
                     <TouchableOpacity
-                      onPress={onRefreshInbox}
+                      onPress={() => onRefreshInbox(true)}
                       disabled={isRefreshing || stage !== 'authenticated'}
                       style={styles.refreshMiniBtn}
                       accessibilityRole="button"
@@ -1747,11 +1767,14 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                         {activityStats.firstBudgetPausedThread ? (
                           <TouchableOpacity
                             style={styles.usageBudgetAlertBtn}
-                            onPress={() =>
+                            onPress={() => {
+                              resetTransientInputs();
+                              isDraggingOpenRef.current = false;
+                              setIsDraggingOpen(false);
                               onSelectThread(
                                 activityStats.firstBudgetPausedThread!,
-                              )
-                            }
+                              );
+                            }}
                             accessibilityRole="button"
                             accessibilityLabel="Open budget-paused thread"
                           >

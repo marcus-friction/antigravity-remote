@@ -7,6 +7,7 @@ private final class ActionNotificationDelegate: NSObject, UNUserNotificationCent
   static let shared = ActionNotificationDelegate()
   static let deepLinkKey = "agyDeepLink"
   static let shouldAlertKey = "agyShouldAlert"
+  static let countKey = "agyCount"
   static let allowedPrefix = "antigravity-remote://"
 
   func userNotificationCenter(
@@ -27,9 +28,18 @@ private final class ActionNotificationDelegate: NSObject, UNUserNotificationCent
     didReceive response: UNNotificationResponse,
     withCompletionHandler completionHandler: @escaping () -> Void
   ) {
-    let rawLink = response.notification.request.content.userInfo[Self.deepLinkKey] as? String
+    let userInfo = response.notification.request.content.userInfo
+    let rawLink = userInfo[Self.deepLinkKey] as? String
+    let count = (userInfo[Self.countKey] as? Int) ?? 0
     if let link = rawLink, link.hasPrefix(Self.allowedPrefix), let url = URL(string: link) {
       DispatchQueue.main.async {
+        if count <= 1 {
+          if #available(iOS 16.0, *) {
+            center.setBadgeCount(0) { _ in }
+          } else {
+            UIApplication.shared.applicationIconBadgeNumber = 0
+          }
+        }
         UIApplication.shared.open(url, options: [:], completionHandler: nil)
       }
     }
@@ -159,10 +169,16 @@ public class RemoteSessionModule: Module {
       content.badge = NSNumber(value: count)
       if shouldAlert {
         content.sound = .default
+        if #available(iOS 15.0, *) {
+          content.interruptionLevel = .active
+        }
+      } else if #available(iOS 15.0, *) {
+        content.interruptionLevel = .passive
       }
       content.userInfo = [
         ActionNotificationDelegate.deepLinkKey: deepLinkUrl,
         ActionNotificationDelegate.shouldAlertKey: shouldAlert,
+        ActionNotificationDelegate.countKey: count,
       ]
 
       let request = UNNotificationRequest(

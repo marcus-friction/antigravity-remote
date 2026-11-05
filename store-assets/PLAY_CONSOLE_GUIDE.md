@@ -1,6 +1,6 @@
 # Google Play Console — Production Release Checklist & Copy-Paste Guide
 
-Use the answers below to complete the mandatory **Monitor and improve → Policy and programs → App content** declarations and **Grow users → Store presence → Main store listing** in Google Play Console before promoting **Antigravity Remote (`1.1.2 (10)`)** to **Production**.
+Use the answers below to complete the mandatory **Monitor and improve → Policy and programs → App content** declarations and **Grow users → Store presence → Main store listing** in Google Play Console before promoting **Antigravity Remote** to **Production**.
 
 ---
 
@@ -37,8 +37,9 @@ Select **"All or some functionality in my app is restricted"** → **"Add instru
   ```text
   Antigravity Remote is an open-source mobile companion client wrapper for https://antigravity.google.com.
   1. On launch, the app loads the public https://antigravity.google.com landing page and Google Sign-In flow (https://accounts.google.com).
-  2. Reviewers can test all native wrapper features without a dedicated test account by pulling open or tapping the vertical drawer handle along the left margin to open the native Inbox & Settings drawer:
-     - Configure bounded background connection timers ("Stay Connected in Background")
+  2. Reviewers can test all native wrapper features without a dedicated test account by pulling open or tapping the vertical drawer handle along the left margin to open the native Inbox, Usage, and Settings drawer:
+     - Configure open-action notifications ("Action Notifications": Off, Approvals, or All Attention) and bounded background connection timers ("Stay Connected in Background": Off, 5m, 15m, 30m, or 60m)
+     - Inspect the Usage tab empty/sign-in state and Inbox filter tabs (All, Attention, Running)
      - Expand "Open Link or Machine ID" to test machine link/ID validation (e.g., entering "devbox-demo-1" or "https://antigravity.google.com/r/devbox-demo-1")
      - Test "Reload Current Page" and "All Machines Overview"
      - Test "Sign Out of Google Account" -> "Confirm Sign Out" (which unmounts the WebView and wipes local cookies/cache)

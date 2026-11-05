@@ -616,6 +616,27 @@ describe('inboxParser', () => {
       'https://antigravity.google.com/r/box-alpha?p=c%2Fcascade-42',
     );
 
+    // Exiting the thread back to Project Overview inside the iframe strips stale `?p=` from `window.location`
+    // and emits `AGY_INBOX_ACTIVE_ROUTE` with `activeCascadeId: null`
+    for (const listener of windowListeners.get('message') ?? []) {
+      listener({
+        origin: 'https://antigravity.static.usercontent.goog',
+        data: {
+          type: 'URL_CHANGED',
+          path: '/web/1.0.20260910010023/',
+        },
+      });
+    }
+    expect(sandboxWindow.location.href).toBe(
+      'https://antigravity.google.com/r/box-alpha',
+    );
+    expect(postedToNative[postedToNative.length - 1]).toEqual({
+      type: 'AGY_INBOX_ACTIVE_ROUTE',
+      activeUrl: 'https://antigravity.google.com/r/box-alpha',
+      activeInstanceUuid: 'box-alpha',
+      activeCascadeId: null,
+    });
+
     // Test unready/stalled iframe fallback: if the iframe does not confirm within 380ms,
     // `fastNavigate` reports `handled: false` so native falls back to full URL navigation.
     postedToIframe.length = 0;
@@ -859,5 +880,102 @@ describe('inboxParser', () => {
         previousOpenThreadIds: bgSync.openThreadIds,
       }).notification,
     ).toBeNull();
+  });
+
+  it('preserves explicit null activeCascadeId when exiting to Project Overview and suppresses false-positive alert chimes on app switch', () => {
+    // 1. Exiting a thread inside the iframe posts `activeCascadeId: null` even if `activeUrl` still had `?p=c%2Factive-thread`
+    const parsedExitRoute = parseInboxBridgeMessage(
+      JSON.stringify({
+        type: 'AGY_INBOX_ACTIVE_ROUTE',
+        activeUrl: 'https://antigravity.google.com/r/box-1?p=c%2Factive-thread',
+        activeInstanceUuid: 'box-1',
+        activeCascadeId: null,
+      }),
+    );
+    expect(parsedExitRoute).toEqual({
+      type: 'AGY_INBOX_ACTIVE_ROUTE',
+      activeUrl: 'https://antigravity.google.com/r/box-1?p=c%2Factive-thread',
+      activeInstanceUuid: 'box-1',
+      activeCascadeId: null,
+    });
+
+    const overviewSnapMsg = parseInboxBridgeMessage(
+      JSON.stringify({
+        type: 'AGY_INBOX_SNAPSHOT',
+        fetchedAtMs: Date.now(),
+        activeUrl: 'https://antigravity.google.com/r/box-1?p=c%2Factive-thread',
+        activeInstanceUuid: 'box-1',
+        activeCascadeId: null,
+        instances: [
+          {
+            uuid: 'box-1',
+            name: 'Workstation One',
+            status: 1,
+            trajectories: {
+              trajectorySummaries: {
+                'active-thread': {
+                  summary: 'Prompt on active thread',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  waitingSteps: [
+                    { step: { runCommand: { commandLine: 'npm test' } } },
+                  ],
+                  lastModifiedTime: '2026-11-05T18:00:00Z',
+                },
+              },
+            },
+          },
+        ],
+      }),
+    );
+    expect(overviewSnapMsg?.type).toBe('AGY_INBOX_SNAPSHOT');
+    const overviewSnap = buildInboxSnapshot(
+      overviewSnapMsg as Extract<
+        ReturnType<typeof parseInboxBridgeMessage>,
+        { type: 'AGY_INBOX_SNAPSHOT' }
+      >,
+      {},
+      'https://antigravity.google.com/r/box-1?p=c%2Factive-thread',
+      true,
+    );
+    expect(overviewSnap.activeInstanceUuid).toBe('box-1');
+    expect(overviewSnap.activeCascadeId).toBeNull();
+    expect(overviewSnap.threads[0].isActiveThread).toBe(false);
+
+    // 2. While viewing `active-thread` in the foreground with an open approval, no notification is shown,
+    // AND switching apps (`isAppForeground: true -> false`) posts the tray count silently (`shouldAlert: false`)
+    // instead of chiming as a newly arrived prompt.
+    const inThreadSnap = buildInboxSnapshot(
+      {
+        ...(overviewSnapMsg as any),
+        activeCascadeId: 'active-thread',
+      },
+      {},
+      'https://antigravity.google.com/r/box-1?p=c%2Factive-thread',
+      true,
+    );
+    const whileViewing = buildActionNotificationSyncState({
+      stage: 'authenticated',
+      mode: 'approvals',
+      threads: inThreadSnap.threads,
+      isAppForeground: true,
+      isDrawerOpen: false,
+      previousOpenThreadIds: new Set(),
+    });
+    expect(whileViewing.notification).toBeNull();
+    expect(whileViewing.openThreadIds.has('box-1:active-thread')).toBe(true);
+
+    const afterAppSwitch = buildActionNotificationSyncState({
+      stage: 'authenticated',
+      mode: 'approvals',
+      threads: inThreadSnap.threads,
+      isAppForeground: false,
+      isDrawerOpen: false,
+      previousOpenThreadIds: whileViewing.openThreadIds,
+    });
+    expect(afterAppSwitch.notification).toMatchObject({
+      count: 1,
+      deepLinkUrl: 'antigravity-remote://r/box-1?p=c%2Factive-thread',
+      shouldAlert: false,
+    });
   });
 });

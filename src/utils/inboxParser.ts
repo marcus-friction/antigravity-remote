@@ -1504,6 +1504,41 @@ export function buildUsageSnapshot(
 }
 
 /**
+ * Resolves the active workstation and cascade route from a WebView bridge message,
+ * preserving explicit `null` overrides (e.g. when returning to Project Overview
+ * inside the iframe while the host URL still carries a `?p=c%2F...` query) and
+ * falling back to `activeUrl` / `fallbackActiveUrl` only when fields are omitted.
+ */
+export function resolveActiveRouteFromBridgeMessage(
+  message: {
+    activeUrl?: string;
+    activeInstanceUuid?: string | null;
+    activeCascadeId?: string | null;
+  },
+  fallbackActiveUrl?: string | null,
+): { instanceUuid: string | null; cascadeId: string | null } {
+  const referenceUrl = message.activeUrl ?? fallbackActiveUrl ?? null;
+  const routeFromUrl = extractActiveRouteFromUrl(referenceUrl);
+  const instanceUuid =
+    message.activeInstanceUuid === null
+      ? null
+      : typeof message.activeInstanceUuid === 'string'
+        ? SAFE_ID_PATTERN.test(message.activeInstanceUuid)
+          ? message.activeInstanceUuid
+          : null
+        : routeFromUrl.instanceUuid;
+  const cascadeId =
+    message.activeCascadeId === null
+      ? null
+      : typeof message.activeCascadeId === 'string'
+        ? SAFE_ID_PATTERN.test(message.activeCascadeId)
+          ? message.activeCascadeId
+          : null
+        : routeFromUrl.cascadeId;
+  return { instanceUuid, cascadeId };
+}
+
+/**
  * Builds a sorted, deduplicated `InboxSnapshot` from a raw WebView bridge snapshot.
  */
 export function buildInboxSnapshot(
@@ -1513,17 +1548,8 @@ export function buildInboxSnapshot(
   isAppForeground: boolean = true,
 ): InboxSnapshot {
   const referenceUrl = message.activeUrl ?? fallbackActiveUrl ?? null;
-  const routeFromUrl = extractActiveRouteFromUrl(referenceUrl);
-  const activeInstanceUuid =
-    typeof message.activeInstanceUuid === 'string' &&
-    SAFE_ID_PATTERN.test(message.activeInstanceUuid)
-      ? message.activeInstanceUuid
-      : routeFromUrl.instanceUuid;
-  const activeCascadeId =
-    typeof message.activeCascadeId === 'string' &&
-    SAFE_ID_PATTERN.test(message.activeCascadeId)
-      ? message.activeCascadeId
-      : routeFromUrl.cascadeId;
+  const { instanceUuid: activeInstanceUuid, cascadeId: activeCascadeId } =
+    resolveActiveRouteFromBridgeMessage(message, fallbackActiveUrl);
 
   const accountPrefix = extractAccountPathPrefix(referenceUrl);
   const preservedQueryParams = extractPreservedHostQueryParams(referenceUrl);
@@ -1807,11 +1833,15 @@ export function parseInboxBridgeMessage(
         activeInstanceUuid:
           typeof parsed.activeInstanceUuid === 'string'
             ? parsed.activeInstanceUuid
-            : null,
+            : parsed.activeInstanceUuid === null
+              ? null
+              : undefined,
         activeCascadeId:
           typeof parsed.activeCascadeId === 'string'
             ? parsed.activeCascadeId
-            : null,
+            : parsed.activeCascadeId === null
+              ? null
+              : undefined,
         instances,
         cloudTrajectories: isRecord(parsed.cloudTrajectories)
           ? parsed.cloudTrajectories
@@ -1829,11 +1859,15 @@ export function parseInboxBridgeMessage(
         activeInstanceUuid:
           typeof parsed.activeInstanceUuid === 'string'
             ? parsed.activeInstanceUuid
-            : null,
+            : parsed.activeInstanceUuid === null
+              ? null
+              : undefined,
         activeCascadeId:
           typeof parsed.activeCascadeId === 'string'
             ? parsed.activeCascadeId
-            : null,
+            : parsed.activeCascadeId === null
+              ? null
+              : undefined,
       };
 
     case 'AGY_INBOX_REALTIME_HINT': {

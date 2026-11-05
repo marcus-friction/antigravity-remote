@@ -71,6 +71,7 @@ import {
   buildInboxSnapshot,
   extractActiveRouteFromUrl,
   parseInboxBridgeMessage,
+  resolveActiveRouteFromBridgeMessage,
 } from '../utils/inboxParser';
 import {
   isGoogleCookieErrorUrl,
@@ -400,12 +401,17 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       // Complete hydration (including any interrupted-sign-out wipe) before reading
       // persisted URL or keep-alive preferences.
       const restoredCount = await hydrateCookiesToWebView();
-      const [savedUrl, savedKeepAliveMinutes, savedActionNotificationMode] =
-        await Promise.all([
-          getLastActiveUrl(),
-          getKeepAliveMinutes(),
-          getActionNotificationMode(),
-        ]);
+      const [
+        savedUrl,
+        savedKeepAliveMinutes,
+        savedActionNotificationMode,
+        sessionSignature,
+      ] = await Promise.all([
+        getLastActiveUrl(),
+        getKeepAliveMinutes(),
+        getActionNotificationMode(),
+        getGoogleSessionSignature(),
+      ]);
 
       if (!isMounted) {
         return;
@@ -427,7 +433,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       if (incomingDeepLinkUrl) {
         onDeepLinkConsumed();
       }
-      setStage(restoredCount > 0 ? 'authenticated' : 'authenticating');
+      setStage(
+        restoredCount > 0 && sessionSignature.length > 0
+          ? 'authenticated'
+          : 'authenticating',
+      );
       hydratedRef.current = true;
       setIsHydrated(true);
     }
@@ -1155,13 +1165,16 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     (inboxRefreshTimeoutRef.current as { unref?: () => void })?.unref?.();
   }, []);
 
-  const handleRefreshInbox = useCallback(() => {
-    if (isResettingSessionRef.current) return;
-    setIsInboxRefreshing(true);
-    armInboxRefreshTimeout();
-    webViewRef.current?.injectJavaScript(INBOX_BRIDGE_SCRIPT);
-    webViewRef.current?.injectJavaScript(buildInboxRefreshScript());
-  }, [armInboxRefreshTimeout]);
+  const handleRefreshInbox = useCallback(
+    (forceUsage: boolean = false) => {
+      if (isResettingSessionRef.current) return;
+      setIsInboxRefreshing(true);
+      armInboxRefreshTimeout();
+      webViewRef.current?.injectJavaScript(INBOX_BRIDGE_SCRIPT);
+      webViewRef.current?.injectJavaScript(buildInboxRefreshScript(forceUsage));
+    },
+    [armInboxRefreshTimeout],
+  );
 
   const handleOpenDrawer = useCallback(
     (preferredMode?: DrawerMode) => {
@@ -1173,7 +1186,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       isDrawerOpenRef.current = true;
       setIsDrawerOpen(true);
       if (stageRef.current === 'authenticated') {
-        handleRefreshInbox();
+        handleRefreshInbox(resolvedMode === 'usage');
       }
     },
     [handleRefreshInbox],
@@ -1501,13 +1514,13 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
 
         case 'AGY_INBOX_ACTIVE_ROUTE': {
           syncVerifiedActiveHostUrl(message.activeUrl);
-          const fallbackRoute = extractActiveRouteFromUrl(
-            message.activeUrl ?? currentNavUrlRef.current,
+          const {
+            instanceUuid: activeInstanceUuid,
+            cascadeId: activeCascadeId,
+          } = resolveActiveRouteFromBridgeMessage(
+            message,
+            currentNavUrlRef.current,
           );
-          const activeInstanceUuid =
-            message.activeInstanceUuid ?? fallbackRoute.instanceUuid;
-          const activeCascadeId =
-            message.activeCascadeId ?? fallbackRoute.cascadeId;
           activeInstanceUuidRef.current = activeInstanceUuid;
           recordActiveRouteForBackNavigation(
             activeInstanceUuid,

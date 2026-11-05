@@ -38,6 +38,8 @@ export const INBOX_BRIDGE_SCRIPT = `
     var POLL_INTERVAL_MS = 20000;
     var USAGE_POLL_MIN_INTERVAL_MS = 45000;
     var INSTANCE_RPC_TIMEOUT_MS = 8000;
+    var USAGE_RPC_TIMEOUT_MS = 3500;
+    var USAGE_INLINE_BUDGET_MS = 1200;
     var SAFE_ID_RE = /^[a-zA-Z0-9._-]+$/;
 
     var capturedApiClient = null;
@@ -47,8 +49,10 @@ export const INBOX_BRIDGE_SCRIPT = `
     var cachedAuthFirstParty = null;
     var cachedApiKey = null;
     var lastTrajectoryCache = Object.create(null);
+    var lastInstancesPayloadCache = [];
     var lastUsageCache = null;
     var lastUsageFetchedAtMs = 0;
+    var inFlightUsagePromise = null;
     var pendingForcedUsageRefresh = false;
     var cloudTrajectoriesCache = null;
     var activeIframeCascadeId = null;
@@ -58,6 +62,7 @@ export const INBOX_BRIDGE_SCRIPT = `
     var FAST_NAV_CONFIRM_MS = 380;
     var refreshTimer = null;
     var inFlightRefresh = null;
+    var isStopped = false;
 
     function setIframeCascadeOverride(cascadeId) {
       activeIframeCascadeId = cascadeId || null;
@@ -506,7 +511,7 @@ export const INBOX_BRIDGE_SCRIPT = `
       return '';
     }
 
-    function callProxyJson(ctx, targetUuid, rpcPath, jsonBody) {
+    function callProxyJson(ctx, targetUuid, rpcPath, jsonBody, timeoutMs) {
       var req = new ctx.proto.ProxyCommandRequest();
       req.setTargetInstanceUuid(targetUuid);
       req.setRpcPath(rpcPath);
@@ -523,9 +528,13 @@ export const INBOX_BRIDGE_SCRIPT = `
           map.set('connect-protocol-version', '1');
         }
       }
+      var rpcTimeout =
+        typeof timeoutMs === 'number' && timeoutMs > 0
+          ? timeoutMs
+          : INSTANCE_RPC_TIMEOUT_MS;
       return withTimeout(
         ctx.client.proxyCommand(req, ctx.metadata),
-        INSTANCE_RPC_TIMEOUT_MS,
+        rpcTimeout,
         'ProxyCommand timeout'
       ).then(function(res) {
         var text = decodeResponseBytes(res);
@@ -601,7 +610,8 @@ export const INBOX_BRIDGE_SCRIPT = `
         ctx,
         candidate.uuid,
         RETRIEVE_QUOTA_SUMMARY_PATH,
-        '{}'
+        '{}',
+        USAGE_RPC_TIMEOUT_MS
       )
         .then(function(res) {
           return hasQuotaSummaryFields(res) ? res : null;
@@ -615,11 +625,18 @@ export const INBOX_BRIDGE_SCRIPT = `
         ctx,
         candidate.uuid,
         GET_USER_STATUS_PATH,
-        DEFAULT_LS_METADATA_BODY
+        DEFAULT_LS_METADATA_BODY,
+        USAGE_RPC_TIMEOUT_MS
       )
         .then(function(res) {
           if (hasUserStatusFields(res)) return res;
-          return callProxyJson(ctx, candidate.uuid, GET_USER_STATUS_PATH, '{}').then(
+          return callProxyJson(
+            ctx,
+            candidate.uuid,
+            GET_USER_STATUS_PATH,
+            '{}',
+            USAGE_RPC_TIMEOUT_MS
+          ).then(
             function(fallbackRes) {
               return hasUserStatusFields(fallbackRes) ? fallbackRes : null;
             }
@@ -627,7 +644,13 @@ export const INBOX_BRIDGE_SCRIPT = `
         })
         .catch(function(err) {
           if (err && err.message) lastErr = String(err.message);
-          return callProxyJson(ctx, candidate.uuid, GET_USER_STATUS_PATH, '{}')
+          return callProxyJson(
+            ctx,
+            candidate.uuid,
+            GET_USER_STATUS_PATH,
+            '{}',
+            USAGE_RPC_TIMEOUT_MS
+          )
             .then(function(fallbackRes) {
               return hasUserStatusFields(fallbackRes) ? fallbackRes : null;
             })
@@ -659,7 +682,8 @@ export const INBOX_BRIDGE_SCRIPT = `
           ctx,
           candidate.uuid,
           GET_COMMAND_MODEL_CONFIGS_PATH,
-          DEFAULT_LS_METADATA_BODY
+          DEFAULT_LS_METADATA_BODY,
+          USAGE_RPC_TIMEOUT_MS
         )
           .then(function(cmdRes) {
             return hasModelConfigsInStatus(cmdRes) ? cmdRes : null;
@@ -697,6 +721,9 @@ export const INBOX_BRIDGE_SCRIPT = `
         lastUsageFetchedAtMs = 0;
         return Promise.resolve(null);
       }
+      if (!forceUsage && document && document.visibilityState === 'hidden') {
+        return Promise.resolve(lastUsageCache);
+      }
       var now = Date.now();
       if (
         !forceUsage &&
@@ -704,6 +731,9 @@ export const INBOX_BRIDGE_SCRIPT = `
         now - lastUsageFetchedAtMs < USAGE_POLL_MIN_INTERVAL_MS
       ) {
         return Promise.resolve(lastUsageCache);
+      }
+      if (inFlightUsagePromise) {
+        return inFlightUsagePromise;
       }
 
       var idx = 0;
@@ -739,7 +769,23 @@ export const INBOX_BRIDGE_SCRIPT = `
           return next();
         });
       }
-      return next();
+
+      var job = next().then(
+        function(result) {
+          if (inFlightUsagePromise === job) {
+            inFlightUsagePromise = null;
+          }
+          return result;
+        },
+        function() {
+          if (inFlightUsagePromise === job) {
+            inFlightUsagePromise = null;
+          }
+          return lastUsageCache;
+        }
+      );
+      inFlightUsagePromise = job;
+      return job;
     }
 
     function refresh(forceUsage) {
@@ -865,30 +911,78 @@ export const INBOX_BRIDGE_SCRIPT = `
               })(rawList[i]);
             }
 
+            var instancesPromise = Promise.all(instanceJobs);
             var usageJob = fetchUsageFromCandidates(
               ctx,
               usageCandidates,
               didForceUsageThisRun
             );
 
-            return Promise.all([Promise.all(instanceJobs), usageJob]).then(
-              function(combined) {
-                var instancesPayload = combined[0];
-                var usagePayload = combined[1];
-                var latestRoute = parseRouteFromLocation();
-                postToNative({
-                  type: 'AGY_INBOX_SNAPSHOT',
-                  fetchedAtMs: Date.now(),
-                  activeUrl: window.location.href,
-                  activeInstanceUuid: latestRoute.instanceUuid,
-                  activeCascadeId: latestRoute.cascadeId,
-                  instances: instancesPayload,
-                  cloudTrajectories: cloudTrajectoriesCache,
-                  usage: usagePayload,
-                  error: null
+            return instancesPromise.then(function(instancesPayload) {
+              lastInstancesPayloadCache = instancesPayload;
+
+              return new Promise(function(resolveSnapshot) {
+                var emittedInitialSnapshot = false;
+                var inlineBudgetTimer = setTimeout(function() {
+                  if (emittedInitialSnapshot || isStopped) return;
+                  emittedInitialSnapshot = true;
+                  var fallbackRoute = parseRouteFromLocation();
+                  postToNative({
+                    type: 'AGY_INBOX_SNAPSHOT',
+                    fetchedAtMs: Date.now(),
+                    activeUrl: window.location.href,
+                    activeInstanceUuid: fallbackRoute.instanceUuid,
+                    activeCascadeId: fallbackRoute.cascadeId,
+                    instances: instancesPayload,
+                    cloudTrajectories: cloudTrajectoriesCache,
+                    usage: lastUsageCache,
+                    error: null
+                  });
+                  resolveSnapshot();
+                }, USAGE_INLINE_BUDGET_MS);
+
+                usageJob.then(function(usagePayload) {
+                  clearTimeout(inlineBudgetTimer);
+                  if (isStopped) {
+                    if (!emittedInitialSnapshot) {
+                      emittedInitialSnapshot = true;
+                      resolveSnapshot();
+                    }
+                    return;
+                  }
+                  var latestRoute = parseRouteFromLocation();
+                  if (!emittedInitialSnapshot) {
+                    emittedInitialSnapshot = true;
+                    postToNative({
+                      type: 'AGY_INBOX_SNAPSHOT',
+                      fetchedAtMs: Date.now(),
+                      activeUrl: window.location.href,
+                      activeInstanceUuid: latestRoute.instanceUuid,
+                      activeCascadeId: latestRoute.cascadeId,
+                      instances: instancesPayload,
+                      cloudTrajectories: cloudTrajectoriesCache,
+                      usage: usagePayload,
+                      error: null
+                    });
+                    resolveSnapshot();
+                    return;
+                  }
+                  if (usagePayload) {
+                    postToNative({
+                      type: 'AGY_INBOX_SNAPSHOT',
+                      fetchedAtMs: Date.now(),
+                      activeUrl: window.location.href,
+                      activeInstanceUuid: latestRoute.instanceUuid,
+                      activeCascadeId: latestRoute.cascadeId,
+                      instances: lastInstancesPayloadCache,
+                      cloudTrajectories: cloudTrajectoriesCache,
+                      usage: usagePayload,
+                      error: null
+                    });
+                  }
                 });
-              }
-            );
+              });
+            });
           });
         })
         .catch(function(err) {
@@ -1005,6 +1099,37 @@ export const INBOX_BRIDGE_SCRIPT = `
             '',
             parsedTarget.pathname + parsedTarget.search + parsedTarget.hash
           );
+        }
+      } catch (_) {}
+    }
+
+    function clearHostChildPathParam() {
+      if (
+        !window.location ||
+        !window.history ||
+        typeof window.history.replaceState !== 'function'
+      ) {
+        return;
+      }
+      try {
+        var parsedCurrent = new URL(window.location.href);
+        if (!parsedCurrent.searchParams.has('p')) {
+          return;
+        }
+        parsedCurrent.searchParams.delete('p');
+        var nextSearch = parsedCurrent.searchParams.toString();
+        var nextRelativeUrl =
+          parsedCurrent.pathname +
+          (nextSearch ? '?' + nextSearch : '') +
+          parsedCurrent.hash;
+        window.history.replaceState(window.history.state, '', nextRelativeUrl);
+        if (typeof window.location.search === 'string') {
+          try {
+            var updatedHref = parsedCurrent.origin + nextRelativeUrl;
+            if (window.location.href !== updatedHref) {
+              // Real browsers update window.location synchronously via replaceState.
+            }
+          } catch (_) {}
         }
       } catch (_) {}
     }
@@ -1142,6 +1267,9 @@ export const INBOX_BRIDGE_SCRIPT = `
           if (completePendingFastNavIfMatched(changedCascadeId, true)) {
             return;
           }
+          if (!changedCascadeId) {
+            clearHostChildPathParam();
+          }
           setIframeCascadeOverride(changedCascadeId);
           var routeNow = parseRouteFromLocation();
           postToNative({
@@ -1170,6 +1298,9 @@ export const INBOX_BRIDGE_SCRIPT = `
             return;
           }
           if (isUrlChangeEvent) {
+            if (!extractedCascadeId) {
+              clearHostChildPathParam();
+            }
             setIframeCascadeOverride(extractedCascadeId);
             var currentRoute = parseRouteFromLocation();
             postToNative({
@@ -1232,9 +1363,11 @@ export const INBOX_BRIDGE_SCRIPT = `
     });
 
     var pollId = setInterval(function() {
-      if (document.visibilityState === 'hidden') return;
+      if (document.visibilityState === 'hidden' && !window.__agyKeepAliveLockDesired) {
+        return;
+      }
       if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
-      refresh();
+      refresh(false);
     }, POLL_INTERVAL_MS);
 
     var bootstrapDelays = [0, 350, 1100, 2600, 5200];
@@ -1255,6 +1388,7 @@ export const INBOX_BRIDGE_SCRIPT = `
       markThreadRead: markThreadRead,
       fastNavigate: fastNavigate,
       stop: function() {
+        isStopped = true;
         clearPendingFastNav();
         if (refreshTimer) clearTimeout(refreshTimer);
         if (pollId) clearInterval(pollId);
@@ -1265,7 +1399,7 @@ export const INBOX_BRIDGE_SCRIPT = `
 })();
 `;
 
-export function buildInboxRefreshScript(forceUsage: boolean = true): string {
+export function buildInboxRefreshScript(forceUsage: boolean = false): string {
   const serializedForce = forceUsage ? 'true' : 'false';
   return `
 (function() {

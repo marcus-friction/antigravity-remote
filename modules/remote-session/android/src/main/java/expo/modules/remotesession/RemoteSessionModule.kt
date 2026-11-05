@@ -16,6 +16,7 @@ import android.os.Handler
 import android.os.Looper
 import android.view.View
 import android.view.ViewGroup
+import java.lang.ref.WeakReference
 import java.util.WeakHashMap
 import android.webkit.WebStorage
 import android.webkit.WebView
@@ -41,9 +42,13 @@ class RemoteSessionModule : Module() {
   @Volatile private var stoppedForCurrentBackgroundStay: Boolean = false
   @Volatile private var desiredDocumentStartScript: String? = null
   private var registeredApplication: Application? = null
+  private var cachedWebViewRef: WeakReference<WebView>? = null
   private val observedDecorViews = WeakHashMap<View, View.OnLayoutChangeListener>()
   private val installedDocumentStartScripts =
     WeakHashMap<WebView, InstalledDocumentStartScript>()
+  private val retryInstallDocumentStartRunnable = Runnable {
+    applyDocumentStartScriptIfNeeded()
+  }
 
   private val activityLifecycleCallbacks = object : Application.ActivityLifecycleCallbacks {
     override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
@@ -143,6 +148,16 @@ class RemoteSessionModule : Module() {
     return null
   }
 
+  private fun resolveWebView(root: View?): WebView? {
+    val cached = cachedWebViewRef?.get()
+    if (cached != null && cached.isAttachedToWindow && cached.parent != null) {
+      return cached
+    }
+    val found = findWebView(root)
+    cachedWebViewRef = if (found != null) WeakReference(found) else null
+    return found
+  }
+
   private fun shouldKeepAlive(): Boolean {
     return keepAliveEnabled && keepAliveMinutes > 0 && sessionActive
   }
@@ -154,7 +169,7 @@ class RemoteSessionModule : Module() {
     hostActivity: Activity? = null
   ) {
     val activity = hostActivity ?: appContext.currentActivity ?: return
-    val webView = findWebView(activity.window?.decorView) ?: return
+    val webView = resolveWebView(activity.window?.decorView) ?: return
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
       webView.setRendererPriorityPolicy(
         WebView.RENDERER_PRIORITY_IMPORTANT,
@@ -216,7 +231,7 @@ class RemoteSessionModule : Module() {
       return false
     }
     val activity = hostActivity ?: appContext.currentActivity ?: return false
-    val webView = findWebView(activity.window?.decorView) ?: return false
+    val webView = resolveWebView(activity.window?.decorView) ?: return false
     val existing = installedDocumentStartScripts[webView]
     if (existing != null && existing.script == script) {
       return true
@@ -239,6 +254,8 @@ class RemoteSessionModule : Module() {
   }
 
   private fun removeInstalledDocumentStartScripts() {
+    mainHandler.removeCallbacks(retryInstallDocumentStartRunnable)
+    cachedWebViewRef = null
     for ((_, installed) in installedDocumentStartScripts) {
       runCatching { installed.handler.remove() }
     }
@@ -403,11 +420,12 @@ class RemoteSessionModule : Module() {
 
     AsyncFunction("installDocumentStartScript") { script: String ->
       registerActivityLifecycleObserverIfNeeded()
+      mainHandler.removeCallbacks(retryInstallDocumentStartRunnable)
       desiredDocumentStartScript = script
       applyDrawerGestureExclusion()
       if (!applyDocumentStartScriptIfNeeded() && script.isNotEmpty()) {
-        mainHandler.postDelayed({ applyDocumentStartScriptIfNeeded() }, 50L)
-        mainHandler.postDelayed({ applyDocumentStartScriptIfNeeded() }, 200L)
+        mainHandler.postDelayed(retryInstallDocumentStartRunnable, 50L)
+        mainHandler.postDelayed(retryInstallDocumentStartRunnable, 200L)
       }
     }.runOnQueue(Queues.MAIN)
 
