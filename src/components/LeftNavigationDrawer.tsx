@@ -33,10 +33,13 @@ import {
   InboxThreadItem,
 } from '../types/inbox';
 import { AuthFlowStage, KeepAliveMinutes } from '../types/session';
-import { formatRelativeTime } from '../utils/inboxParser';
+import {
+  formatRelativeTime,
+  formatResetCountdown,
+} from '../utils/inboxParser';
 import { parseHandoffInput } from '../utils/urlValidator';
 
-export type DrawerMode = 'inbox' | 'settings';
+export type DrawerMode = 'inbox' | 'usage' | 'settings';
 
 /**
  * Shared handle line geometry so the closed pull-in handle and the inner-right
@@ -131,6 +134,58 @@ function getBadgeVisuals(kind: InboxAttentionKind): {
         accentColor: '#475569',
       };
   }
+}
+
+function getQuotaVisuals(
+  remainingFraction: number,
+  isExhausted: boolean,
+): {
+  barColor: string;
+  textColor: string;
+  badgeBgColor: string;
+  badgeBorderColor: string;
+} {
+  if (isExhausted || remainingFraction <= 0) {
+    return {
+      barColor: '#EF4444',
+      textColor: '#FECACA',
+      badgeBgColor: 'rgba(239, 68, 68, 0.2)',
+      badgeBorderColor: 'rgba(239, 68, 68, 0.45)',
+    };
+  }
+  if (remainingFraction <= 0.2) {
+    return {
+      barColor: '#EF4444',
+      textColor: '#FCA5A5',
+      badgeBgColor: 'rgba(239, 68, 68, 0.15)',
+      badgeBorderColor: 'rgba(248, 113, 113, 0.4)',
+    };
+  }
+  if (remainingFraction <= 0.5) {
+    return {
+      barColor: '#F59E0B',
+      textColor: '#FDE68A',
+      badgeBgColor: 'rgba(245, 158, 11, 0.16)',
+      badgeBorderColor: 'rgba(245, 158, 11, 0.4)',
+    };
+  }
+  return {
+    barColor: '#10B981',
+    textColor: '#A7F3D0',
+    badgeBgColor: 'rgba(16, 185, 129, 0.15)',
+    badgeBorderColor: 'rgba(52, 211, 153, 0.35)',
+  };
+}
+
+function formatNumberWithCommas(value: number): string {
+  if (!Number.isFinite(value)) return '0';
+  const rounded =
+    Math.abs(value % 1) > 0.001
+      ? String(Math.round(value * 100) / 100)
+      : String(Math.round(value));
+  const [intPart, decPart] = rounded.split('.');
+  const withCommas = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return decPart ? `${withCommas}.${decPart}` : withCommas;
 }
 
 function getHandleVisualState(params: {
@@ -613,6 +668,73 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     return updatedLabel ? `${machineLabel} • ${updatedLabel}` : machineLabel;
   }, [connectedInstances, isRefreshing, snapshot.fetchedAtMs, stage]);
 
+  const usage = snapshot.usage ?? null;
+
+  const activityStats = useMemo(() => {
+    let totalSteps = 0;
+    let budgetPausedCount = 0;
+    let firstBudgetPausedThread: InboxThreadItem | null = null;
+    for (const thread of snapshot.threads) {
+      totalSteps += Math.max(0, thread.stepCount || 0);
+      const reasonLower = thread.attentionReason.toLowerCase();
+      if (
+        thread.attentionKind === 'error' &&
+        (reasonLower.includes('budget') || reasonLower.includes('limit'))
+      ) {
+        budgetPausedCount++;
+        if (!firstBudgetPausedThread) {
+          firstBudgetPausedThread = thread;
+        }
+      }
+    }
+    return {
+      totalSteps,
+      budgetPausedCount,
+      firstBudgetPausedThread,
+    };
+  }, [snapshot.threads]);
+
+  const usageSubtitleText = useMemo(() => {
+    if (stage !== 'authenticated') {
+      return stage === 'authenticating'
+        ? 'Sign in to view account usage'
+        : 'Waiting for connection…';
+    }
+    if (usage) {
+      const updatedLabel =
+        usage.fetchedAtMs > 0 ? formatRelativeTime(usage.fetchedAtMs) : '';
+      const hostLabel = usage.sourceInstanceName || 'Workstation';
+      return updatedLabel ? `${hostLabel} • ${updatedLabel}` : hostLabel;
+    }
+    if (isRefreshing) {
+      return 'Syncing usage from Antigravity…';
+    }
+    if (connectedInstances.length > 0) {
+      return connectedInstances.length === 1
+        ? `1 machine (${connectedInstances[0].name})`
+        : `${connectedInstances.length} machines`;
+    }
+    return 'Waiting for workstation…';
+  }, [connectedInstances, isRefreshing, stage, usage]);
+
+  const usageStatusDotColor = useMemo(() => {
+    if (stage !== 'authenticated' || !usage) {
+      return null;
+    }
+    if (
+      typeof usage.lowestRemainingFraction === 'number' &&
+      Number.isFinite(usage.lowestRemainingFraction)
+    ) {
+      if (usage.lowestRemainingFraction <= 0) {
+        return '#EF4444';
+      }
+      if (usage.lowestRemainingFraction <= 0.2) {
+        return '#F59E0B';
+      }
+    }
+    return null;
+  }, [stage, usage]);
+
   const handleConnectHandoff = () => {
     const parsedUrl = parseHandoffInput(handoffText);
     if (!parsedUrl) {
@@ -759,7 +881,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
           ]}
           {...openDrawerPanResponder.panHandlers}
         >
-            {/* Segmented Mode Switcher: Inbox vs Settings */}
+            {/* Segmented Mode Switcher: Inbox | Usage | Settings */}
             <View style={styles.modeSwitchTrack}>
               <TouchableOpacity
                 style={[
@@ -782,6 +904,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                   />
                 ) : null}
                 <Text
+                  numberOfLines={1}
                   style={[
                     styles.modeSwitchText,
                     activeMode === 'inbox' ? styles.modeSwitchTextActive : null,
@@ -808,6 +931,40 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
               <TouchableOpacity
                 style={[
                   styles.modeSwitchBtn,
+                  activeMode === 'usage' ? styles.modeSwitchBtnActive : null,
+                ]}
+                onPress={() => {
+                  setActiveMode('usage');
+                  if (stage === 'authenticated' && !isRefreshing) {
+                    onRefreshInbox();
+                  }
+                }}
+                accessibilityRole="button"
+                accessibilityState={{ selected: activeMode === 'usage' }}
+                accessibilityLabel="Drawer mode Usage"
+              >
+                {usageStatusDotColor ? (
+                  <View
+                    style={[
+                      styles.modeStatusDot,
+                      { backgroundColor: usageStatusDotColor },
+                    ]}
+                  />
+                ) : null}
+                <Text
+                  numberOfLines={1}
+                  style={[
+                    styles.modeSwitchText,
+                    activeMode === 'usage' ? styles.modeSwitchTextActive : null,
+                  ]}
+                >
+                  Usage
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[
+                  styles.modeSwitchBtn,
                   activeMode === 'settings' ? styles.modeSwitchBtnActive : null,
                 ]}
                 onPress={() => setActiveMode('settings')}
@@ -816,6 +973,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                 accessibilityLabel="Drawer mode Settings"
               >
                 <Text
+                  numberOfLines={1}
                   style={[
                     styles.modeSwitchText,
                     activeMode === 'settings'
@@ -1182,6 +1340,412 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                         </>
                       )}
                     </View>
+                  )}
+                </ScrollView>
+              </View>
+            ) : activeMode === 'usage' ? (
+              <View style={styles.modeBody}>
+                <View style={styles.inboxSubheaderRow}>
+                  <Text style={styles.inboxSubtitle} numberOfLines={1}>
+                    {usageSubtitleText}
+                  </Text>
+                  <View style={styles.inboxHeaderActions}>
+                    <TouchableOpacity
+                      onPress={onRefreshInbox}
+                      disabled={isRefreshing || stage !== 'authenticated'}
+                      style={styles.refreshMiniBtn}
+                      accessibilityRole="button"
+                      accessibilityLabel="Refresh Usage Stats"
+                    >
+                      <Text style={styles.refreshMiniBtnText}>
+                        {isRefreshing ? 'Syncing…' : 'Refresh'}
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+
+                <ScrollView
+                  style={styles.flexScroll}
+                  contentContainerStyle={styles.usageScrollContent}
+                  keyboardShouldPersistTaps="handled"
+                  showsVerticalScrollIndicator={false}
+                >
+                  {stage !== 'authenticated' ? (
+                    <View style={styles.emptyState}>
+                      <Text style={styles.emptyTitle}>Sign in required</Text>
+                      <Text style={styles.emptySubtitle}>
+                        Complete Google Sign-In to view your Antigravity model
+                        quotas and credits.
+                      </Text>
+                      <TouchableOpacity
+                        style={styles.emptyActionBtn}
+                        onPress={() => setActiveMode('settings')}
+                        accessibilityRole="button"
+                        accessibilityLabel="Open Settings from Usage"
+                      >
+                        <Text style={styles.emptyActionBtnText}>
+                          Open Settings
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+                  ) : isRefreshing && snapshot.fetchedAtMs === 0 && !usage ? (
+                    <View style={styles.emptyState}>
+                      <ActivityIndicator size="small" color="#60A5FA" />
+                      <Text style={styles.emptyTitle}>
+                        Loading usage stats…
+                      </Text>
+                      <Text style={styles.emptySubtitle}>
+                        Querying quota windows and credits from your connected
+                        workstation.
+                      </Text>
+                    </View>
+                  ) : !usage &&
+                    counts.all === 0 &&
+                    connectedInstances.length === 0 ? (
+                    <View style={styles.emptyState}>
+                      <Text style={styles.emptyTitle}>
+                        No connected workstations
+                      </Text>
+                      <Text style={styles.emptySubtitle}>
+                        Run agy --remote-control on your computer, or open a
+                        machine link directly to inspect live quotas.
+                      </Text>
+                      <TouchableOpacity
+                        style={styles.emptyActionBtn}
+                        onPress={() => {
+                          setActiveMode('settings');
+                          setIsHandoffExpanded(true);
+                        }}
+                        accessibilityRole="button"
+                        accessibilityLabel="Open machine link from Usage"
+                      >
+                        <Text style={styles.emptyActionBtnText}>
+                          Open Link or Machine ID
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+                  ) : (
+                    <>
+                      {usage &&
+                      (usage.planName ||
+                        usage.accountEmail ||
+                        usage.credits.length > 0) ? (
+                        <View style={styles.usageCard}>
+                          {usage.planName || usage.accountEmail ? (
+                            <View style={styles.usagePlanRow}>
+                              {usage.planName ? (
+                                <View style={styles.usageTierPill}>
+                                  <Text
+                                    style={styles.usageTierPillText}
+                                    numberOfLines={1}
+                                  >
+                                    {usage.planName}
+                                  </Text>
+                                </View>
+                              ) : null}
+                              {usage.accountEmail ? (
+                                <Text
+                                  style={styles.usageAccountEmail}
+                                  numberOfLines={1}
+                                >
+                                  {usage.accountEmail}
+                                </Text>
+                              ) : null}
+                            </View>
+                          ) : null}
+
+                          {usage.credits.map((credit, idx) => (
+                            <View
+                              key={credit.id}
+                              style={[
+                                styles.usageCreditRow,
+                                idx > 0 || usage.planName || usage.accountEmail
+                                  ? styles.usageCreditRowBorder
+                                  : null,
+                              ]}
+                            >
+                              <Text
+                                style={styles.usageCreditLabel}
+                                numberOfLines={1}
+                              >
+                                {credit.label}
+                              </Text>
+                              <Text style={styles.usageCreditValue}>
+                                {formatNumberWithCommas(credit.available)}
+                                {credit.limit
+                                  ? ` / ${formatNumberWithCommas(credit.limit)}`
+                                  : ''}
+                              </Text>
+                            </View>
+                          ))}
+                        </View>
+                      ) : null}
+
+                      {usage && usage.groups.length > 0 ? (
+                        <View style={styles.usageSection}>
+                          <Text style={styles.usageSectionTitle}>
+                            QUOTA POOLS
+                          </Text>
+                          {usage.groups.map((group) => (
+                            <View key={group.id} style={styles.usageCard}>
+                              <Text
+                                style={styles.usageGroupTitle}
+                                numberOfLines={1}
+                              >
+                                {group.label}
+                              </Text>
+                              {group.buckets.map((bucket, idx) => {
+                                const clamped = Math.max(
+                                  0,
+                                  Math.min(1, bucket.remainingFraction),
+                                );
+                                const pct = Math.round(clamped * 100);
+                                const visuals = getQuotaVisuals(
+                                  clamped,
+                                  bucket.isExhausted,
+                                );
+                                const countdown = formatResetCountdown(
+                                  bucket.resetTimeMs,
+                                );
+                                return (
+                                  <View
+                                    key={bucket.id}
+                                    style={[
+                                      styles.usageQuotaItem,
+                                      idx > 0
+                                        ? styles.usageQuotaItemDivider
+                                        : null,
+                                    ]}
+                                  >
+                                    <View style={styles.usageQuotaHeaderRow}>
+                                      <Text
+                                        style={styles.usageQuotaLabel}
+                                        numberOfLines={1}
+                                      >
+                                        {bucket.label}
+                                      </Text>
+                                      <View
+                                        style={[
+                                          styles.usagePctBadge,
+                                          {
+                                            backgroundColor:
+                                              visuals.badgeBgColor,
+                                            borderColor:
+                                              visuals.badgeBorderColor,
+                                          },
+                                        ]}
+                                      >
+                                        <Text
+                                          style={[
+                                            styles.usagePctBadgeText,
+                                            { color: visuals.textColor },
+                                          ]}
+                                        >
+                                          {bucket.isExhausted || pct === 0
+                                            ? 'Exhausted'
+                                            : `${pct}% left`}
+                                        </Text>
+                                      </View>
+                                    </View>
+                                    <View style={styles.usageProgressTrack}>
+                                      <View
+                                        style={[
+                                          styles.usageProgressFill,
+                                          {
+                                            width: `${pct}%`,
+                                            backgroundColor: visuals.barColor,
+                                          },
+                                        ]}
+                                      />
+                                    </View>
+                                    <Text style={styles.usageResetText}>
+                                      {countdown ||
+                                        (bucket.isExhausted
+                                          ? 'Quota exhausted'
+                                          : 'Full quota available')}
+                                    </Text>
+                                  </View>
+                                );
+                              })}
+                            </View>
+                          ))}
+                        </View>
+                      ) : null}
+
+                      {usage && usage.models.length > 0 ? (
+                        <View style={styles.usageSection}>
+                          <Text style={styles.usageSectionTitle}>
+                            MODEL QUOTAS
+                          </Text>
+                          <View style={styles.usageCard}>
+                            {usage.models.map((model, idx) => {
+                              const clamped = Math.max(
+                                0,
+                                Math.min(1, model.remainingFraction),
+                              );
+                              const pct = Math.round(clamped * 100);
+                              const visuals = getQuotaVisuals(
+                                clamped,
+                                model.isExhausted,
+                              );
+                              const countdown = formatResetCountdown(
+                                model.resetTimeMs,
+                              );
+                              return (
+                                <View
+                                  key={model.id}
+                                  style={[
+                                    styles.usageQuotaItem,
+                                    idx > 0
+                                      ? styles.usageQuotaItemDivider
+                                      : null,
+                                  ]}
+                                >
+                                  <View style={styles.usageQuotaHeaderRow}>
+                                    <View style={styles.usageModelTitleRow}>
+                                      <Text
+                                        style={styles.usageQuotaLabel}
+                                        numberOfLines={1}
+                                      >
+                                        {model.label}
+                                      </Text>
+                                      {model.isDefault ||
+                                      model.isRecommended ? (
+                                        <View style={styles.usageDefaultTag}>
+                                          <Text
+                                            style={styles.usageDefaultTagText}
+                                          >
+                                            {model.isDefault
+                                              ? 'DEFAULT'
+                                              : 'REC'}
+                                          </Text>
+                                        </View>
+                                      ) : null}
+                                    </View>
+                                    <View
+                                      style={[
+                                        styles.usagePctBadge,
+                                        {
+                                          backgroundColor: visuals.badgeBgColor,
+                                          borderColor: visuals.badgeBorderColor,
+                                        },
+                                      ]}
+                                    >
+                                      <Text
+                                        style={[
+                                          styles.usagePctBadgeText,
+                                          { color: visuals.textColor },
+                                        ]}
+                                      >
+                                        {model.isExhausted || pct === 0
+                                          ? 'Exhausted'
+                                          : `${pct}%`}
+                                      </Text>
+                                    </View>
+                                  </View>
+                                  <View style={styles.usageProgressTrack}>
+                                    <View
+                                      style={[
+                                        styles.usageProgressFill,
+                                        {
+                                          width: `${pct}%`,
+                                          backgroundColor: visuals.barColor,
+                                        },
+                                      ]}
+                                    />
+                                  </View>
+                                  <Text style={styles.usageResetText}>
+                                    {countdown ||
+                                      (model.isExhausted
+                                        ? 'Quota exhausted'
+                                        : 'Available')}
+                                  </Text>
+                                </View>
+                              );
+                            })}
+                          </View>
+                        </View>
+                      ) : null}
+
+                      {usage?.error ? (
+                        <View style={styles.errorBanner}>
+                          <Text style={styles.errorBannerText}>
+                            {usage.error}
+                          </Text>
+                        </View>
+                      ) : !usage && !isRefreshing ? (
+                        <View style={styles.usageInfoBanner}>
+                          <Text style={styles.usageInfoBannerText}>
+                            Live model quota windows appear automatically when a
+                            connected Antigravity workstation responds. Tap
+                            Refresh to query now.
+                          </Text>
+                        </View>
+                      ) : null}
+
+                      <View style={styles.usageSection}>
+                        <Text style={styles.usageSectionTitle}>
+                          WORKSTATION ACTIVITY
+                        </Text>
+                        <View style={styles.usageMetricsGrid}>
+                          <View style={styles.usageMetricTile}>
+                            <Text style={styles.usageMetricValue}>
+                              {connectedInstances.length}
+                            </Text>
+                            <Text style={styles.usageMetricLabel}>
+                              {connectedInstances.length === 1
+                                ? 'Machine'
+                                : 'Machines'}
+                            </Text>
+                          </View>
+                          <View style={styles.usageMetricTile}>
+                            <Text
+                              style={[
+                                styles.usageMetricValue,
+                                counts.running > 0
+                                  ? styles.usageMetricValueActive
+                                  : null,
+                              ]}
+                            >
+                              {counts.running}
+                            </Text>
+                            <Text style={styles.usageMetricLabel}>Running</Text>
+                          </View>
+                          <View style={styles.usageMetricTile}>
+                            <Text style={styles.usageMetricValue}>
+                              {formatNumberWithCommas(activityStats.totalSteps)}
+                            </Text>
+                            <Text
+                              style={styles.usageMetricLabel}
+                              numberOfLines={1}
+                            >
+                              {counts.all === 1
+                                ? 'Steps (1 chat)'
+                                : `Steps (${counts.all})`}
+                            </Text>
+                          </View>
+                        </View>
+
+                        {activityStats.firstBudgetPausedThread ? (
+                          <TouchableOpacity
+                            style={styles.usageBudgetAlertBtn}
+                            onPress={() =>
+                              onSelectThread(
+                                activityStats.firstBudgetPausedThread!,
+                              )
+                            }
+                            accessibilityRole="button"
+                            accessibilityLabel="Open budget-paused thread"
+                          >
+                            <Text style={styles.usageBudgetAlertText}>
+                              {activityStats.budgetPausedCount === 1
+                                ? '1 thread paused on token/step budget — tap to open'
+                                : `${activityStats.budgetPausedCount} threads paused on token/step budget — tap to open`}
+                            </Text>
+                          </TouchableOpacity>
+                        ) : null}
+                      </View>
+                    </>
                   )}
                 </ScrollView>
               </View>
@@ -1622,9 +2186,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     paddingVertical: 8,
-    paddingHorizontal: 8,
+    paddingHorizontal: 6,
     borderRadius: 8,
-    gap: 6,
+    gap: 5,
   },
   modeSwitchBtnActive: {
     backgroundColor: '#1E293B',
@@ -1927,6 +2491,202 @@ const styles = StyleSheet.create({
     color: '#93C5FD',
     fontSize: 12,
     fontWeight: '600',
+  },
+  usageScrollContent: {
+    paddingBottom: 12,
+    gap: 12,
+  },
+  usageSection: {
+    gap: 7,
+  },
+  usageSectionTitle: {
+    color: '#94A3B8',
+    fontSize: 10.5,
+    fontWeight: '700',
+    letterSpacing: 0.7,
+    paddingHorizontal: 2,
+  },
+  usageCard: {
+    backgroundColor: '#1E293B',
+    borderRadius: 11,
+    paddingHorizontal: 12,
+    paddingVertical: 11,
+    borderWidth: 1,
+    borderColor: '#334155',
+    gap: 8,
+  },
+  usagePlanRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  usageTierPill: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+    backgroundColor: 'rgba(59, 130, 246, 0.2)',
+    borderWidth: 1,
+    borderColor: 'rgba(96, 165, 250, 0.45)',
+    flexShrink: 1,
+  },
+  usageTierPillText: {
+    color: '#BFDBFE',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  usageAccountEmail: {
+    flex: 1,
+    color: '#94A3B8',
+    fontSize: 11,
+    textAlign: 'right',
+  },
+  usageCreditRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  usageCreditRowBorder: {
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(51, 65, 85, 0.7)',
+  },
+  usageCreditLabel: {
+    flex: 1,
+    color: '#CBD5E1',
+    fontSize: 12,
+    fontWeight: '500',
+  },
+  usageCreditValue: {
+    color: '#F8FAFC',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  usageGroupTitle: {
+    color: '#F8FAFC',
+    fontSize: 12.5,
+    fontWeight: '700',
+    marginBottom: 2,
+  },
+  usageQuotaItem: {
+    gap: 5,
+  },
+  usageQuotaItemDivider: {
+    paddingTop: 9,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(51, 65, 85, 0.7)',
+  },
+  usageQuotaHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  usageModelTitleRow: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  usageQuotaLabel: {
+    flexShrink: 1,
+    color: '#E2E8F0',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  usageDefaultTag: {
+    paddingHorizontal: 5,
+    paddingVertical: 1.5,
+    borderRadius: 4,
+    backgroundColor: 'rgba(96, 165, 250, 0.18)',
+  },
+  usageDefaultTagText: {
+    color: '#93C5FD',
+    fontSize: 9,
+    fontWeight: '700',
+    letterSpacing: 0.3,
+  },
+  usagePctBadge: {
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  usagePctBadgeText: {
+    fontSize: 10.5,
+    fontWeight: '700',
+  },
+  usageProgressTrack: {
+    height: 6,
+    borderRadius: 999,
+    backgroundColor: '#0B1120',
+    overflow: 'hidden',
+  },
+  usageProgressFill: {
+    height: '100%',
+    borderRadius: 999,
+  },
+  usageResetText: {
+    color: '#94A3B8',
+    fontSize: 10.5,
+  },
+  usageInfoBanner: {
+    backgroundColor: 'rgba(30, 41, 59, 0.75)',
+    borderColor: '#334155',
+    borderWidth: 1,
+    borderRadius: 9,
+    paddingHorizontal: 11,
+    paddingVertical: 9,
+  },
+  usageInfoBannerText: {
+    color: '#CBD5E1',
+    fontSize: 11.5,
+    lineHeight: 16,
+  },
+  usageMetricsGrid: {
+    flexDirection: 'row',
+    gap: 7,
+  },
+  usageMetricTile: {
+    flex: 1,
+    backgroundColor: '#1E293B',
+    borderRadius: 10,
+    paddingVertical: 9,
+    paddingHorizontal: 6,
+    borderWidth: 1,
+    borderColor: '#334155',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  usageMetricValue: {
+    color: '#F8FAFC',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  usageMetricValueActive: {
+    color: '#34D399',
+  },
+  usageMetricLabel: {
+    color: '#94A3B8',
+    fontSize: 10.5,
+    fontWeight: '500',
+    marginTop: 2,
+    textAlign: 'center',
+  },
+  usageBudgetAlertBtn: {
+    backgroundColor: 'rgba(239, 68, 68, 0.16)',
+    borderColor: 'rgba(248, 113, 113, 0.45)',
+    borderWidth: 1,
+    borderRadius: 9,
+    paddingHorizontal: 11,
+    paddingVertical: 8,
+  },
+  usageBudgetAlertText: {
+    color: '#FECACA',
+    fontSize: 11.5,
+    fontWeight: '600',
+    lineHeight: 16,
   },
   sessionScrollContent: {
     flexGrow: 1,

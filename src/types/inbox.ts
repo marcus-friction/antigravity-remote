@@ -47,12 +47,73 @@ export interface InboxThreadItem {
   hasRunningSubagents: boolean;
 }
 
+export interface UsageQuotaBucket {
+  id: string;
+  label: string;
+  window?: string;
+  remainingFraction: number;
+  remainingPercent: number;
+  resetTimeMs: number;
+  isExhausted: boolean;
+}
+
+export interface UsageQuotaGroup {
+  id: string;
+  label: string;
+  buckets: UsageQuotaBucket[];
+}
+
+export interface UsageModelQuota {
+  id: string;
+  label: string;
+  modelId?: string;
+  remainingFraction: number;
+  remainingPercent: number;
+  resetTimeMs: number;
+  isExhausted: boolean;
+  isRecommended: boolean;
+  isDefault: boolean;
+  supportsImages: boolean;
+}
+
+export interface UsageCreditBalance {
+  id: string;
+  label: string;
+  available: number;
+  limit?: number;
+  minimumForUsage?: number;
+}
+
+export interface UsageStatsSnapshot {
+  sourceInstanceUuid: string | null;
+  sourceInstanceName: string | null;
+  fetchedAtMs: number;
+  planName: string | null;
+  accountEmail: string | null;
+  credits: UsageCreditBalance[];
+  groups: UsageQuotaGroup[];
+  models: UsageModelQuota[];
+  lowestRemainingFraction: number | null;
+  error: string | null;
+}
+
+export interface RawBridgeUsagePayload {
+  instanceUuid?: string | null;
+  instanceName?: string | null;
+  fetchedAtMs?: number;
+  quotaSummary?: Record<string, unknown> | null;
+  userStatus?: Record<string, unknown> | null;
+  commandModelConfigs?: Record<string, unknown> | null;
+  error?: string | null;
+}
+
 export interface InboxSnapshot {
   instances: InboxInstanceSummary[];
   threads: InboxThreadItem[];
   fetchedAtMs: number;
   activeInstanceUuid: string | null;
   activeCascadeId: string | null;
+  usage?: UsageStatsSnapshot | null;
   error: string | null;
 }
 
@@ -75,6 +136,7 @@ export type InboxBridgeMessage =
       activeCascadeId?: string | null;
       instances: RawBridgeInstancePayload[];
       cloudTrajectories?: Record<string, unknown> | null;
+      usage?: RawBridgeUsagePayload | null;
       error?: string | null;
     }
   | {

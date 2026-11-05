@@ -7,11 +7,21 @@ import {
   InboxSnapshot,
   InboxThreadItem,
   RawBridgeInstancePayload,
+  RawBridgeUsagePayload,
+  UsageCreditBalance,
+  UsageModelQuota,
+  UsageQuotaBucket,
+  UsageQuotaGroup,
+  UsageStatsSnapshot,
 } from '../types/inbox';
 import { validateNavigationUrl } from './urlValidator';
 
 const MAX_INBOX_BRIDGE_PAYLOAD_LENGTH = 2 * 1024 * 1024;
 const MAX_INSTANCES_PER_SNAPSHOT = 64;
+const MAX_USAGE_GROUPS = 16;
+const MAX_USAGE_BUCKETS_PER_GROUP = 16;
+const MAX_USAGE_MODELS = 48;
+const MAX_USAGE_CREDITS = 12;
 const SAFE_ID_PATTERN = /^[a-zA-Z0-9._-]+$/;
 
 const ATTENTION_PRIORITY: Record<InboxAttentionKind, number> = {
@@ -849,6 +859,643 @@ function parseTrajectoriesForSource(params: {
   return items;
 }
 
+function parseOptionalNumber(raw: unknown): number | null {
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) ? raw : null;
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    const numeric = Number(trimmed);
+    return Number.isFinite(numeric) ? numeric : null;
+  }
+  return null;
+}
+
+function fractionToPercent(fraction: number): number {
+  if (!Number.isFinite(fraction) || fraction <= 0) {
+    return 0;
+  }
+  if (fraction >= 1) {
+    return 100;
+  }
+  return Math.max(1, Math.min(99, Math.round(fraction * 100)));
+}
+
+function resolveRemainingFraction(
+  rawQuota: Record<string, unknown>,
+  resetTimeMs: number,
+): number {
+  if (rawQuota.isExhausted === true || rawQuota.is_exhausted === true) {
+    return 0;
+  }
+  const explicitFraction = parseOptionalNumber(
+    rawQuota.remainingFraction ?? rawQuota.remaining_fraction,
+  );
+  if (explicitFraction !== null) {
+    return Math.max(0, Math.min(1, explicitFraction));
+  }
+  const explicitAmount = parseOptionalNumber(
+    rawQuota.remainingAmount ?? rawQuota.remaining_amount,
+  );
+  if (explicitAmount !== null) {
+    return explicitAmount <= 0 ? 0 : 1;
+  }
+  // In proto3 JSON, 0.0 is omitted on active cooldown buckets while resetTime is populated;
+  // untouched buckets omit both remainingFraction and resetTime.
+  return resetTimeMs > 0 ? 0 : 1;
+}
+
+function humanizeTierLabel(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.toUpperCase().includes('UNSPECIFIED')) {
+    return null;
+  }
+  if (/^[A-Z0-9_]+$/.test(trimmed) && trimmed.includes('_')) {
+    const stripped = trimmed.replace(/^(?:USER|TEAMS|PLAN)_TIER_/, '');
+    const formatted = stripped
+      .split('_')
+      .filter(Boolean)
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+      .join(' ');
+    return formatted ? truncateText(formatted, 48) : null;
+  }
+  return truncateText(trimmed, 48);
+}
+
+function humanizeBucketLabel(
+  rawBucket: Record<string, unknown>,
+  index: number,
+): string {
+  const direct =
+    rawBucket.displayName ??
+    rawBucket.display_name ??
+    rawBucket.label ??
+    rawBucket.name;
+  if (typeof direct === 'string' && direct.trim()) {
+    return truncateText(direct.trim(), 48);
+  }
+  const windowRaw = String(
+    rawBucket.window ??
+      rawBucket.windowDuration ??
+      rawBucket.window_duration ??
+      rawBucket.bucketId ??
+      rawBucket.bucket_id ??
+      '',
+  ).toLowerCase();
+  if (
+    windowRaw.includes('5h') ||
+    windowRaw.includes('5_h') ||
+    windowRaw.includes('5-h') ||
+    windowRaw.includes('five_hour') ||
+    windowRaw.includes('18000')
+  ) {
+    return '5-hour window';
+  }
+  if (
+    windowRaw.includes('week') ||
+    windowRaw.includes('7d') ||
+    windowRaw.includes('7_d') ||
+    windowRaw.includes('7-d') ||
+    windowRaw.includes('604800')
+  ) {
+    return 'Weekly limit';
+  }
+  if (
+    windowRaw.includes('day') ||
+    windowRaw.includes('24h') ||
+    windowRaw.includes('86400')
+  ) {
+    return 'Daily limit';
+  }
+  if (windowRaw.includes('month')) {
+    return 'Monthly limit';
+  }
+  return `Quota window ${index + 1}`;
+}
+
+function humanizeCreditLabel(rawType: unknown): string {
+  if (typeof rawType !== 'string' || !rawType.trim()) {
+    return 'AI Credits';
+  }
+  const trimmed = rawType.trim();
+  const upper = trimmed.toUpperCase();
+  if (upper.includes('GOOGLE_ONE') || upper.includes('G1')) {
+    return 'AI Credits';
+  }
+  if (upper.includes('TOP_UP') || upper.includes('TOPUP')) {
+    return 'Top-Up Credits';
+  }
+  if (upper.includes('PROMPT')) {
+    return 'Prompt Credits';
+  }
+  if (upper.includes('FLOW')) {
+    return 'Flow Credits';
+  }
+  if (/^[A-Z0-9_]+$/.test(trimmed)) {
+    return truncateText(
+      trimmed
+        .split('_')
+        .filter(Boolean)
+        .map(
+          (part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase(),
+        )
+        .join(' '),
+      36,
+    );
+  }
+  return truncateText(trimmed, 36);
+}
+
+function parseQuotaBucketsList(rawBuckets: unknown[]): UsageQuotaBucket[] {
+  const buckets: UsageQuotaBucket[] = [];
+  for (let i = 0; i < rawBuckets.length && buckets.length < MAX_USAGE_BUCKETS_PER_GROUP; i++) {
+    const raw = rawBuckets[i];
+    if (!isRecord(raw)) continue;
+    const resetTimeMs = parseProtoTimestampMs(raw.resetTime ?? raw.reset_time);
+    const remainingFraction = resolveRemainingFraction(raw, resetTimeMs);
+    const rawId = raw.bucketId ?? raw.bucket_id ?? raw.window ?? `bucket-${i}`;
+    const id =
+      typeof rawId === 'string' && rawId.trim()
+        ? truncateText(rawId.trim(), 64)
+        : `bucket-${i}`;
+    const windowStr =
+      typeof raw.window === 'string' && raw.window.trim()
+        ? truncateText(raw.window.trim(), 24)
+        : undefined;
+    buckets.push({
+      id,
+      label: humanizeBucketLabel(raw, i),
+      window: windowStr,
+      remainingFraction,
+      remainingPercent: fractionToPercent(remainingFraction),
+      resetTimeMs,
+      isExhausted: remainingFraction <= 0,
+    });
+  }
+  return buckets;
+}
+
+function extractModelId(rawCfg: Record<string, unknown>): string | undefined {
+  const modelOrAlias = isRecord(rawCfg.modelOrAlias)
+    ? rawCfg.modelOrAlias
+    : isRecord(rawCfg.model_or_alias)
+      ? rawCfg.model_or_alias
+      : null;
+  const candidate =
+    (modelOrAlias && (modelOrAlias.model ?? modelOrAlias.alias)) ??
+    rawCfg.modelName ??
+    rawCfg.model_name ??
+    rawCfg.model ??
+    rawCfg.id;
+  return typeof candidate === 'string' && candidate.trim()
+    ? truncateText(candidate.trim(), 64)
+    : undefined;
+}
+
+/**
+ * Parses `RetrieveUserQuotaSummary`, `GetUserStatus`, and fallback `GetCommandModelConfigs`
+ * responses into a normalized `UsageStatsSnapshot` for the sidebar Usage tab.
+ */
+export function buildUsageSnapshot(
+  rawUsage: RawBridgeUsagePayload | null | undefined,
+  fallbackFetchedAtMs: number = Date.now(),
+): UsageStatsSnapshot | null {
+  if (!rawUsage || !isRecord(rawUsage as unknown)) {
+    return null;
+  }
+
+  const sourceInstanceUuid =
+    typeof rawUsage.instanceUuid === 'string' &&
+    SAFE_ID_PATTERN.test(rawUsage.instanceUuid)
+      ? rawUsage.instanceUuid
+      : null;
+  const sourceInstanceName =
+    typeof rawUsage.instanceName === 'string' && rawUsage.instanceName.trim()
+      ? truncateText(rawUsage.instanceName.trim(), 64)
+      : sourceInstanceUuid;
+  const fetchedAtMs =
+    typeof rawUsage.fetchedAtMs === 'number' &&
+    Number.isFinite(rawUsage.fetchedAtMs) &&
+    rawUsage.fetchedAtMs > 0
+      ? rawUsage.fetchedAtMs
+      : fallbackFetchedAtMs;
+
+  // 1. Parse grouped quota buckets from RetrieveUserQuotaSummary (if available).
+  const groups: UsageQuotaGroup[] = [];
+  if (isRecord(rawUsage.quotaSummary)) {
+    const qsRoot = isRecord(rawUsage.quotaSummary.response)
+      ? rawUsage.quotaSummary.response
+      : isRecord(rawUsage.quotaSummary.quotaSummary)
+        ? rawUsage.quotaSummary.quotaSummary
+        : isRecord(rawUsage.quotaSummary.quota_summary)
+          ? rawUsage.quotaSummary.quota_summary
+          : rawUsage.quotaSummary;
+
+    const rawGroups = Array.isArray(qsRoot.groups)
+      ? qsRoot.groups
+      : Array.isArray(qsRoot.quotaGroups)
+        ? qsRoot.quotaGroups
+        : Array.isArray(qsRoot.quota_groups)
+          ? qsRoot.quota_groups
+          : null;
+
+    if (rawGroups) {
+      for (let g = 0; g < rawGroups.length && groups.length < MAX_USAGE_GROUPS; g++) {
+        const grp = rawGroups[g];
+        if (!isRecord(grp)) continue;
+        const rawBuckets = Array.isArray(grp.buckets)
+          ? grp.buckets
+          : Array.isArray(grp.quotaBuckets)
+            ? grp.quotaBuckets
+            : Array.isArray(grp.quota_buckets)
+              ? grp.quota_buckets
+              : [];
+        const buckets = parseQuotaBucketsList(rawBuckets);
+        if (buckets.length === 0) continue;
+        const rawGroupId = grp.groupId ?? grp.group_id ?? `group-${g}`;
+        const groupId =
+          typeof rawGroupId === 'string' && rawGroupId.trim()
+            ? truncateText(rawGroupId.trim(), 64)
+            : `group-${g}`;
+        const rawGroupLabel =
+          grp.displayName ??
+          grp.display_name ??
+          grp.groupName ??
+          grp.group_name ??
+          grp.title ??
+          grp.label ??
+          grp.name ??
+          groupId;
+        const groupLabel =
+          typeof rawGroupLabel === 'string' && rawGroupLabel.trim()
+            ? truncateText(rawGroupLabel.trim(), 56)
+            : `Quota Pool ${g + 1}`;
+        groups.push({
+          id: groupId,
+          label: groupLabel,
+          buckets,
+        });
+      }
+    } else {
+      const topBuckets = Array.isArray(qsRoot.buckets)
+        ? qsRoot.buckets
+        : Array.isArray(qsRoot.quotaBuckets)
+          ? qsRoot.quotaBuckets
+          : Array.isArray(qsRoot.quota_buckets)
+            ? qsRoot.quota_buckets
+            : null;
+      if (topBuckets) {
+        const parsedBuckets = parseQuotaBucketsList(topBuckets);
+        if (parsedBuckets.length > 0) {
+          groups.push({
+            id: 'account-quota',
+            label: 'Quota Limits',
+            buckets: parsedBuckets,
+          });
+        }
+      }
+    }
+  }
+
+  // 2. Parse account tier, credits, and per-model configs from GetUserStatus / GetCommandModelConfigs.
+  let planName: string | null = null;
+  let accountEmail: string | null = null;
+  const credits: UsageCreditBalance[] = [];
+  const seenCreditKeys = new Set<string>();
+  const models: UsageModelQuota[] = [];
+
+  const statusWrapper = isRecord(rawUsage.userStatus)
+    ? rawUsage.userStatus
+    : null;
+  const statusRoot =
+    statusWrapper && isRecord(statusWrapper.userStatus)
+      ? statusWrapper.userStatus
+      : statusWrapper && isRecord(statusWrapper.user_status)
+        ? statusWrapper.user_status
+        : statusWrapper;
+
+  const addCreditEntry = (entry: UsageCreditBalance) => {
+    if (credits.length >= MAX_USAGE_CREDITS) return;
+    if (seenCreditKeys.has(entry.id)) return;
+    seenCreditKeys.add(entry.id);
+    credits.push(entry);
+  };
+
+  const collectCreditsArray = (rawArr: unknown, prefix: string) => {
+    if (!Array.isArray(rawArr)) return;
+    for (let i = 0; i < rawArr.length; i++) {
+      const item = rawArr[i];
+      if (!isRecord(item)) continue;
+      const available = parseOptionalNumber(
+        item.creditAmount ??
+          item.credit_amount ??
+          item.balance ??
+          item.available ??
+          item.remaining,
+      );
+      if (available === null || available < 0) continue;
+      const minUsage = parseOptionalNumber(
+        item.minimumCreditAmountForUsage ??
+          item.minimum_credit_amount_for_usage,
+      );
+      const rawType = item.creditType ?? item.credit_type ?? `${prefix}-${i}`;
+      const label = humanizeCreditLabel(rawType);
+      addCreditEntry({
+        id: `${label.toLowerCase().replace(/\s+/g, '-')}`,
+        label,
+        available: Math.floor(available * 100) / 100,
+        minimumForUsage:
+          minUsage !== null && minUsage > 0 ? minUsage : undefined,
+      });
+    }
+  };
+
+  if (statusRoot) {
+    if (typeof statusRoot.email === 'string' && statusRoot.email.includes('@')) {
+      accountEmail = truncateText(statusRoot.email.trim(), 80);
+    }
+
+    const paidTier = isRecord(statusRoot.paidTier)
+      ? statusRoot.paidTier
+      : isRecord(statusRoot.paid_tier)
+        ? statusRoot.paid_tier
+        : isRecord(statusWrapper?.paidTier)
+          ? statusWrapper.paidTier
+          : null;
+    const userTier = isRecord(statusRoot.userTier)
+      ? statusRoot.userTier
+      : isRecord(statusRoot.user_tier)
+        ? statusRoot.user_tier
+        : isRecord(statusRoot.currentTier)
+          ? statusRoot.currentTier
+          : isRecord(statusRoot.current_tier)
+            ? statusRoot.current_tier
+            : isRecord(statusWrapper?.currentTier)
+              ? statusWrapper.currentTier
+              : null;
+    const planStatus = isRecord(statusRoot.planStatus)
+      ? statusRoot.planStatus
+      : isRecord(statusRoot.plan_status)
+        ? statusRoot.plan_status
+        : null;
+    const planInfo =
+      planStatus && isRecord(planStatus.planInfo)
+        ? planStatus.planInfo
+        : planStatus && isRecord(planStatus.plan_info)
+          ? planStatus.plan_info
+          : null;
+
+    planName =
+      humanizeTierLabel(paidTier?.name) ??
+      humanizeTierLabel(userTier?.name) ??
+      humanizeTierLabel(userTier?.tierType ?? userTier?.tier_type) ??
+      humanizeTierLabel(planInfo?.planName ?? planInfo?.plan_name) ??
+      humanizeTierLabel(planInfo?.teamsTier ?? planInfo?.teams_tier);
+
+    collectCreditsArray(
+      paidTier?.availableCredits ?? paidTier?.available_credits,
+      'paid',
+    );
+    collectCreditsArray(
+      userTier?.availableCredits ?? userTier?.available_credits,
+      'tier',
+    );
+    collectCreditsArray(
+      statusRoot.availableCredits ?? statusRoot.available_credits,
+      'root',
+    );
+
+    const directG1 = parseOptionalNumber(
+      statusRoot.g1Credits ?? statusRoot.g1_credits,
+    );
+    if (directG1 !== null && directG1 >= 0) {
+      addCreditEntry({
+        id: 'ai-credits',
+        label: 'AI Credits',
+        available: Math.floor(directG1 * 100) / 100,
+      });
+    }
+
+    if (planStatus) {
+      const availPrompt = parseOptionalNumber(
+        planStatus.availablePromptCredits ?? planStatus.available_prompt_credits,
+      );
+      const monthlyPrompt = parseOptionalNumber(
+        planInfo?.monthlyPromptCredits ?? planInfo?.monthly_prompt_credits,
+      );
+      if (availPrompt !== null && availPrompt >= 0) {
+        addCreditEntry({
+          id: 'prompt-credits',
+          label: 'Prompt Credits',
+          available: Math.floor(availPrompt),
+          limit:
+            monthlyPrompt !== null && monthlyPrompt > 0
+              ? Math.floor(monthlyPrompt)
+              : undefined,
+        });
+      }
+      const availFlow = parseOptionalNumber(
+        planStatus.availableFlowCredits ?? planStatus.available_flow_credits,
+      );
+      const monthlyFlow = parseOptionalNumber(
+        planInfo?.monthlyFlowCredits ?? planInfo?.monthly_flow_credits,
+      );
+      if (availFlow !== null && availFlow >= 0) {
+        addCreditEntry({
+          id: 'flow-credits',
+          label: 'Flow Credits',
+          available: Math.floor(availFlow),
+          limit:
+            monthlyFlow !== null && monthlyFlow > 0
+              ? Math.floor(monthlyFlow)
+              : undefined,
+        });
+      }
+    }
+  }
+
+  const extractModelsFromSource = (sourceObj: Record<string, unknown> | null) => {
+    if (!sourceObj || models.length > 0) return;
+    const inner = isRecord(sourceObj.userStatus)
+      ? sourceObj.userStatus
+      : isRecord(sourceObj.user_status)
+        ? sourceObj.user_status
+        : sourceObj;
+    const cascadeData = isRecord(inner.cascadeModelConfigData)
+      ? inner.cascadeModelConfigData
+      : isRecord(inner.cascade_model_config_data)
+        ? inner.cascade_model_config_data
+        : inner;
+
+    const defaultOverride = isRecord(cascadeData.defaultOverrideModelConfig)
+      ? cascadeData.defaultOverrideModelConfig
+      : isRecord(cascadeData.default_override_model_config)
+        ? cascadeData.default_override_model_config
+        : null;
+    const defaultModelId =
+      (defaultOverride ? extractModelId(defaultOverride) : undefined) ??
+      (typeof cascadeData.defaultAgentModelId === 'string'
+        ? cascadeData.defaultAgentModelId
+        : undefined);
+    const defaultLabel =
+      defaultOverride && typeof defaultOverride.label === 'string'
+        ? defaultOverride.label.trim()
+        : '';
+
+    const rawConfigs = Array.isArray(cascadeData.clientModelConfigs)
+      ? cascadeData.clientModelConfigs
+      : Array.isArray(cascadeData.client_model_configs)
+        ? cascadeData.client_model_configs
+        : Array.isArray(inner.modelConfigs)
+          ? inner.modelConfigs
+          : Array.isArray(inner.model_configs)
+            ? inner.model_configs
+            : null;
+
+    if (rawConfigs) {
+      const seenIds = new Set<string>();
+      for (let i = 0; i < rawConfigs.length && models.length < MAX_USAGE_MODELS; i++) {
+        const cfg = rawConfigs[i];
+        if (!isRecord(cfg)) continue;
+        const modelId = extractModelId(cfg);
+        const rawLabel =
+          cfg.label ??
+          cfg.displayName ??
+          cfg.display_name ??
+          cfg.modelName ??
+          cfg.model_name ??
+          modelId;
+        if (typeof rawLabel !== 'string' || !rawLabel.trim()) continue;
+        const label = truncateText(rawLabel.trim(), 64);
+        const dedupKey = `${modelId ?? ''}::${label}`;
+        if (seenIds.has(dedupKey)) continue;
+        seenIds.add(dedupKey);
+
+        const quotaObj = isRecord(cfg.quotaInfo)
+          ? cfg.quotaInfo
+          : isRecord(cfg.quota_info)
+            ? cfg.quota_info
+            : null;
+        const resetTimeMs = quotaObj
+          ? parseProtoTimestampMs(quotaObj.resetTime ?? quotaObj.reset_time)
+          : 0;
+        const remainingFraction = quotaObj
+          ? resolveRemainingFraction(quotaObj, resetTimeMs)
+          : 1;
+
+        const isDefault = Boolean(
+          (defaultModelId && modelId === defaultModelId) ||
+            (defaultLabel && label === defaultLabel),
+        );
+
+        models.push({
+          id: modelId ? `${modelId}-${models.length}` : `model-${models.length}`,
+          label,
+          modelId,
+          remainingFraction,
+          remainingPercent: fractionToPercent(remainingFraction),
+          resetTimeMs,
+          isExhausted: remainingFraction <= 0,
+          isRecommended: Boolean(cfg.isRecommended ?? cfg.is_recommended),
+          isDefault,
+          supportsImages: Boolean(cfg.supportsImages ?? cfg.supports_images),
+        });
+      }
+      return;
+    }
+
+    if (isRecord(cascadeData.models)) {
+      for (const [key, val] of Object.entries(cascadeData.models)) {
+        if (models.length >= MAX_USAGE_MODELS) break;
+        if (!isRecord(val)) continue;
+        const rawLabel =
+          val.displayName ?? val.display_name ?? val.label ?? key;
+        if (typeof rawLabel !== 'string' || !rawLabel.trim()) continue;
+        const label = truncateText(rawLabel.trim(), 64);
+        const quotaObj = isRecord(val.quotaInfo)
+          ? val.quotaInfo
+          : isRecord(val.quota_info)
+            ? val.quota_info
+            : null;
+        const resetTimeMs = quotaObj
+          ? parseProtoTimestampMs(quotaObj.resetTime ?? quotaObj.reset_time)
+          : 0;
+        const remainingFraction = quotaObj
+          ? resolveRemainingFraction(quotaObj, resetTimeMs)
+          : 1;
+        models.push({
+          id: `${key}-${models.length}`,
+          label,
+          modelId: truncateText(key, 64),
+          remainingFraction,
+          remainingPercent: fractionToPercent(remainingFraction),
+          resetTimeMs,
+          isExhausted: remainingFraction <= 0,
+          isRecommended: false,
+          isDefault: defaultModelId === key,
+          supportsImages: false,
+        });
+      }
+    }
+  };
+
+  extractModelsFromSource(statusWrapper);
+  if (models.length === 0 && isRecord(rawUsage.commandModelConfigs)) {
+    extractModelsFromSource(rawUsage.commandModelConfigs);
+  }
+
+  const error =
+    typeof rawUsage.error === 'string' && rawUsage.error.trim()
+      ? truncateText(rawUsage.error.trim(), 160)
+      : null;
+
+  if (
+    groups.length === 0 &&
+    models.length === 0 &&
+    !planName &&
+    !accountEmail &&
+    credits.length === 0 &&
+    !error
+  ) {
+    return null;
+  }
+
+  let lowestRemainingFraction: number | null = null;
+  for (const grp of groups) {
+    for (const b of grp.buckets) {
+      if (
+        lowestRemainingFraction === null ||
+        b.remainingFraction < lowestRemainingFraction
+      ) {
+        lowestRemainingFraction = b.remainingFraction;
+      }
+    }
+  }
+  for (const m of models) {
+    if (
+      lowestRemainingFraction === null ||
+      m.remainingFraction < lowestRemainingFraction
+    ) {
+      lowestRemainingFraction = m.remainingFraction;
+    }
+  }
+
+  return {
+    sourceInstanceUuid,
+    sourceInstanceName,
+    fetchedAtMs,
+    planName,
+    accountEmail,
+    credits,
+    groups,
+    models,
+    lowestRemainingFraction,
+    error,
+  };
+}
+
 /**
  * Builds a sorted, deduplicated `InboxSnapshot` from a raw WebView bridge snapshot.
  */
@@ -956,17 +1603,20 @@ export function buildInboxSnapshot(
     return a.title.localeCompare(b.title);
   });
 
+  const resolvedFetchedAtMs =
+    typeof message.fetchedAtMs === 'number' &&
+    Number.isFinite(message.fetchedAtMs) &&
+    message.fetchedAtMs > 0
+      ? message.fetchedAtMs
+      : Date.now();
+
   return {
     instances,
     threads: allThreads,
-    fetchedAtMs:
-      typeof message.fetchedAtMs === 'number' &&
-      Number.isFinite(message.fetchedAtMs) &&
-      message.fetchedAtMs > 0
-        ? message.fetchedAtMs
-        : Date.now(),
+    fetchedAtMs: resolvedFetchedAtMs,
     activeInstanceUuid,
     activeCascadeId,
+    usage: buildUsageSnapshot(message.usage, resolvedFetchedAtMs),
     error:
       typeof message.error === 'string' && message.error.trim()
         ? truncateText(message.error, 160)
@@ -1103,6 +1753,34 @@ export function parseInboxBridgeMessage(
           error: typeof item.error === 'string' ? item.error : undefined,
         });
       }
+        const rawUsage = isRecord(parsed.usage) ? parsed.usage : null;
+        const sanitizedUsage: RawBridgeUsagePayload | null = rawUsage
+          ? {
+              instanceUuid:
+                typeof rawUsage.instanceUuid === 'string'
+                  ? rawUsage.instanceUuid
+                  : null,
+              instanceName:
+                typeof rawUsage.instanceName === 'string'
+                  ? rawUsage.instanceName
+                  : null,
+              fetchedAtMs:
+                typeof rawUsage.fetchedAtMs === 'number'
+                  ? rawUsage.fetchedAtMs
+                  : undefined,
+              quotaSummary: isRecord(rawUsage.quotaSummary)
+                ? rawUsage.quotaSummary
+                : null,
+              userStatus: isRecord(rawUsage.userStatus)
+                ? rawUsage.userStatus
+                : null,
+              commandModelConfigs: isRecord(rawUsage.commandModelConfigs)
+                ? rawUsage.commandModelConfigs
+                : null,
+              error:
+                typeof rawUsage.error === 'string' ? rawUsage.error : null,
+            }
+          : null;
       return {
         type: 'AGY_INBOX_SNAPSHOT',
         fetchedAtMs:
@@ -1123,6 +1801,7 @@ export function parseInboxBridgeMessage(
         cloudTrajectories: isRecord(parsed.cloudTrajectories)
           ? parsed.cloudTrajectories
           : null,
+        usage: sanitizedUsage,
         error: typeof parsed.error === 'string' ? parsed.error : null,
       };
     }
@@ -1209,4 +1888,40 @@ export function formatRelativeTime(
   }
   const diffWeeks = Math.floor(diffDays / 7);
   return `${diffWeeks}w ago`;
+}
+
+/**
+ * Formats a future quota reset timestamp into a concise human countdown
+ * (e.g., `Resets in 24m`, `Resets in 3h 15m`, `Resets in 4d 6h`, or `Resetting soon`).
+ */
+export function formatResetCountdown(
+  resetTimeMs: number,
+  nowMs: number = Date.now(),
+): string {
+  if (!resetTimeMs || !Number.isFinite(resetTimeMs) || resetTimeMs <= 0) {
+    return '';
+  }
+  const diffMs = resetTimeMs - nowMs;
+  if (diffMs <= 0) {
+    return 'Resetting soon';
+  }
+  const totalMinutes = Math.ceil(diffMs / 60_000);
+  if (totalMinutes <= 1) {
+    return 'Resets in <1m';
+  }
+  if (totalMinutes < 60) {
+    return `Resets in ${totalMinutes}m`;
+  }
+  const totalHours = Math.floor(diffMs / 3_600_000);
+  if (totalHours < 24) {
+    const remMinutes = Math.floor((diffMs % 3_600_000) / 60_000);
+    return remMinutes > 0
+      ? `Resets in ${totalHours}h ${remMinutes}m`
+      : `Resets in ${totalHours}h`;
+  }
+  const days = Math.floor(totalHours / 24);
+  const remHours = totalHours % 24;
+  return remHours > 0
+    ? `Resets in ${days}d ${remHours}h`
+    : `Resets in ${days}d`;
 }

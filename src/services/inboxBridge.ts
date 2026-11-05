@@ -6,8 +6,9 @@
  * - Never touches `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`,
  *   `<script>` injection, `eval`, or `new Function` (satisfies `require-trusted-types-for 'script'`).
  * - Reuses the host page's first-party / enterprise gRPC-Web `ApiServicePromiseClient`
- *   to query `ListInstances` and `ProxyCommand` (`GetAllCascadeTrajectories` &
- *   `UpdateConversationAnnotations`) across all connected workstations.
+ *   to query `ListInstances` and `ProxyCommand` (`GetAllCascadeTrajectories`,
+ *   `UpdateConversationAnnotations`, `RetrieveUserQuotaSummary`, `GetUserStatus`,
+ *   and fallback `GetCommandModelConfigs`) across connected workstations.
  * - Never transmits data outside the local `window.ReactNativeWebView.postMessage` channel.
  */
 export const INBOX_BRIDGE_SCRIPT = `
@@ -24,7 +25,18 @@ export const INBOX_BRIDGE_SCRIPT = `
 
     var GET_TRAJECTORIES_PATH = '/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories';
     var UPDATE_ANNOTATIONS_PATH = '/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations';
+    var RETRIEVE_QUOTA_SUMMARY_PATH = '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary';
+    var GET_USER_STATUS_PATH = '/exa.language_server_pb.LanguageServerService/GetUserStatus';
+    var GET_COMMAND_MODEL_CONFIGS_PATH = '/exa.language_server_pb.LanguageServerService/GetCommandModelConfigs';
+    var DEFAULT_LS_METADATA_BODY = JSON.stringify({
+      metadata: {
+        ideName: 'antigravity',
+        extensionName: 'antigravity',
+        locale: 'en'
+      }
+    });
     var POLL_INTERVAL_MS = 20000;
+    var USAGE_POLL_MIN_INTERVAL_MS = 45000;
     var INSTANCE_RPC_TIMEOUT_MS = 8000;
     var SAFE_ID_RE = /^[a-zA-Z0-9._-]+$/;
 
@@ -35,6 +47,9 @@ export const INBOX_BRIDGE_SCRIPT = `
     var cachedAuthFirstParty = null;
     var cachedApiKey = null;
     var lastTrajectoryCache = Object.create(null);
+    var lastUsageCache = null;
+    var lastUsageFetchedAtMs = 0;
+    var pendingForcedUsageRefresh = false;
     var cloudTrajectoriesCache = null;
     var activeIframeCascadeId = null;
     var activeIframeLocationHref = null;
@@ -519,10 +534,225 @@ export const INBOX_BRIDGE_SCRIPT = `
       });
     }
 
-    function refresh() {
+    function hasQuotaSummaryFields(obj) {
+      if (!obj || typeof obj !== 'object') return false;
+      return Boolean(
+        obj.groups ||
+          obj.quotaGroups ||
+          obj.quota_groups ||
+          obj.buckets ||
+          obj.quotaBuckets ||
+          obj.quota_buckets ||
+          (obj.response && typeof obj.response === 'object') ||
+          (obj.quotaSummary && typeof obj.quotaSummary === 'object') ||
+          (obj.quota_summary && typeof obj.quota_summary === 'object')
+      );
+    }
+
+    function hasUserStatusFields(obj) {
+      if (!obj || typeof obj !== 'object') return false;
+      return Boolean(
+        obj.userStatus ||
+          obj.user_status ||
+          obj.userTier ||
+          obj.user_tier ||
+          obj.paidTier ||
+          obj.paid_tier ||
+          obj.currentTier ||
+          obj.current_tier ||
+          obj.planStatus ||
+          obj.plan_status ||
+          obj.cascadeModelConfigData ||
+          obj.cascade_model_config_data ||
+          obj.clientModelConfigs ||
+          obj.client_model_configs ||
+          obj.availableCredits ||
+          obj.available_credits ||
+          obj.email
+      );
+    }
+
+    function hasModelConfigsInStatus(obj) {
+      if (!obj || typeof obj !== 'object') return false;
+      var root = obj.userStatus || obj.user_status || obj;
+      if (!root || typeof root !== 'object') return false;
+      var cascadeCfg =
+        root.cascadeModelConfigData || root.cascade_model_config_data;
+      if (
+        cascadeCfg &&
+        typeof cascadeCfg === 'object' &&
+        (Array.isArray(cascadeCfg.clientModelConfigs) ||
+          Array.isArray(cascadeCfg.client_model_configs))
+      ) {
+        return true;
+      }
+      return Boolean(
+        Array.isArray(root.clientModelConfigs) ||
+          Array.isArray(root.client_model_configs) ||
+          Array.isArray(obj.modelConfigs) ||
+          Array.isArray(obj.model_configs) ||
+          (obj.models && typeof obj.models === 'object')
+      );
+    }
+
+    function queryUsageOnCandidate(ctx, candidate) {
+      var lastErr = null;
+      var quotaPromise = callProxyJson(
+        ctx,
+        candidate.uuid,
+        RETRIEVE_QUOTA_SUMMARY_PATH,
+        '{}'
+      )
+        .then(function(res) {
+          return hasQuotaSummaryFields(res) ? res : null;
+        })
+        .catch(function(err) {
+          if (err && err.message) lastErr = String(err.message);
+          return null;
+        });
+
+      var statusPromise = callProxyJson(
+        ctx,
+        candidate.uuid,
+        GET_USER_STATUS_PATH,
+        DEFAULT_LS_METADATA_BODY
+      )
+        .then(function(res) {
+          if (hasUserStatusFields(res)) return res;
+          return callProxyJson(ctx, candidate.uuid, GET_USER_STATUS_PATH, '{}').then(
+            function(fallbackRes) {
+              return hasUserStatusFields(fallbackRes) ? fallbackRes : null;
+            }
+          );
+        })
+        .catch(function(err) {
+          if (err && err.message) lastErr = String(err.message);
+          return callProxyJson(ctx, candidate.uuid, GET_USER_STATUS_PATH, '{}')
+            .then(function(fallbackRes) {
+              return hasUserStatusFields(fallbackRes) ? fallbackRes : null;
+            })
+            .catch(function(err2) {
+              if (err2 && err2.message) lastErr = String(err2.message);
+              return null;
+            });
+        });
+
+      return Promise.all([quotaPromise, statusPromise]).then(function(pair) {
+        var quotaSummaryRes = pair[0];
+        var userStatusRes = pair[1];
+        if (hasModelConfigsInStatus(userStatusRes)) {
+          return {
+            ok: true,
+            payload: {
+              instanceUuid: candidate.uuid,
+              instanceName: candidate.name,
+              fetchedAtMs: Date.now(),
+              quotaSummary: quotaSummaryRes,
+              userStatus: userStatusRes,
+              commandModelConfigs: null,
+              error: null
+            }
+          };
+        }
+
+        return callProxyJson(
+          ctx,
+          candidate.uuid,
+          GET_COMMAND_MODEL_CONFIGS_PATH,
+          DEFAULT_LS_METADATA_BODY
+        )
+          .then(function(cmdRes) {
+            return hasModelConfigsInStatus(cmdRes) ? cmdRes : null;
+          })
+          .catch(function(err) {
+            if (err && err.message) lastErr = String(err.message);
+            return null;
+          })
+          .then(function(cmdConfigsRes) {
+            if (!quotaSummaryRes && !userStatusRes && !cmdConfigsRes) {
+              return {
+                ok: false,
+                error: lastErr
+              };
+            }
+            return {
+              ok: true,
+              payload: {
+                instanceUuid: candidate.uuid,
+                instanceName: candidate.name,
+                fetchedAtMs: Date.now(),
+                quotaSummary: quotaSummaryRes,
+                userStatus: userStatusRes,
+                commandModelConfigs: cmdConfigsRes,
+                error: null
+              }
+            };
+          });
+      });
+    }
+
+    function fetchUsageFromCandidates(ctx, candidates, forceUsage) {
+      if (!candidates || candidates.length === 0) {
+        lastUsageCache = null;
+        lastUsageFetchedAtMs = 0;
+        return Promise.resolve(null);
+      }
+      var now = Date.now();
+      if (
+        !forceUsage &&
+        lastUsageCache &&
+        now - lastUsageFetchedAtMs < USAGE_POLL_MIN_INTERVAL_MS
+      ) {
+        return Promise.resolve(lastUsageCache);
+      }
+
+      var idx = 0;
+      var firstError = null;
+      function next() {
+        if (idx >= candidates.length) {
+          if (lastUsageCache) {
+            return Promise.resolve(lastUsageCache);
+          }
+          if (firstError) {
+            return Promise.resolve({
+              instanceUuid: candidates[0].uuid,
+              instanceName: candidates[0].name,
+              fetchedAtMs: Date.now(),
+              quotaSummary: null,
+              userStatus: null,
+              commandModelConfigs: null,
+              error: firstError
+            });
+          }
+          return Promise.resolve(null);
+        }
+        var current = candidates[idx++];
+        return queryUsageOnCandidate(ctx, current).then(function(res) {
+          if (res && res.ok && res.payload) {
+            lastUsageCache = res.payload;
+            lastUsageFetchedAtMs = res.payload.fetchedAtMs;
+            return res.payload;
+          }
+          if (!firstError && res && res.error) {
+            firstError = res.error;
+          }
+          return next();
+        });
+      }
+      return next();
+    }
+
+    function refresh(forceUsage) {
+      var wantForcedUsage = Boolean(forceUsage);
       if (inFlightRefresh) {
+        if (wantForcedUsage) {
+          pendingForcedUsageRefresh = true;
+        }
         return inFlightRefresh;
       }
+      var didForceUsageThisRun = wantForcedUsage || pendingForcedUsageRefresh;
+      pendingForcedUsageRefresh = false;
+
       inFlightRefresh = getClientWithMetadata()
         .then(function(ctx) {
           if (!ctx) {
@@ -540,6 +770,7 @@ export const INBOX_BRIDGE_SCRIPT = `
                 : [];
             var route = parseRouteFromLocation();
             var instanceJobs = [];
+            var usageCandidates = [];
 
             for (var i = 0; i < rawList.length; i++) {
               (function(inst) {
@@ -590,6 +821,16 @@ export const INBOX_BRIDGE_SCRIPT = `
                   return;
                 }
 
+                var candidateEntry = {
+                  uuid: uuid,
+                  name: name || uuid
+                };
+                if (route.instanceUuid === uuid) {
+                  usageCandidates.unshift(candidateEntry);
+                } else {
+                  usageCandidates.push(candidateEntry);
+                }
+
                 instanceJobs.push(
                   callProxyJson(ctx, uuid, GET_TRAJECTORIES_PATH, '{}')
                     .then(function(parsed) {
@@ -624,19 +865,30 @@ export const INBOX_BRIDGE_SCRIPT = `
               })(rawList[i]);
             }
 
-            return Promise.all(instanceJobs).then(function(instancesPayload) {
-              var latestRoute = parseRouteFromLocation();
-              postToNative({
-                type: 'AGY_INBOX_SNAPSHOT',
-                fetchedAtMs: Date.now(),
-                activeUrl: window.location.href,
-                activeInstanceUuid: latestRoute.instanceUuid,
-                activeCascadeId: latestRoute.cascadeId,
-                instances: instancesPayload,
-                cloudTrajectories: cloudTrajectoriesCache,
-                error: null
-              });
-            });
+            var usageJob = fetchUsageFromCandidates(
+              ctx,
+              usageCandidates,
+              didForceUsageThisRun
+            );
+
+            return Promise.all([Promise.all(instanceJobs), usageJob]).then(
+              function(combined) {
+                var instancesPayload = combined[0];
+                var usagePayload = combined[1];
+                var latestRoute = parseRouteFromLocation();
+                postToNative({
+                  type: 'AGY_INBOX_SNAPSHOT',
+                  fetchedAtMs: Date.now(),
+                  activeUrl: window.location.href,
+                  activeInstanceUuid: latestRoute.instanceUuid,
+                  activeCascadeId: latestRoute.cascadeId,
+                  instances: instancesPayload,
+                  cloudTrajectories: cloudTrajectoriesCache,
+                  usage: usagePayload,
+                  error: null
+                });
+              }
+            );
           });
         })
         .catch(function(err) {
@@ -649,11 +901,17 @@ export const INBOX_BRIDGE_SCRIPT = `
             activeCascadeId: latestRoute.cascadeId,
             instances: [],
             cloudTrajectories: cloudTrajectoriesCache,
+            usage: lastUsageCache,
             error: err && err.message ? String(err.message) : 'Unable to query Antigravity instances'
           });
         })
         .then(function() {
           inFlightRefresh = null;
+          if (pendingForcedUsageRefresh && !didForceUsageThisRun) {
+            pendingForcedUsageRefresh = false;
+            return refresh(true);
+          }
+          pendingForcedUsageRefresh = false;
         });
 
       return inFlightRefresh;
@@ -1007,12 +1265,13 @@ export const INBOX_BRIDGE_SCRIPT = `
 })();
 `;
 
-export function buildInboxRefreshScript(): string {
+export function buildInboxRefreshScript(forceUsage: boolean = true): string {
+  const serializedForce = forceUsage ? 'true' : 'false';
   return `
 (function() {
   try {
     if (window.__agyInboxBridge && typeof window.__agyInboxBridge.refresh === 'function') {
-      window.__agyInboxBridge.refresh();
+      window.__agyInboxBridge.refresh(${serializedForce});
     }
   } catch (_) {}
   return true;

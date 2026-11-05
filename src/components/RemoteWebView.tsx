@@ -217,6 +217,7 @@ const EMPTY_INBOX_SNAPSHOT: InboxSnapshot = {
   fetchedAtMs: 0,
   activeInstanceUuid: null,
   activeCascadeId: null,
+  usage: null,
   error: null,
 };
 
