@@ -20,6 +20,7 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   ANTIGRAVITY_DASHBOARD_URL,
+  DEFAULT_ACTION_NOTIFICATION_MODE,
   DEFAULT_KEEP_ALIVE_MINUTES,
   IOS_KEEP_ALIVE_ENABLED_MINUTES,
   KEEP_ALIVE_DURATION_OPTIONS,
@@ -32,7 +33,11 @@ import {
   InboxSnapshot,
   InboxThreadItem,
 } from '../types/inbox';
-import { AuthFlowStage, KeepAliveMinutes } from '../types/session';
+import {
+  ActionNotificationMode,
+  AuthFlowStage,
+  KeepAliveMinutes,
+} from '../types/session';
 import {
   formatRelativeTime,
   formatResetCountdown,
@@ -63,6 +68,7 @@ const CLOSED_PARK_EXTRA_OFFSET = 16; // Extra off-screen margin so no subpixel b
 export interface LeftNavigationDrawerProps {
   visible: boolean;
   initialMode?: DrawerMode;
+  focusInboxRequestKey?: number;
   isKeyboardVisible?: boolean;
   keyboardBottomPadding?: number;
   stage: AuthFlowStage;
@@ -72,6 +78,7 @@ export interface LeftNavigationDrawerProps {
   urgentAttentionCount: number;
   runningCount: number;
   keepAliveMinutes?: KeepAliveMinutes;
+  actionNotificationMode?: ActionNotificationMode;
   onOpen: (preferredMode?: DrawerMode) => void;
   onClose: () => void;
   onRefreshInbox: () => void;
@@ -79,6 +86,7 @@ export interface LeftNavigationDrawerProps {
   onMarkThreadRead: (thread: InboxThreadItem) => void;
   onMarkAllRead: () => void;
   onChangeKeepAliveMinutes?: (minutes: KeepAliveMinutes) => void;
+  onChangeActionNotificationMode?: (mode: ActionNotificationMode) => void;
   onNavigateToUrl: (targetUrl: string) => void;
   onReloadSession: () => void;
   onSignOut: () => void;
@@ -237,6 +245,7 @@ function getHandleVisualState(params: {
 export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   visible,
   initialMode,
+  focusInboxRequestKey = 0,
   isKeyboardVisible = false,
   keyboardBottomPadding = 0,
   stage,
@@ -246,6 +255,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   urgentAttentionCount,
   runningCount,
   keepAliveMinutes = DEFAULT_KEEP_ALIVE_MINUTES,
+  actionNotificationMode = DEFAULT_ACTION_NOTIFICATION_MODE,
   onOpen,
   onClose,
   onRefreshInbox,
@@ -253,6 +263,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   onMarkThreadRead,
   onMarkAllRead,
   onChangeKeepAliveMinutes,
+  onChangeActionNotificationMode,
   onNavigateToUrl,
   onReloadSession,
   onSignOut,
@@ -353,6 +364,13 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
       setActiveMode(nextMode);
     }
   }, [initialMode, stage, visible]);
+
+  useEffect(() => {
+    if (focusInboxRequestKey > 0) {
+      setActiveMode('inbox');
+      setSelectedTab((prev) => (prev === 'running' ? 'all' : prev));
+    }
+  }, [focusInboxRequestKey]);
 
   useEffect(() => {
     const parkedX = -(drawerWidth + CLOSED_PARK_EXTRA_OFFSET);
@@ -808,10 +826,10 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   const keepAliveHint = isAndroid
     ? keepAliveMinutes > 0
       ? `Active for up to ${keepAliveMinutes}m • Shows a silent stoppable notification and uses slightly more battery.`
-      : 'Off by default (no background battery use) • Pauses in background and reconnects on return.'
+      : 'Off (no background battery use) • Pauses in background and reconnects on return.'
     : keepAliveMinutes > 0
       ? 'Active across quick app switches (~30s iOS limit) • Uses slightly more battery.'
-      : 'Off by default (no background battery use) • Pauses when switching apps and reconnects on return.';
+      : 'Off (no background battery use) • Pauses when switching apps and reconnects on return.';
 
   const handleVisuals = getHandleVisualState({
     stage,
@@ -1757,6 +1775,76 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                 keyboardShouldPersistTaps="handled"
                 showsVerticalScrollIndicator={false}
               >
+                <View style={styles.keepAliveSection}>
+                  <Text style={styles.sectionLabel}>Action Notifications</Text>
+                  <Text style={styles.keepAliveDescription}>
+                    Notify when an agent requires an answer or approval. Updates
+                    with open action count; opens the thread (if 1) or Inbox (if
+                    multiple).
+                  </Text>
+                  <View style={styles.keepAliveRow}>
+                    {(
+                      [
+                        {
+                          key: 'off' as const,
+                          label: 'Off',
+                          a11yLabel: 'Action notifications Off',
+                        },
+                        {
+                          key: 'approvals' as const,
+                          label: 'Approvals',
+                          a11yLabel: 'Action notifications Approvals',
+                        },
+                        {
+                          key: 'all_attention' as const,
+                          label: 'All Attention',
+                          a11yLabel: 'Action notifications All Attention',
+                        },
+                      ] as const
+                    ).map((option) => {
+                      const selected = actionNotificationMode === option.key;
+                      return (
+                        <TouchableOpacity
+                          key={option.key}
+                          style={[
+                            styles.keepAliveChip,
+                            selected ? styles.keepAliveChipSelected : null,
+                          ]}
+                          onPress={() =>
+                            onChangeActionNotificationMode?.(option.key)
+                          }
+                          accessibilityRole="button"
+                          accessibilityState={{ selected }}
+                          accessibilityLabel={option.a11yLabel}
+                        >
+                          <Text
+                            style={[
+                              styles.keepAliveChipText,
+                              selected
+                                ? styles.keepAliveChipTextSelected
+                                : null,
+                            ]}
+                            numberOfLines={1}
+                          >
+                            {option.label}
+                          </Text>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+                  <Text style={styles.keepAliveHint}>
+                    {actionNotificationMode === 'off'
+                      ? 'Notifications disabled.'
+                      : keepAliveMinutes > 0
+                        ? actionNotificationMode === 'approvals'
+                          ? 'Active for blocking approvals & questions • Background updates enabled.'
+                          : 'Active for approvals, questions & unread replies • Background updates enabled.'
+                        : 'Alerts while connected • Select a background timer below to receive alerts after switching apps.'}
+                  </Text>
+                </View>
+
+                <View style={styles.sectionDivider} />
+
                 <View style={styles.keepAliveSection}>
                   <Text style={styles.sectionLabel}>
                     Stay Connected in Background

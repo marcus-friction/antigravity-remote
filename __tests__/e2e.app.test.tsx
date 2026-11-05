@@ -1,6 +1,10 @@
 jest.mock('../src/services/webData', () => ({
   clearWebData: jest.fn(async () => undefined),
   configureNativeKeepAlive: jest.fn(async () => undefined),
+  syncNativeActionNotification: jest.fn(async () => undefined),
+  clearNativeActionNotification: jest.fn(async () => undefined),
+  requestNativeNotificationPermission: jest.fn(async () => true),
+  installNativeDocumentStartScript: jest.fn(async () => undefined),
 }));
 import React from 'react';
 import renderer, { act, ReactTestRenderer } from 'react-test-renderer';
@@ -215,8 +219,11 @@ jest.mock('react-native-webview', () => {
 
 import App from '../App';
 import {
+  clearNativeActionNotification,
   clearWebData,
   configureNativeKeepAlive,
+  requestNativeNotificationPermission,
+  syncNativeActionNotification,
 } from '../src/services/webData';
 import {
   CLOSED_HANDLE_TOUCH_LEFT,
@@ -597,6 +604,15 @@ describe('Session and navigation regressions', () => {
     (configureNativeKeepAlive as jest.Mock)
       .mockReset()
       .mockResolvedValue(undefined);
+    (syncNativeActionNotification as jest.Mock)
+      .mockReset()
+      .mockResolvedValue(undefined);
+    (clearNativeActionNotification as jest.Mock)
+      .mockReset()
+      .mockResolvedValue(undefined);
+    (requestNativeNotificationPermission as jest.Mock)
+      .mockReset()
+      .mockResolvedValue(true);
     await act(async () => {
       tree = renderer.create(<App />);
     });
@@ -885,15 +901,19 @@ describe('Session and navigation regressions', () => {
     expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(false, 0, false);
     expect(mockPermissionsRequest).not.toHaveBeenCalled();
 
-    // Default is Off (0): even after signing in, native keep-alive and POST_NOTIFICATIONS stay inactive until user opts in
+    // Default is 30m paired with Action Notifications: signing in activates keep-alive and requests POST_NOTIFICATIONS
     mockCookieStore.set('https://antigravity.google.com', {
       SID: { name: 'SID', value: 'live-session', domain: '.google.com' },
     });
     await navigate('https://antigravity.google.com/r/workstation-1', false);
 
-    expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(false, 0, false);
-    expect(mockPermissionsCheck).not.toHaveBeenCalled();
-    expect(mockPermissionsRequest).not.toHaveBeenCalled();
+    expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(true, 30, true);
+    expect(mockPermissionsCheck).toHaveBeenCalledWith(
+      'android.permission.POST_NOTIFICATIONS',
+    );
+    expect(mockPermissionsRequest).toHaveBeenCalledWith(
+      'android.permission.POST_NOTIFICATIONS',
+    );
     mockWebViewInjectJavaScript.mockClear();
 
     // Brief iOS/Android inactive peek without backgrounding does not spam wakeup events on authenticated pages
@@ -923,7 +943,7 @@ describe('Session and navigation regressions', () => {
       ),
     ).toBe(true);
 
-    // Open left drawer, switch to Settings mode, verify concise guidance, and opt in ('5m' -> '60m' -> 'Off')
+    // Open left drawer, switch to Settings mode, verify concise guidance, and adjust ('5m' -> '60m' -> 'Off')
     const drawerHandle = tree.root.findAll(
       (node) =>
         node.type === ('TouchableOpacity' as any) &&
@@ -956,9 +976,7 @@ describe('Session and navigation regressions', () => {
         .some(
           (node) =>
             typeof node.props.children === 'string' &&
-            node.props.children.includes(
-              'Off by default (no background battery use)',
-            ),
+            node.props.children.includes('Active for up to 30m'),
         ),
     ).toBe(true);
 
@@ -970,12 +988,6 @@ describe('Session and navigation regressions', () => {
       fiveChip.props.onPress();
     });
     expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(true, 5, true);
-    expect(mockPermissionsCheck).toHaveBeenCalledWith(
-      'android.permission.POST_NOTIFICATIONS',
-    );
-    expect(mockPermissionsRequest).toHaveBeenCalledWith(
-      'android.permission.POST_NOTIFICATIONS',
-    );
 
     const sixtyChip = tree.root
       .findAllByType('TouchableOpacity' as any)
@@ -994,8 +1006,17 @@ describe('Session and navigation regressions', () => {
       offChip.props.onPress();
     });
     expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(false, 0, false);
+    expect(
+      tree.root
+        .findAllByType('Text' as any)
+        .some(
+          (node) =>
+            typeof node.props.children === 'string' &&
+            node.props.children.includes('Off (no background battery use)'),
+        ),
+    ).toBe(true);
 
-    // Verify iOS 'On (~30s)' chip passes a non-zero duration even though DEFAULT_KEEP_ALIVE_MINUTES is 0
+    // Verify iOS 'On (~30s)' chip passes a non-zero duration when toggled back on from Off
     RNPlatform.OS = 'ios';
     await act(async () => {
       tree.update(<App />);
@@ -1009,11 +1030,11 @@ describe('Session and navigation regressions', () => {
     });
     expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(true, 30, true);
 
-    // Sign Out stops keep-alive and resets preference back to default Off (0)
+    // Sign Out stops active native keep-alive immediately and resets preference back to default 30m
     await act(async () => {
       await controls().props.onSignOut();
     });
-    expect(controls().props.keepAliveMinutes).toBe(0);
+    expect(controls().props.keepAliveMinutes).toBe(30);
     expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(false, 0, false);
   });
 
@@ -1165,10 +1186,12 @@ describe('Session and navigation regressions', () => {
     });
 
     expect(webView().props.source.uri).toBe('https://antigravity.google.com');
-    expect(controls().props.keepAliveMinutes).toBe(0);
+    expect(controls().props.keepAliveMinutes).toBe(30);
+    expect(controls().props.actionNotificationMode).toBe('all_attention');
     expect(mockSecureStoreData.has('agy_session_cleanup_pending')).toBe(false);
     expect(mockSecureStoreData.has('agy_last_active_url_v1')).toBe(false);
     expect(mockSecureStoreData.has('agy_keep_alive_minutes_v1')).toBe(false);
+    expect(mockSecureStoreData.has('agy_action_notifications_v1')).toBe(false);
   });
 
   it('auto-recovers killed WebView render processes at the active URL and caps crash loops', async () => {
@@ -1796,5 +1819,198 @@ describe('Session and navigation regressions', () => {
     });
     expect(controls().props.attentionCount).toBe(0);
     expect(controls().props.snapshot.threads).toHaveLength(0);
+  });
+
+  it('syncs configurable Action Notifications (1 -> thread deep link, 2+ -> Inbox deep link), background unread alerts, and notification taps', async () => {
+    const RNPlatform = require('react-native').Platform;
+    RNPlatform.OS = 'android';
+    RNPlatform.Version = 34;
+
+    mockCookieStore.set('https://antigravity.google.com', {
+      SID: { name: 'SID', value: 'notif-session', domain: '.google.com' },
+    });
+    await navigate(
+      'https://antigravity.google.com/r/workstation-1?p=c%2Factive-local',
+      false,
+    );
+
+    const deliverSnapshot = async (
+      approvalPresent: boolean,
+      unreadRemotePresent: boolean,
+      activeModifiedTime = '2026-11-04T14:50:00Z',
+    ) => {
+      const localSummaries: Record<string, any> = {
+        'active-local': {
+          summary: 'Open foreground thread',
+          status: 'CASCADE_RUN_STATUS_IDLE',
+          lastModifiedTime: activeModifiedTime,
+          lastUserInputTime: '2026-11-04T14:00:00Z',
+        },
+      };
+      if (approvalPresent) {
+        localSummaries['approval-local'] = {
+          summary: 'Approve production deploy',
+          status: 'CASCADE_RUN_STATUS_RUNNING',
+          waitingSteps: [
+            { step: { runCommand: { commandLine: './deploy.sh' } } },
+          ],
+          lastModifiedTime: '2026-11-04T15:05:00Z',
+        };
+      }
+
+      const remoteSummaries: Record<string, any> = {};
+      if (unreadRemotePresent) {
+        remoteSummaries['unread-remote'] = {
+          summary: 'Benchmark summary ready',
+          status: 'CASCADE_RUN_STATUS_IDLE',
+          lastModifiedTime: '2026-11-04T15:02:00Z',
+          lastUserInputTime: '2026-11-04T14:00:00Z',
+        };
+      }
+
+      await act(async () => {
+        webView().props.onMessage({
+          nativeEvent: {
+            url: 'https://antigravity.google.com/r/workstation-1?p=c%2Factive-local',
+            data: JSON.stringify({
+              type: 'AGY_INBOX_SNAPSHOT',
+              fetchedAtMs: 1_762_269_000_000,
+              activeUrl:
+                'https://antigravity.google.com/r/workstation-1?p=c%2Factive-local',
+              activeInstanceUuid: 'workstation-1',
+              activeCascadeId: 'active-local',
+              instances: [
+                {
+                  uuid: 'workstation-1',
+                  name: 'Primary Box',
+                  status: 1,
+                  trajectories: {
+                    trajectorySummaries: localSummaries,
+                  },
+                },
+                {
+                  uuid: 'workstation-2',
+                  name: 'Secondary Box',
+                  status: 1,
+                  trajectories: {
+                    trajectorySummaries: remoteSummaries,
+                  },
+                },
+              ],
+            }),
+          },
+        });
+      });
+    };
+
+    // 1. Single open action (`approval-local`) -> count = 1, deepLinkUrl points directly to that thread
+    (syncNativeActionNotification as jest.Mock).mockClear();
+    await deliverSnapshot(true, false);
+    expect(syncNativeActionNotification).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        count: 1,
+        title: '1 action open • Primary Box',
+        deepLinkUrl:
+          'antigravity-remote://r/workstation-1?p=c%2Fapproval-local',
+        shouldAlert: true,
+      }),
+    );
+
+    // 2. Second open action arrives (`unread-remote`) -> updates to count = 2, deepLinkUrl points to `antigravity-remote://inbox`
+    await deliverSnapshot(true, true);
+    expect(syncNativeActionNotification).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        count: 2,
+        title: '2 actions open',
+        deepLinkUrl: 'antigravity-remote://inbox',
+        shouldAlert: true,
+      }),
+    );
+
+    // 3. Tapping the multi-action notification (`antigravity-remote://inbox`) opens the Sidebar directly to Inbox
+    expect(controls().props.visible).toBe(false);
+    await act(async () => {
+      for (const listener of mockLinkingListeners) {
+        listener({ url: 'antigravity-remote://inbox' });
+      }
+    });
+    expect(controls().props.visible).toBe(true);
+    expect(controls().props.initialMode).toBe('inbox');
+
+    // 4. Switch Settings -> Action Notifications -> 'Approvals' -> updates count silently (`shouldAlert: false`) to 1 (thread deep link),
+    // and switching 'Off' clears the OS notification; turning back on while Keep-Alive is Off auto-pairs 30m Keep-Alive
+    const settingsBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((node) => node.props.accessibilityLabel === 'Drawer mode Settings')!;
+    await act(async () => {
+      settingsBtn.props.onPress();
+    });
+
+    const approvalsModeChip = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find(
+        (node) =>
+          node.props.accessibilityLabel === 'Action notifications Approvals',
+      )!;
+    await act(async () => {
+      approvalsModeChip.props.onPress();
+    });
+    expect(syncNativeActionNotification).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        count: 1,
+        deepLinkUrl:
+          'antigravity-remote://r/workstation-1?p=c%2Fapproval-local',
+        shouldAlert: false,
+      }),
+    );
+
+    const keepAliveOffChip = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((node) => node.props.accessibilityLabel === 'Keep-alive Off')!;
+    const notifOffChip = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find(
+        (node) => node.props.accessibilityLabel === 'Action notifications Off',
+      )!;
+    (clearNativeActionNotification as jest.Mock).mockClear();
+    await act(async () => {
+      keepAliveOffChip.props.onPress();
+      notifOffChip.props.onPress();
+    });
+    expect(controls().props.keepAliveMinutes).toBe(0);
+    expect(controls().props.actionNotificationMode).toBe('off');
+    expect(clearNativeActionNotification).toHaveBeenCalled();
+
+    const allAttentionChip = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find(
+        (node) =>
+          node.props.accessibilityLabel ===
+          'Action notifications All Attention',
+      )!;
+    await act(async () => {
+      allAttentionChip.props.onPress();
+    });
+    expect(controls().props.actionNotificationMode).toBe('all_attention');
+    expect(controls().props.keepAliveMinutes).toBe(30);
+
+    // 5. Tapping a single-action thread notification (`antigravity-remote://r/workstation-2?p=c%2Funread-remote`)
+    // closes the open Sidebar and navigates directly to that thread
+    await act(async () => {
+      for (const listener of mockLinkingListeners) {
+        listener({
+          url: 'antigravity-remote://r/workstation-2?p=c%2Funread-remote',
+        });
+      }
+    });
+    expect(controls().props.visible).toBe(false);
+    expect(webView().props.source.uri).toBe(
+      'https://antigravity.google.com/r/workstation-2?p=c%2Funread-remote',
+    );
+
+    // 6. Resolving all open actions clears the OS notification automatically
+    (clearNativeActionNotification as jest.Mock).mockClear();
+    await deliverSnapshot(false, false);
+    expect(clearNativeActionNotification).toHaveBeenCalled();
   });
 });

@@ -1,8 +1,44 @@
 import ExpoModulesCore
 import UIKit
+import UserNotifications
 import WebKit
 
+private final class ActionNotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
+  static let shared = ActionNotificationDelegate()
+  static let deepLinkKey = "agyDeepLink"
+  static let shouldAlertKey = "agyShouldAlert"
+  static let allowedPrefix = "antigravity-remote://"
+
+  func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    willPresent notification: UNNotification,
+    withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+  ) {
+    let shouldAlert = (notification.request.content.userInfo[Self.shouldAlertKey] as? Bool) ?? false
+    if shouldAlert {
+      completionHandler([.banner, .list, .sound, .badge])
+    } else {
+      completionHandler([.list, .badge])
+    }
+  }
+
+  func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    didReceive response: UNNotificationResponse,
+    withCompletionHandler completionHandler: @escaping () -> Void
+  ) {
+    let rawLink = response.notification.request.content.userInfo[Self.deepLinkKey] as? String
+    if let link = rawLink, link.hasPrefix(Self.allowedPrefix), let url = URL(string: link) {
+      DispatchQueue.main.async {
+        UIApplication.shared.open(url, options: [:], completionHandler: nil)
+      }
+    }
+    completionHandler()
+  }
+}
+
 public class RemoteSessionModule: Module {
+  private static let actionNotificationIdentifier = "agy_action_required"
   private var keepAliveEnabled: Bool = false
   private var keepAliveMinutes: Int = 0
   private var sessionActive: Bool = false
@@ -60,9 +96,26 @@ public class RemoteSessionModule: Module {
   public func definition() -> ModuleDefinition {
     Name("RemoteSession")
 
+    OnCreate {
+      self.runOnMain {
+        let center = UNUserNotificationCenter.current()
+        if center.delegate == nil {
+          center.delegate = ActionNotificationDelegate.shared
+        }
+      }
+    }
+
     AsyncFunction("clearWebData") { (promise: Promise) in
       self.sessionActive = false
       self.endBackgroundKeepAliveTask()
+      let center = UNUserNotificationCenter.current()
+      center.removeDeliveredNotifications(withIdentifiers: [Self.actionNotificationIdentifier])
+      center.removePendingNotificationRequests(withIdentifiers: [Self.actionNotificationIdentifier])
+      if #available(iOS 16.0, *) {
+        center.setBadgeCount(0) { _ in }
+      } else {
+        UIApplication.shared.applicationIconBadgeNumber = 0
+      }
       WKWebsiteDataStore.default().removeData(
         ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
         modifiedSince: Date(timeIntervalSince1970: 0)
@@ -81,6 +134,64 @@ public class RemoteSessionModule: Module {
     AsyncFunction("installDocumentStartScript") { (_: String) in
       // iOS injects document-start subframe scripts via WKUserScript
       // (`injectedJavaScriptBeforeContentLoadedForMainFrameOnly={false}`).
+    }.runOnQueue(.main)
+
+    AsyncFunction("syncActionNotification") {
+      (title: String, body: String, expandedBody: String, count: Int, deepLinkUrl: String, shouldAlert: Bool) in
+      let center = UNUserNotificationCenter.current()
+      if center.delegate == nil {
+        center.delegate = ActionNotificationDelegate.shared
+      }
+      guard count > 0, deepLinkUrl.hasPrefix(ActionNotificationDelegate.allowedPrefix) else {
+        center.removeDeliveredNotifications(withIdentifiers: [Self.actionNotificationIdentifier])
+        center.removePendingNotificationRequests(withIdentifiers: [Self.actionNotificationIdentifier])
+        if #available(iOS 16.0, *) {
+          center.setBadgeCount(0) { _ in }
+        } else {
+          UIApplication.shared.applicationIconBadgeNumber = 0
+        }
+        return
+      }
+
+      let content = UNMutableNotificationContent()
+      content.title = title
+      content.body = expandedBody.isEmpty ? body : expandedBody
+      content.badge = NSNumber(value: count)
+      if shouldAlert {
+        content.sound = .default
+      }
+      content.userInfo = [
+        ActionNotificationDelegate.deepLinkKey: deepLinkUrl,
+        ActionNotificationDelegate.shouldAlertKey: shouldAlert,
+      ]
+
+      let request = UNNotificationRequest(
+        identifier: Self.actionNotificationIdentifier,
+        content: content,
+        trigger: nil
+      )
+      center.add(request, withCompletionHandler: nil)
+    }.runOnQueue(.main)
+
+    AsyncFunction("clearActionNotification") {
+      let center = UNUserNotificationCenter.current()
+      center.removeDeliveredNotifications(withIdentifiers: [Self.actionNotificationIdentifier])
+      center.removePendingNotificationRequests(withIdentifiers: [Self.actionNotificationIdentifier])
+      if #available(iOS 16.0, *) {
+        center.setBadgeCount(0) { _ in }
+      } else {
+        UIApplication.shared.applicationIconBadgeNumber = 0
+      }
+    }.runOnQueue(.main)
+
+    AsyncFunction("requestNotificationPermission") { (promise: Promise) in
+      let center = UNUserNotificationCenter.current()
+      if center.delegate == nil {
+        center.delegate = ActionNotificationDelegate.shared
+      }
+      center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
+        promise.resolve(granted)
+      }
     }.runOnQueue(.main)
 
     OnAppEntersBackground {

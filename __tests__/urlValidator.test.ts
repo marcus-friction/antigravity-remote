@@ -9,6 +9,7 @@ import {
   isGoogleCookieErrorUrl,
   isInternalWebViewSchemeUrl,
   parseHandoffInput,
+  parseIncomingAppLink,
   validateNavigationUrl,
 } from '../src/utils/urlValidator';
 import {
@@ -236,6 +237,28 @@ describe('urlValidator', () => {
       expect(parseHandoffInput('antigravity-remote://')).toBe(
         'https://antigravity.google.com',
       );
+
+      expect(parseHandoffInput('antigravity-remote://inbox')).toBeNull();
+    });
+
+    it('parses incoming notification and app links into Inbox vs thread navigation actions', () => {
+      expect(parseIncomingAppLink('antigravity-remote://inbox')).toEqual({
+        kind: 'open_inbox',
+      });
+      expect(parseIncomingAppLink('antigravity-remote://inbox/')).toEqual({
+        kind: 'open_inbox',
+      });
+      expect(
+        parseIncomingAppLink(
+          'antigravity-remote://r/workstation-primary?p=c%2Fthread-42',
+        ),
+      ).toEqual({
+        kind: 'navigate',
+        targetUrl:
+          'https://antigravity.google.com/r/workstation-primary?p=c%2Fthread-42',
+      });
+      expect(parseIncomingAppLink('https://evil.example.com/r/123')).toBeNull();
+      expect(parseIncomingAppLink(null)).toBeNull();
     });
 
     it('converts a bare instance hostname into a full handoff URL', () => {

@@ -506,6 +506,7 @@ function parseTrajectoriesForSource(params: {
   accountPrefix: string;
   preservedQueryParams: Readonly<Record<string, string>>;
   locallyReadAtByThreadId: Readonly<Record<string, number>>;
+  isAppForeground?: boolean;
 }): InboxThreadItem[] {
   const {
     source,
@@ -517,6 +518,7 @@ function parseTrajectoriesForSource(params: {
     accountPrefix,
     preservedQueryParams,
     locallyReadAtByThreadId,
+    isAppForeground = true,
   } = params;
 
   const map = unwrapTrajectoryMap(rawTrajectories);
@@ -753,7 +755,12 @@ function parseTrajectoriesForSource(params: {
       attentionKind = 'error';
       needsAttention = true;
       attentionReason = terminationFailure;
-    } else if (!isRunning && !killed && !isActiveThread && isUnread) {
+    } else if (
+      !isRunning &&
+      !killed &&
+      !(isAppForeground && isActiveThread) &&
+      isUnread
+    ) {
       attentionKind = 'unread';
       needsAttention = true;
       attentionReason = 'Finished — unread updates';
@@ -1503,6 +1510,7 @@ export function buildInboxSnapshot(
   message: Extract<InboxBridgeMessage, { type: 'AGY_INBOX_SNAPSHOT' }>,
   locallyReadAtByThreadId: Readonly<Record<string, number>> = {},
   fallbackActiveUrl?: string | null,
+  isAppForeground: boolean = true,
 ): InboxSnapshot {
   const referenceUrl = message.activeUrl ?? fallbackActiveUrl ?? null;
   const routeFromUrl = extractActiveRouteFromUrl(referenceUrl);
@@ -1567,6 +1575,7 @@ export function buildInboxSnapshot(
           accountPrefix,
           preservedQueryParams,
           locallyReadAtByThreadId,
+          isAppForeground,
         }),
       );
     }
@@ -1584,6 +1593,7 @@ export function buildInboxSnapshot(
         accountPrefix,
         preservedQueryParams,
         locallyReadAtByThreadId,
+        isAppForeground,
       }),
     );
   }
@@ -1634,10 +1644,15 @@ export function applyLocalStateToSnapshot(
     activeInstanceUuid: string | null;
     activeCascadeId: string | null;
     locallyReadAtByThreadId: Readonly<Record<string, number>>;
+    isAppForeground?: boolean;
   },
 ): InboxSnapshot {
-  const { activeInstanceUuid, activeCascadeId, locallyReadAtByThreadId } =
-    params;
+  const {
+    activeInstanceUuid,
+    activeCascadeId,
+    locallyReadAtByThreadId,
+    isAppForeground = true,
+  } = params;
 
   const updatedThreads = snapshot.threads.map((thread) => {
     const isActiveThread =
@@ -1652,7 +1667,7 @@ export function applyLocalStateToSnapshot(
 
     if (
       thread.attentionKind === 'unread' &&
-      (isActiveThread || isLocallyCleared)
+      ((isAppForeground && isActiveThread) || isLocallyCleared)
     ) {
       return {
         ...thread,

@@ -25,6 +25,8 @@ export type AuthFlowStage =
 
 export type KeepAliveMinutes = 0 | 5 | 15 | 30 | 60;
 
+export type ActionNotificationMode = 'off' | 'approvals' | 'all_attention';
+
 export interface UrlValidationResult {
   isValid: boolean;
   normalizedUrl: string | null;

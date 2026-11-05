@@ -4,23 +4,26 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { StyleSheet } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { RemoteWebView } from './src/components/RemoteWebView';
-import { parseHandoffInput } from './src/utils/urlValidator';
+import { parseIncomingAppLink } from './src/utils/urlValidator';
 
 export default function App(): React.JSX.Element {
   const [incomingDeepLinkUrl, setIncomingDeepLinkUrl] = useState<string | null>(
     null
   );
+  const [pendingOpenInbox, setPendingOpenInbox] = useState<boolean>(false);
   const [isInitialUrlResolved, setIsInitialUrlResolved] =
     useState<boolean>(false);
 
   const handleIncomingUrl = useCallback((rawUrl: string | null) => {
-    if (!rawUrl) {
+    const parsedAction = parseIncomingAppLink(rawUrl);
+    if (!parsedAction) {
       return;
     }
-    const parsedTarget = parseHandoffInput(rawUrl);
-    if (parsedTarget) {
-      setIncomingDeepLinkUrl(parsedTarget);
+    if (parsedAction.kind === 'open_inbox') {
+      setPendingOpenInbox(true);
+      return;
     }
+    setIncomingDeepLinkUrl(parsedAction.targetUrl);
   }, []);
 
   useEffect(() => {
@@ -55,6 +58,10 @@ export default function App(): React.JSX.Element {
     setIncomingDeepLinkUrl(null);
   }, []);
 
+  const handleOpenInboxConsumed = useCallback(() => {
+    setPendingOpenInbox(false);
+  }, []);
+
   return (
     <SafeAreaProvider>
       <SafeAreaView
@@ -64,8 +71,10 @@ export default function App(): React.JSX.Element {
         <StatusBar style="light" backgroundColor="#0B0F17" />
         <RemoteWebView
           incomingDeepLinkUrl={incomingDeepLinkUrl}
+          pendingOpenInbox={pendingOpenInbox}
           isInitialUrlResolved={isInitialUrlResolved}
           onDeepLinkConsumed={handleDeepLinkConsumed}
+          onOpenInboxConsumed={handleOpenInboxConsumed}
         />
       </SafeAreaView>
     </SafeAreaProvider>

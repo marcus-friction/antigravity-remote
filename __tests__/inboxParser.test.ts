@@ -5,6 +5,10 @@ import {
   buildMarkThreadReadScript,
 } from '../src/services/inboxBridge';
 import {
+  buildActionNotificationSyncState,
+  buildThreadNotificationDeepLink,
+} from '../src/utils/actionNotification';
+import {
   applyLocalStateToSnapshot,
   buildInboxSnapshot,
   describeWaitingSteps,
@@ -697,5 +701,163 @@ describe('inboxParser', () => {
     await sandboxWindow.__agyInboxBridge.refresh();
     expect(postedToNative[0].type).toBe('AGY_INBOX_SNAPSHOT');
     expect(postedToNative[0].activeCascadeId).toBe('cascade-99');
+  });
+
+  it('builds single-thread vs multi-action Inbox notification payloads, updates silently on decrements, and catches unread replies while backgrounded', () => {
+    expect(
+      buildThreadNotificationDeepLink(
+        'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-7',
+      ),
+    ).toBe('antigravity-remote://r/workstation-1?p=c%2Fthread-7');
+    expect(
+      buildThreadNotificationDeepLink('https://evil.example.com/r/box'),
+    ).toBeNull();
+
+    const snapshotMsg = {
+      type: 'AGY_INBOX_SNAPSHOT' as const,
+      fetchedAtMs: 1_762_265_000_000,
+      activeUrl: 'https://antigravity.google.com/r/box-1?p=c%2Factive-thread',
+      activeInstanceUuid: 'box-1',
+      activeCascadeId: 'active-thread',
+      instances: [
+        {
+          uuid: 'box-1',
+          name: 'Workstation One',
+          status: 1,
+          trajectories: {
+            trajectorySummaries: {
+              'active-thread': {
+                summary: 'Open foreground task',
+                status: 'CASCADE_RUN_STATUS_IDLE',
+                lastModifiedTime: '2026-11-04T15:00:00Z',
+                lastUserInputTime: '2026-11-04T14:00:00Z',
+              },
+              'approval-thread': {
+                summary: 'Run migration',
+                status: 'CASCADE_RUN_STATUS_RUNNING',
+                waitingSteps: [
+                  { step: { runCommand: { commandLine: 'npm run migrate' } } },
+                ],
+                lastModifiedTime: '2026-11-04T15:05:00Z',
+              },
+            },
+          },
+        },
+        {
+          uuid: 'box-2',
+          name: 'Workstation Two',
+          status: 1,
+          trajectories: {
+            trajectorySummaries: {
+              'unread-thread': {
+                summary: 'Draft release notes',
+                status: 'CASCADE_RUN_STATUS_IDLE',
+                lastModifiedTime: '2026-11-04T15:02:00Z',
+                lastUserInputTime: '2026-11-04T14:00:00Z',
+              },
+            },
+          },
+        },
+      ],
+    };
+
+    // 1. In foreground (`isAppForeground = true`), `active-thread` is suppressed as unread,
+    // leaving 2 open background actions (`approval-thread` + `unread-thread`).
+    const fgSnap = buildInboxSnapshot(
+      snapshotMsg,
+      {},
+      snapshotMsg.activeUrl,
+      true,
+    );
+    expect(
+      fgSnap.threads.find((t) => t.cascadeId === 'active-thread')?.attentionKind,
+    ).toBe('idle');
+
+    // Mode = 'approvals': only `approval-thread` counts -> count === 1 -> direct thread deep link!
+    const approvalsOnly = buildActionNotificationSyncState({
+      stage: 'authenticated',
+      mode: 'approvals',
+      threads: fgSnap.threads,
+      isAppForeground: true,
+      isDrawerOpen: false,
+      previousOpenThreadIds: new Set(),
+    });
+    expect(approvalsOnly.notification).toMatchObject({
+      count: 1,
+      title: '1 action open • Workstation One',
+      deepLinkUrl: 'antigravity-remote://r/box-1?p=c%2Fapproval-thread',
+      shouldAlert: true,
+    });
+
+    // Mode = 'all_attention': 2 open actions -> count === 2 -> Inbox deep link!
+    const twoOpen = buildActionNotificationSyncState({
+      stage: 'authenticated',
+      mode: 'all_attention',
+      threads: fgSnap.threads,
+      isAppForeground: true,
+      isDrawerOpen: false,
+      previousOpenThreadIds: approvalsOnly.openThreadIds,
+    });
+    expect(twoOpen.notification).toMatchObject({
+      count: 2,
+      title: '2 actions open',
+      deepLinkUrl: 'antigravity-remote://inbox',
+      shouldAlert: true,
+    });
+
+    // Resolving 1 of the 2 actions (`2 -> 1`) updates silently (`shouldAlert: false`) and switches deep link back to the single remaining thread!
+    const remainingOne = fgSnap.threads.filter(
+      (t) => t.cascadeId !== 'unread-thread',
+    );
+    const decremented = buildActionNotificationSyncState({
+      stage: 'authenticated',
+      mode: 'all_attention',
+      threads: remainingOne,
+      isAppForeground: true,
+      isDrawerOpen: false,
+      previousOpenThreadIds: twoOpen.openThreadIds,
+    });
+    expect(decremented.notification).toMatchObject({
+      count: 1,
+      deepLinkUrl: 'antigravity-remote://r/box-1?p=c%2Fapproval-thread',
+      shouldAlert: false,
+    });
+
+    // 2. While backgrounded (`isAppForeground = false`), a finished reply on `active-thread` DOES count as unread (`count === 3`)!
+    const bgSnap = buildInboxSnapshot(
+      snapshotMsg,
+      {},
+      snapshotMsg.activeUrl,
+      false,
+    );
+    expect(
+      bgSnap.threads.find((t) => t.cascadeId === 'active-thread')?.attentionKind,
+    ).toBe('unread');
+    const bgSync = buildActionNotificationSyncState({
+      stage: 'authenticated',
+      mode: 'all_attention',
+      threads: bgSnap.threads,
+      isAppForeground: false,
+      isDrawerOpen: false,
+      previousOpenThreadIds: twoOpen.openThreadIds,
+    });
+    expect(bgSync.notification).toMatchObject({
+      count: 3,
+      title: '3 actions open',
+      deepLinkUrl: 'antigravity-remote://inbox',
+      shouldAlert: true,
+    });
+
+    // Mode = 'off' clears notification (`null`)
+    expect(
+      buildActionNotificationSyncState({
+        stage: 'authenticated',
+        mode: 'off',
+        threads: bgSnap.threads,
+        isAppForeground: false,
+        isDrawerOpen: false,
+        previousOpenThreadIds: bgSync.openThreadIds,
+      }).notification,
+    ).toBeNull();
   });
 });

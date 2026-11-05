@@ -2,13 +2,16 @@ import CookieManager, { Cookie } from '@preeternal/react-native-cookie-manager';
 import * as SecureStore from 'expo-secure-store';
 import { Platform } from 'react-native';
 import {
+  ACTION_NOTIFICATION_MODES,
   ANTIGRAVITY_DASHBOARD_URL,
   COOKIE_SYNC_URLS,
+  DEFAULT_ACTION_NOTIFICATION_MODE,
   DEFAULT_KEEP_ALIVE_MINUTES,
   KEEP_ALIVE_DURATION_OPTIONS,
   LEGACY_SECURE_STORE_CHUNK_PREFIX_V1,
   LEGACY_SECURE_STORE_META_KEY_V1,
   MAX_COOKIE_CHUNKS,
+  SECURE_STORE_ACTION_NOTIFICATIONS_KEY,
   SECURE_STORE_CHUNK_PREFIX,
   SECURE_STORE_CHUNK_SIZE,
   SECURE_STORE_KEEP_ALIVE_MINUTES_KEY,
@@ -19,6 +22,7 @@ import {
   SECURE_STORE_MIGRATION_V2_KEY,
 } from '../constants/config';
 import {
+  ActionNotificationMode,
   CookieVaultMetadata,
   KeepAliveMinutes,
   PersistedCookieRecord,
@@ -548,6 +552,52 @@ export async function getKeepAliveMinutes(): Promise<KeepAliveMinutes> {
   return DEFAULT_KEEP_ALIVE_MINUTES;
 }
 
+function isValidActionNotificationMode(
+  value: string,
+): value is ActionNotificationMode {
+  return (ACTION_NOTIFICATION_MODES as readonly string[]).includes(value);
+}
+
+export function saveActionNotificationMode(
+  mode: ActionNotificationMode,
+): Promise<void> {
+  const generation = sessionGeneration;
+  return serialize(async () => {
+    if (!isCurrent(generation) || !isValidActionNotificationMode(mode)) return;
+    try {
+      await SecureStore.setItemAsync(
+        SECURE_STORE_ACTION_NOTIFICATIONS_KEY,
+        mode,
+        SECURE_STORE_OPTIONS,
+      );
+    } catch {
+      /* Default notification preference still applies if storage is unavailable. */
+    }
+  });
+}
+
+export async function getActionNotificationMode(): Promise<ActionNotificationMode> {
+  try {
+    const pendingSignOut = await SecureStore.getItemAsync(
+      SECURE_STORE_SIGN_OUT_KEY,
+      SECURE_STORE_OPTIONS,
+    );
+    if (pendingSignOut) {
+      return DEFAULT_ACTION_NOTIFICATION_MODE;
+    }
+    const saved = await SecureStore.getItemAsync(
+      SECURE_STORE_ACTION_NOTIFICATIONS_KEY,
+      SECURE_STORE_OPTIONS,
+    );
+    if (saved !== null && isValidActionNotificationMode(saved)) {
+      return saved;
+    }
+  } catch {
+    /* Fall back to default notification mode if SecureStore read fails. */
+  }
+  return DEFAULT_ACTION_NOTIFICATION_MODE;
+}
+
 async function clearSessionStores(): Promise<void> {
   // Establish intent before deleting anything so a process kill cannot reopen
   // a partly cleared session. Continue all cleanup if the marker write fails.
@@ -582,6 +632,7 @@ async function clearSessionStores(): Promise<void> {
     LEGACY_SECURE_STORE_META_KEY_V1,
     SECURE_STORE_LAST_URL_KEY,
     SECURE_STORE_KEEP_ALIVE_MINUTES_KEY,
+    SECURE_STORE_ACTION_NOTIFICATIONS_KEY,
   ]) {
     operations.push(() =>
       SecureStore.deleteItemAsync(key, SECURE_STORE_OPTIONS),

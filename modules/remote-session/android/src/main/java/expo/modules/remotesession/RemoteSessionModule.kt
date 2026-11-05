@@ -2,7 +2,14 @@ package expo.modules.remotesession
 
 import android.app.Activity
 import android.app.Application
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
 import android.graphics.Rect
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -250,6 +257,88 @@ class RemoteSessionModule : Module() {
     RemoteKeepAliveService.stop(context)
   }
 
+  private fun ensureActionNotificationChannel(context: Context) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+    val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+    if (manager.getNotificationChannel(ACTION_CHANNEL_ID) != null) return
+
+    val channel = NotificationChannel(
+      ACTION_CHANNEL_ID,
+      "Action Required",
+      NotificationManager.IMPORTANCE_HIGH
+    ).apply {
+      description = "Alerts when an Antigravity agent requires an answer or approval."
+      enableVibration(false)
+      setShowBadge(true)
+    }
+    manager.createNotificationChannel(channel)
+  }
+
+  private fun postOrUpdateActionNotification(
+    title: String,
+    body: String,
+    expandedBody: String,
+    count: Int,
+    deepLinkUrl: String,
+    shouldAlert: Boolean
+  ) {
+    val context = appContext.reactContext ?: appContext.currentActivity?.applicationContext ?: return
+    if (count <= 0) {
+      cancelActionNotification()
+      return
+    }
+    if (!deepLinkUrl.startsWith(CUSTOM_DEEP_LINK_PREFIX)) {
+      return
+    }
+    val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && !manager.areNotificationsEnabled()) {
+      return
+    }
+    ensureActionNotificationChannel(context)
+
+    val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      Notification.Builder(context, ACTION_CHANNEL_ID)
+    } else {
+      @Suppress("DEPRECATION")
+      Notification.Builder(context)
+        .setPriority(Notification.PRIORITY_HIGH)
+        .setDefaults(Notification.DEFAULT_SOUND or Notification.DEFAULT_LIGHTS)
+    }
+
+    val viewIntent = Intent(Intent.ACTION_VIEW, Uri.parse(deepLinkUrl)).apply {
+      `package` = context.packageName
+      addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+    }
+    val contentPendingIntent = PendingIntent.getActivity(
+      context,
+      ACTION_NOTIFICATION_ID,
+      viewIntent,
+      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+    )
+
+    builder
+      .setSmallIcon(R.drawable.ic_stat_keep_alive)
+      .setContentTitle(title)
+      .setContentText(body)
+      .setStyle(Notification.BigTextStyle().bigText(expandedBody.ifBlank { body }))
+      .setNumber(count)
+      .setAutoCancel(true)
+      .setOnlyAlertOnce(!shouldAlert)
+      .setCategory(Notification.CATEGORY_MESSAGE)
+      .setVisibility(Notification.VISIBILITY_PRIVATE)
+      .setContentIntent(contentPendingIntent)
+
+    runCatching {
+      manager.notify(ACTION_NOTIFICATION_ID, builder.build())
+    }
+  }
+
+  private fun cancelActionNotification() {
+    val context = appContext.reactContext ?: appContext.currentActivity?.applicationContext ?: return
+    val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+    runCatching { manager.cancel(ACTION_NOTIFICATION_ID) }
+  }
+
   override fun definition() = ModuleDefinition {
     Name("RemoteSession")
 
@@ -275,6 +364,7 @@ class RemoteSessionModule : Module() {
         stoppedForCurrentBackgroundStay = false
         desiredDocumentStartScript = null
         removeInstalledDocumentStartScripts()
+        cancelActionNotification()
         stopKeepAliveServiceIfRunning()
         applyWebViewKeepAlivePolicy(
           protectInBackground = false,
@@ -321,6 +411,37 @@ class RemoteSessionModule : Module() {
       }
     }.runOnQueue(Queues.MAIN)
 
+    AsyncFunction("syncActionNotification") {
+      title: String,
+      body: String,
+      expandedBody: String,
+      count: Int,
+      deepLinkUrl: String,
+      shouldAlert: Boolean ->
+      postOrUpdateActionNotification(
+        title = title,
+        body = body,
+        expandedBody = expandedBody,
+        count = count,
+        deepLinkUrl = deepLinkUrl,
+        shouldAlert = shouldAlert
+      )
+    }.runOnQueue(Queues.MAIN)
+
+    AsyncFunction("clearActionNotification") {
+      cancelActionNotification()
+    }.runOnQueue(Queues.MAIN)
+
+    AsyncFunction("requestNotificationPermission") {
+      val context = appContext.reactContext ?: appContext.currentActivity?.applicationContext
+      val manager = context?.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+        manager?.areNotificationsEnabled() ?: false
+      } else {
+        true
+      }
+    }.runOnQueue(Queues.MAIN)
+
     OnActivityEntersForeground {
       stoppedForCurrentBackgroundStay = false
       runOnMain {
@@ -354,6 +475,9 @@ class RemoteSessionModule : Module() {
   }
 
   companion object {
+    private const val ACTION_CHANNEL_ID = "agy_remote_action_required"
+    private const val ACTION_NOTIFICATION_ID = 4202
+    private const val CUSTOM_DEEP_LINK_PREFIX = "antigravity-remote://"
     private val ALLOWED_DOCUMENT_START_ORIGINS = setOf(
       "https://antigravity.google.com",
       "https://antigravity.static.usercontent.goog"

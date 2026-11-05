@@ -35,7 +35,7 @@ You have full control over all locally stored session data at any time:
 
 ## 5. Permissions
 
-Antigravity Remote requests standard network access (`android.permission.INTERNET`) to load `https://antigravity.google.com`, along with foreground-service, wake-lock, and notification permissions (`FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_SPECIAL_USE`, `WAKE_LOCK`, and `POST_NOTIFICATIONS`) used solely when you opt in to keep your active signed-in remote session connected for a bounded configurable duration (`Off` by default; user-configurable in Settings to `5m`, `15m`, `30m`, or `60m`) while multitasking, with an ongoing status notification and **Stop Keep-Alive** control. It does not request access to your camera, microphone, contacts, location, photos, or external storage.
+Antigravity Remote requests standard network access (`android.permission.INTERNET`) to load `https://antigravity.google.com`, along with foreground-service, wake-lock, and notification permissions (`FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_SPECIAL_USE`, `WAKE_LOCK`, and `POST_NOTIFICATIONS`) used on-device to surface configurable open-action notifications (`Off`, `Approvals`, or `All Attention` in Settings) and keep active signed-in remote sessions connected for a bounded configurable duration (`30m` by default; user-configurable in Settings to `Off`, `5m`, `15m`, `30m`, or `60m`) while multitasking, with an ongoing status notification and **Stop Keep-Alive** control. All notification evaluation happens locally on your device without any developer push server. It does not request access to your camera, microphone, contacts, location, photos, or external storage.
 
 ## 6. Changes to This Privacy Policy
 

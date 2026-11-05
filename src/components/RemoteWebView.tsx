@@ -24,6 +24,8 @@ import {
 import { ShouldStartLoadRequest } from 'react-native-webview/lib/WebViewTypes';
 import {
   ANTIGRAVITY_DASHBOARD_URL,
+  AUTO_NOTIFICATION_KEEP_ALIVE_MINUTES,
+  DEFAULT_ACTION_NOTIFICATION_MODE,
   DEFAULT_KEEP_ALIVE_MINUTES,
 } from '../constants/config';
 import {
@@ -39,21 +41,31 @@ import {
 import {
   backupCookiesFromWebView,
   clearSession,
+  getActionNotificationMode,
   getGoogleSessionSignature,
   getKeepAliveMinutes,
   getLastActiveUrl,
   hydrateCookiesToWebView,
+  saveActionNotificationMode,
   saveKeepAliveMinutes,
   saveLastActiveUrl,
   suspendSessionPersistence,
   resumeSessionPersistence,
 } from '../services/sessionVault';
 import {
+  clearNativeActionNotification,
   configureNativeKeepAlive,
   installNativeDocumentStartScript,
+  requestNativeNotificationPermission,
+  syncNativeActionNotification,
 } from '../services/webData';
 import { InboxSnapshot, InboxThreadItem } from '../types/inbox';
-import { AuthFlowStage, KeepAliveMinutes } from '../types/session';
+import {
+  ActionNotificationMode,
+  AuthFlowStage,
+  KeepAliveMinutes,
+} from '../types/session';
+import { buildActionNotificationSyncState } from '../utils/actionNotification';
 import {
   applyLocalStateToSnapshot,
   buildInboxSnapshot,
@@ -243,16 +255,23 @@ function isPushPromptOrCookieSyncUrl(rawUrl: string): boolean {
 
 interface RemoteWebViewProps {
   incomingDeepLinkUrl: string | null;
+  pendingOpenInbox?: boolean;
   isInitialUrlResolved?: boolean;
   onDeepLinkConsumed: () => void;
+  onOpenInboxConsumed?: () => void;
 }
 
 export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   incomingDeepLinkUrl,
+  pendingOpenInbox = false,
   isInitialUrlResolved = true,
   onDeepLinkConsumed,
+  onOpenInboxConsumed,
 }) => {
   const insets = useSafeAreaInsets();
+  const initialIsForeground =
+    AppState.currentState !== 'background' &&
+    AppState.currentState !== 'inactive';
   const webViewRef = useRef<WebView | null>(null);
   const hydratedRef = useRef(false);
   const canGoBackRef = useRef<boolean>(false);
@@ -269,9 +288,16 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const renderProcessDeadRef = useRef<boolean>(false);
   const notificationPermissionRequestedRef = useRef<boolean>(false);
   const wasBackgroundedRef = useRef<boolean>(false);
+  const isAppForegroundRef = useRef<boolean>(initialIsForeground);
   const keepAliveMinutesRef = useRef<KeepAliveMinutes>(
     DEFAULT_KEEP_ALIVE_MINUTES,
   );
+  const actionNotificationModeRef = useRef<ActionNotificationMode>(
+    DEFAULT_ACTION_NOTIFICATION_MODE,
+  );
+  const inboxSnapshotRef = useRef<InboxSnapshot>(EMPTY_INBOX_SNAPSHOT);
+  const lastActionNotifSigRef = useRef<string>('');
+  const previousOpenActionIdsRef = useRef<Set<string>>(new Set());
   const locallyReadMapRef = useRef<Record<string, number>>({});
   const activeInstanceUuidRef = useRef<string | null>(null);
   const lastObservedOverviewInstanceRef = useRef<string | null>(null);
@@ -288,6 +314,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const [keepAliveMinutes, setKeepAliveMinutes] = useState<KeepAliveMinutes>(
     DEFAULT_KEEP_ALIVE_MINUTES,
   );
+  const [actionNotificationMode, setActionNotificationMode] =
+    useState<ActionNotificationMode>(DEFAULT_ACTION_NOTIFICATION_MODE);
+  const [isAppForeground, setIsAppForeground] =
+    useState<boolean>(initialIsForeground);
+  const [focusInboxRequestKey, setFocusInboxRequestKey] = useState<number>(0);
   const [currentSourceUrl, setCurrentSourceUrl] = useState<string>(
     ANTIGRAVITY_DASHBOARD_URL,
   );
@@ -323,6 +354,14 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   useEffect(() => {
     keepAliveMinutesRef.current = keepAliveMinutes;
   }, [keepAliveMinutes]);
+
+  useEffect(() => {
+    actionNotificationModeRef.current = actionNotificationMode;
+  }, [actionNotificationMode]);
+
+  useEffect(() => {
+    inboxSnapshotRef.current = inboxSnapshot;
+  }, [inboxSnapshot]);
 
   const checkPost2faSessionAndAdvance = useCallback(async () => {
     if (stageRef.current !== 'authenticating') {
@@ -361,10 +400,12 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       // Complete hydration (including any interrupted-sign-out wipe) before reading
       // persisted URL or keep-alive preferences.
       const restoredCount = await hydrateCookiesToWebView();
-      const [savedUrl, savedKeepAliveMinutes] = await Promise.all([
-        getLastActiveUrl(),
-        getKeepAliveMinutes(),
-      ]);
+      const [savedUrl, savedKeepAliveMinutes, savedActionNotificationMode] =
+        await Promise.all([
+          getLastActiveUrl(),
+          getKeepAliveMinutes(),
+          getActionNotificationMode(),
+        ]);
 
       if (!isMounted) {
         return;
@@ -379,6 +420,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       canReturnToOverviewRef.current = false;
       setKeepAliveMinutes(savedKeepAliveMinutes);
       keepAliveMinutesRef.current = savedKeepAliveMinutes;
+      setActionNotificationMode(savedActionNotificationMode);
+      actionNotificationModeRef.current = savedActionNotificationMode;
       setCurrentSourceUrl(initialTarget);
       currentNavUrlRef.current = initialTarget;
       if (incomingDeepLinkUrl) {
@@ -403,36 +446,6 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     onDeepLinkConsumed,
     initializationAttempt,
   ]);
-
-  // Step 2: Handle incoming deep links when the app is already mounted
-  useEffect(() => {
-    if (!isHydrated || isResettingSessionRef.current || !incomingDeepLinkUrl) {
-      return;
-    }
-
-    const validation = validateNavigationUrl(incomingDeepLinkUrl);
-    if (
-      validation.isValid &&
-      validation.normalizedUrl &&
-      validation.isAllowedInApp &&
-      validation.normalizedUrl !== currentNavUrlRef.current
-    ) {
-      setHasNetworkError(false);
-      setPageError(null);
-      renderProcessDeadRef.current = false;
-      renderRecoveryTimestampsRef.current = [];
-      if (stageRef.current === 'offline') {
-        setStage('authenticating');
-      }
-      setCurrentSourceUrl(validation.normalizedUrl);
-      setWebViewInstanceKey((prev) => prev + 1);
-      currentNavUrlRef.current = validation.normalizedUrl;
-      lastObservedOverviewInstanceRef.current = null;
-      canReturnToOverviewRef.current = false;
-      void saveLastActiveUrl(validation.normalizedUrl);
-    }
-    onDeepLinkConsumed();
-  }, [incomingDeepLinkUrl, isHydrated, onDeepLinkConsumed, resetRequest]);
 
   const recordActiveRouteForBackNavigation = useCallback(
     (instanceUuid: string | null, cascadeId: string | null) => {
@@ -466,11 +479,18 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   }, [isHydrated, resetRequest, webViewInstanceKey]);
 
   const requestNotificationPermissionIfNeeded = useCallback(() => {
+    if (notificationPermissionRequestedRef.current) {
+      return;
+    }
+    if (Platform.OS === 'ios') {
+      notificationPermissionRequestedRef.current = true;
+      void requestNativeNotificationPermission?.();
+      return;
+    }
     if (
       Platform.OS !== 'android' ||
       typeof Platform.Version !== 'number' ||
-      Platform.Version < 33 ||
-      notificationPermissionRequestedRef.current
+      Platform.Version < 33
     ) {
       return;
     }
@@ -496,6 +516,12 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       !resetRequest &&
       keepAliveMinutes > 0 &&
       stage === 'authenticated';
+    const notificationsEligible =
+      isHydrated &&
+      !isResettingSessionRef.current &&
+      !resetRequest &&
+      actionNotificationMode !== 'off' &&
+      stage === 'authenticated';
     const effectiveMinutes = keepAliveEligible ? keepAliveMinutes : 0;
 
     void configureNativeKeepAlive?.(
@@ -510,10 +536,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       );
     }
 
-    if (keepAliveEligible) {
+    if (keepAliveEligible || notificationsEligible) {
       requestNotificationPermissionIfNeeded();
     }
   }, [
+    actionNotificationMode,
     isHydrated,
     keepAliveMinutes,
     requestNotificationPermissionIfNeeded,
@@ -536,6 +563,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     return () => {
       clearInboxTimers();
       void configureNativeKeepAlive?.(false, 0, false);
+      void clearNativeActionNotification?.();
     };
   }, [clearInboxTimers]);
 
@@ -551,10 +579,84 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           if (nextAppState === 'background') {
             wasBackgroundedRef.current = true;
           }
+          if (isAppForegroundRef.current) {
+            const currentSnap = inboxSnapshotRef.current;
+            if (currentSnap.activeInstanceUuid && currentSnap.activeCascadeId) {
+              const activeKey = `${currentSnap.activeInstanceUuid}:${currentSnap.activeCascadeId}`;
+              const activeThread = currentSnap.threads.find(
+                (t) => t.id === activeKey,
+              );
+              recordBoundedLocalRead(
+                locallyReadMapRef.current,
+                activeKey,
+                Math.max(
+                  locallyReadMapRef.current[activeKey] ?? 0,
+                  Date.now(),
+                  (activeThread?.lastModifiedAtMs ?? 0) + 1,
+                ),
+              );
+            }
+            isAppForegroundRef.current = false;
+            setIsAppForeground(false);
+            setInboxSnapshot((previous) =>
+              previous.threads.length === 0
+                ? previous
+                : applyLocalStateToSnapshot(previous, {
+                    activeInstanceUuid: previous.activeInstanceUuid,
+                    activeCascadeId: previous.activeCascadeId,
+                    locallyReadAtByThreadId: locallyReadMapRef.current,
+                    isAppForeground: false,
+                  }),
+            );
+          }
           void syncCookiesToVault();
         } else if (nextAppState === 'active') {
           const returningFromBackground = wasBackgroundedRef.current;
           wasBackgroundedRef.current = false;
+          if (!isAppForegroundRef.current) {
+            isAppForegroundRef.current = true;
+            setIsAppForeground(true);
+            const currentSnap = inboxSnapshotRef.current;
+            if (currentSnap.activeInstanceUuid && currentSnap.activeCascadeId) {
+              const activeKey = `${currentSnap.activeInstanceUuid}:${currentSnap.activeCascadeId}`;
+              const activeThread = currentSnap.threads.find(
+                (t) => t.id === activeKey,
+              );
+              const readAtMs = Math.max(
+                locallyReadMapRef.current[activeKey] ?? 0,
+                Date.now(),
+                (activeThread?.lastModifiedAtMs ?? 0) + 1,
+              );
+              recordBoundedLocalRead(
+                locallyReadMapRef.current,
+                activeKey,
+                readAtMs,
+              );
+              if (
+                activeThread &&
+                activeThread.source === 'remote-control' &&
+                activeThread.attentionKind === 'unread'
+              ) {
+                webViewRef.current?.injectJavaScript(
+                  buildMarkThreadReadScript({
+                    instanceUuid: activeThread.instanceUuid,
+                    cascadeId: activeThread.cascadeId,
+                    readAtIso: new Date(readAtMs).toISOString(),
+                  }),
+                );
+              }
+            }
+            setInboxSnapshot((previous) =>
+              previous.threads.length === 0
+                ? previous
+                : applyLocalStateToSnapshot(previous, {
+                    activeInstanceUuid: previous.activeInstanceUuid,
+                    activeCascadeId: previous.activeCascadeId,
+                    locallyReadAtByThreadId: locallyReadMapRef.current,
+                    isAppForeground: true,
+                  }),
+            );
+          }
           if (hydratedRef.current && !isResettingSessionRef.current) {
             if (
               returningFromBackground ||
@@ -735,6 +837,9 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       isResettingSessionRef.current = true;
       suspendSessionPersistence();
       void configureNativeKeepAlive?.(false, 0, false);
+      void clearNativeActionNotification?.();
+      lastActionNotifSigRef.current = 'none';
+      previousOpenActionIdsRef.current = new Set();
       clearInboxTimers();
       locallyReadMapRef.current = {};
       activeInstanceUuidRef.current = null;
@@ -773,6 +878,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           notificationPermissionRequestedRef.current = false;
           setKeepAliveMinutes(DEFAULT_KEEP_ALIVE_MINUTES);
           keepAliveMinutesRef.current = DEFAULT_KEEP_ALIVE_MINUTES;
+          setActionNotificationMode(DEFAULT_ACTION_NOTIFICATION_MODE);
+          actionNotificationModeRef.current = DEFAULT_ACTION_NOTIFICATION_MODE;
         }
         setWebViewInstanceKey((prev) => prev + 1);
         setStage('authenticating');
@@ -859,7 +966,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         const route = extractActiveRouteFromUrl(validation.normalizedUrl);
         activeInstanceUuidRef.current = route.instanceUuid;
         recordActiveRouteForBackNavigation(route.instanceUuid, route.cascadeId);
-        if (route.instanceUuid && route.cascadeId) {
+        if (
+          isAppForegroundRef.current &&
+          route.instanceUuid &&
+          route.cascadeId
+        ) {
           recordBoundedLocalRead(
             locallyReadMapRef.current,
             `${route.instanceUuid}:${route.cascadeId}`,
@@ -873,6 +984,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
                 activeInstanceUuid: route.instanceUuid,
                 activeCascadeId: route.cascadeId,
                 locallyReadAtByThreadId: locallyReadMapRef.current,
+                isAppForeground: isAppForegroundRef.current,
               }),
         );
         if (!navState.loading) {
@@ -979,6 +1091,29 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     [requestNotificationPermissionIfNeeded],
   );
 
+  const handleChangeActionNotificationMode = useCallback(
+    (mode: ActionNotificationMode) => {
+      if (isResettingSessionRef.current) return;
+      actionNotificationModeRef.current = mode;
+      setActionNotificationMode(mode);
+      void saveActionNotificationMode(mode);
+      if (mode === 'off') {
+        lastActionNotifSigRef.current = 'none';
+        previousOpenActionIdsRef.current = new Set();
+        void clearNativeActionNotification?.();
+        return;
+      }
+      notificationPermissionRequestedRef.current = false;
+      requestNotificationPermissionIfNeeded();
+      if (keepAliveMinutesRef.current === 0) {
+        keepAliveMinutesRef.current = AUTO_NOTIFICATION_KEEP_ALIVE_MINUTES;
+        setKeepAliveMinutes(AUTO_NOTIFICATION_KEEP_ALIVE_MINUTES);
+        void saveKeepAliveMinutes(AUTO_NOTIFICATION_KEEP_ALIVE_MINUTES);
+      }
+    },
+    [requestNotificationPermissionIfNeeded],
+  );
+
   const handleNavigateToUrl = useCallback((targetUrl: string) => {
     if (isResettingSessionRef.current) return;
     const validation = validateNavigationUrl(targetUrl);
@@ -1058,6 +1193,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         activeInstanceUuid: previous.activeInstanceUuid,
         activeCascadeId: previous.activeCascadeId,
         locallyReadAtByThreadId: locallyReadMapRef.current,
+        isAppForeground: isAppForegroundRef.current,
       }),
     );
     if (thread.source === 'remote-control') {
@@ -1098,6 +1234,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         activeInstanceUuid: previous.activeInstanceUuid,
         activeCascadeId: previous.activeCascadeId,
         locallyReadAtByThreadId: locallyReadMapRef.current,
+        isAppForeground: isAppForegroundRef.current,
       }),
     );
   }, [inboxSnapshot.threads]);
@@ -1124,6 +1261,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           activeInstanceUuid: thread.instanceUuid,
           activeCascadeId: thread.cascadeId,
           locallyReadAtByThreadId: locallyReadMapRef.current,
+          isAppForeground: isAppForegroundRef.current,
         }),
       );
 
@@ -1162,6 +1300,133 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     },
     [handleCloseDrawer, handleNavigateToUrl],
   );
+
+  // Step 2: Handle incoming deep links and multi-action Inbox opens when mounted
+  useEffect(() => {
+    if (!isHydrated || isResettingSessionRef.current || !pendingOpenInbox) {
+      return;
+    }
+    setDrawerInitialMode('inbox');
+    setFocusInboxRequestKey((prev) => prev + 1);
+    isDrawerOpenRef.current = true;
+    setIsDrawerOpen(true);
+    if (stageRef.current === 'authenticated') {
+      handleRefreshInbox();
+    }
+    onOpenInboxConsumed?.();
+  }, [
+    handleRefreshInbox,
+    isHydrated,
+    onOpenInboxConsumed,
+    pendingOpenInbox,
+    resetRequest,
+  ]);
+
+  useEffect(() => {
+    if (!isHydrated || isResettingSessionRef.current || !incomingDeepLinkUrl) {
+      return;
+    }
+
+    const validation = validateNavigationUrl(incomingDeepLinkUrl);
+    if (
+      validation.isValid &&
+      validation.normalizedUrl &&
+      validation.isAllowedInApp
+    ) {
+      const targetRoute = extractActiveRouteFromUrl(validation.normalizedUrl);
+      const matchingThread =
+        stageRef.current === 'authenticated' &&
+        !renderProcessDeadRef.current &&
+        targetRoute.instanceUuid &&
+        targetRoute.cascadeId
+          ? inboxSnapshotRef.current.threads.find(
+              (thread) =>
+                thread.instanceUuid === targetRoute.instanceUuid &&
+                thread.cascadeId === targetRoute.cascadeId,
+            )
+          : undefined;
+
+      if (matchingThread) {
+        handleSelectInboxThread(matchingThread);
+      } else {
+        handleCloseDrawer();
+        if (targetRoute.instanceUuid && targetRoute.cascadeId) {
+          recordBoundedLocalRead(
+            locallyReadMapRef.current,
+            `${targetRoute.instanceUuid}:${targetRoute.cascadeId}`,
+            Date.now(),
+          );
+          setInboxSnapshot((previous) =>
+            previous.threads.length === 0
+              ? previous
+              : applyLocalStateToSnapshot(previous, {
+                  activeInstanceUuid: targetRoute.instanceUuid,
+                  activeCascadeId: targetRoute.cascadeId,
+                  locallyReadAtByThreadId: locallyReadMapRef.current,
+                  isAppForeground: isAppForegroundRef.current,
+                }),
+          );
+        }
+        if (validation.normalizedUrl !== currentNavUrlRef.current) {
+          handleNavigateToUrl(validation.normalizedUrl);
+        }
+      }
+    }
+    onDeepLinkConsumed();
+  }, [
+    handleCloseDrawer,
+    handleNavigateToUrl,
+    handleSelectInboxThread,
+    incomingDeepLinkUrl,
+    isHydrated,
+    onDeepLinkConsumed,
+    resetRequest,
+  ]);
+
+  // Step 2c: Synchronize the single live OS action-required notification
+  useEffect(() => {
+    if (!isHydrated || isResettingSessionRef.current || resetRequest) {
+      return;
+    }
+    if (
+      stage === 'authenticated' &&
+      actionNotificationMode !== 'off' &&
+      inboxSnapshot.fetchedAtMs === 0
+    ) {
+      return;
+    }
+
+    const syncResult = buildActionNotificationSyncState({
+      stage,
+      mode: actionNotificationMode,
+      threads: inboxSnapshot.threads,
+      isAppForeground,
+      isDrawerOpen,
+      previousOpenThreadIds: previousOpenActionIdsRef.current,
+    });
+    previousOpenActionIdsRef.current = syncResult.openThreadIds;
+
+    if (syncResult.signature === lastActionNotifSigRef.current) {
+      return;
+    }
+    lastActionNotifSigRef.current = syncResult.signature;
+
+    if (!syncResult.notification) {
+      void clearNativeActionNotification?.();
+      return;
+    }
+
+    void syncNativeActionNotification?.(syncResult.notification);
+  }, [
+    actionNotificationMode,
+    inboxSnapshot.fetchedAtMs,
+    inboxSnapshot.threads,
+    isAppForeground,
+    isDrawerOpen,
+    isHydrated,
+    resetRequest,
+    stage,
+  ]);
 
   const syncVerifiedActiveHostUrl = useCallback((rawActiveUrl?: string) => {
     if (typeof rawActiveUrl !== 'string' || !rawActiveUrl) return;
@@ -1206,18 +1471,28 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             message,
             locallyReadMapRef.current,
             currentNavUrlRef.current,
+            isAppForegroundRef.current,
           );
           activeInstanceUuidRef.current = built.activeInstanceUuid;
           recordActiveRouteForBackNavigation(
             built.activeInstanceUuid,
             built.activeCascadeId,
           );
-          if (built.activeInstanceUuid && built.activeCascadeId) {
+          if (
+            isAppForegroundRef.current &&
+            built.activeInstanceUuid &&
+            built.activeCascadeId
+          ) {
             const activeKey = `${built.activeInstanceUuid}:${built.activeCascadeId}`;
+            const activeThread = built.threads.find((t) => t.id === activeKey);
             recordBoundedLocalRead(
               locallyReadMapRef.current,
               activeKey,
-              Math.max(locallyReadMapRef.current[activeKey] ?? 0, Date.now()),
+              Math.max(
+                locallyReadMapRef.current[activeKey] ?? 0,
+                Date.now(),
+                (activeThread?.lastModifiedAtMs ?? 0) + 1,
+              ),
             );
           }
           setInboxSnapshot(built);
@@ -1238,7 +1513,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             activeInstanceUuid,
             activeCascadeId,
           );
-          if (activeInstanceUuid && activeCascadeId) {
+          if (
+            isAppForegroundRef.current &&
+            activeInstanceUuid &&
+            activeCascadeId
+          ) {
             recordBoundedLocalRead(
               locallyReadMapRef.current,
               `${activeInstanceUuid}:${activeCascadeId}`,
@@ -1250,6 +1529,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
               activeInstanceUuid,
               activeCascadeId,
               locallyReadAtByThreadId: locallyReadMapRef.current,
+              isAppForeground: isAppForegroundRef.current,
             }),
           );
           break;
@@ -1438,6 +1718,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       <LeftNavigationDrawer
         visible={isDrawerOpen}
         initialMode={drawerInitialMode}
+        focusInboxRequestKey={focusInboxRequestKey}
         isKeyboardVisible={isKeyboardVisible}
         keyboardBottomPadding={keyboardBottomPadding}
         stage={stage}
@@ -1447,6 +1728,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         urgentAttentionCount={inboxCounts.urgent}
         runningCount={inboxCounts.running}
         keepAliveMinutes={keepAliveMinutes}
+        actionNotificationMode={actionNotificationMode}
         onOpen={handleOpenDrawer}
         onClose={handleCloseDrawer}
         onRefreshInbox={handleRefreshInbox}
@@ -1454,6 +1736,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         onMarkThreadRead={handleMarkThreadRead}
         onMarkAllRead={handleMarkAllRead}
         onChangeKeepAliveMinutes={handleChangeKeepAliveMinutes}
+        onChangeActionNotificationMode={handleChangeActionNotificationMode}
         onNavigateToUrl={handleNavigateToUrl}
         onReloadSession={handleReloadSession}
         onSignOut={handleSignOut}

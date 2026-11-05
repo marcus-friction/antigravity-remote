@@ -261,6 +261,13 @@ export function parseHandoffInput(rawInput: string): string | null {
     if (!remainder) {
       return ANTIGRAVITY_DASHBOARD_URL;
     }
+    const routeToken = remainder
+      .split(/[?#]/)[0]
+      .replace(/\/+$/, '')
+      .toLowerCase();
+    if (routeToken === 'inbox') {
+      return null;
+    }
     const candidateUrl = `${ANTIGRAVITY_DASHBOARD_URL}/${remainder}`;
     return validateAntigravityTargetUrl(candidateUrl);
   }
@@ -302,4 +309,43 @@ function validateAntigravityTargetUrl(candidateUrl: string): string | null {
   }
 
   return parsed.toString();
+}
+
+export type IncomingAppLinkAction =
+  | { kind: 'open_inbox' }
+  | { kind: 'navigate'; targetUrl: string };
+
+/**
+ * Parses an incoming OS deep link (from custom scheme or notification tap) into
+ * either a native Inbox drawer open action or a verified in-app HTTPS target URL.
+ */
+export function parseIncomingAppLink(
+  rawInput: string | null | undefined,
+): IncomingAppLinkAction | null {
+  if (!rawInput || typeof rawInput !== 'string') {
+    return null;
+  }
+  const trimmed = rawInput.trim();
+  if (!trimmed || trimmed.length > 2048) {
+    return null;
+  }
+
+  if (trimmed.toLowerCase().startsWith(CUSTOM_APP_SCHEME)) {
+    const remainder = trimmed
+      .slice(CUSTOM_APP_SCHEME.length)
+      .replace(/^\/+/, '');
+    const routeToken = remainder
+      .split(/[?#]/)[0]
+      .replace(/\/+$/, '')
+      .toLowerCase();
+    if (routeToken === 'inbox') {
+      return { kind: 'open_inbox' };
+    }
+  }
+
+  const targetUrl = parseHandoffInput(trimmed);
+  if (targetUrl) {
+    return { kind: 'navigate', targetUrl };
+  }
+  return null;
 }
