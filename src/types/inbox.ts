@@ -157,4 +157,8 @@ export type InboxBridgeMessage =
       requestId: string;
       handled: boolean;
       targetUrl: string;
+    }
+  | {
+      type: 'AGY_INBOX_HOST_SETTINGS_RESULT';
+      handled: boolean;
     };

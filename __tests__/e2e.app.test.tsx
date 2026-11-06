@@ -1150,12 +1150,23 @@ describe('Session and navigation regressions', () => {
         ),
     ).toBe(true);
 
-    // Switch back to Inbox and tap the header "Machines" shortcut
+    // Switch back to Inbox and open All Machines overview from the header workstation selector menu
     const inboxModeBtn = tree.root
       .findAllByType('TouchableOpacity' as any)
       .find((node) => node.props.accessibilityLabel === 'Drawer mode Inbox')!;
     await act(async () => {
       inboxModeBtn.props.onPress();
+    });
+    const workstationSelectorBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((node) => node.props.accessibilityLabel === 'Select workstation')!;
+    expect(
+      workstationSelectorBtn
+        .findAllByType('Text' as any)
+        .map((t) => t.props.children),
+    ).toContain('Studio Mac');
+    await act(async () => {
+      workstationSelectorBtn.props.onPress();
     });
     const inboxMachinesBtn = tree.root
       .findAllByType('TouchableOpacity' as any)
@@ -2220,5 +2231,628 @@ describe('Session and navigation regressions', () => {
     } finally {
       RN.Platform.OS = prevOS;
     }
+  });
+
+  it('supports compact 2-row sidebar header, workstation switcher menu, host settings bridge, on-demand search, single safe-area inset, and keyboard-aware bottom mode bar', async () => {
+    mockCookieStore.set('https://antigravity.google.com', {
+      SID: { name: 'SID', value: 'redesign-session', domain: '.google.com' },
+    });
+    await navigate(
+      'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-alpha',
+      false,
+    );
+
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-alpha',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_SNAPSHOT',
+            fetchedAtMs: 1_762_270_000_000,
+            activeUrl:
+              'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-alpha',
+            activeInstanceUuid: 'workstation-1',
+            activeCascadeId: 'thread-alpha',
+            instances: [
+              { uuid: 'workstation-1', name: 'dev-server', status: 1 },
+              { uuid: 'workstation-2', name: 'mac-studio', status: 1 },
+            ],
+            trajectories: undefined,
+          }),
+        },
+      });
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-alpha',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_SNAPSHOT',
+            fetchedAtMs: 1_762_270_100_000,
+            activeUrl:
+              'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-alpha',
+            activeInstanceUuid: 'workstation-1',
+            activeCascadeId: 'thread-alpha',
+            instances: [
+              {
+                uuid: 'workstation-1',
+                name: 'dev-server',
+                status: 1,
+                trajectories: {
+                  'thread-alpha': {
+                    summary: 'Redesign sidebar header',
+                    status: 1,
+                    lastModifiedTime: '2026-11-05T10:00:00Z',
+                  },
+                  'thread-beta': {
+                    summary: 'Optimize scraping pipeline',
+                    status: 1,
+                    lastModifiedTime: '2026-11-05T10:05:00Z',
+                    lastUserInputTime: '2026-11-05T09:50:00Z',
+                  },
+                },
+              },
+              {
+                uuid: 'workstation-2',
+                name: 'mac-studio',
+                status: 1,
+                trajectories: {},
+              },
+            ],
+          }),
+        },
+      });
+    });
+
+    const openDrawerHandle = tree.root.findAll(
+      (node) =>
+        node.type === ('TouchableOpacity' as any) &&
+        node.props.accessibilityLabel === 'Open Antigravity drawer',
+    )[0];
+    await act(async () => {
+      openDrawerHandle.props.onPress();
+    });
+
+    // 1. Drawer panel must NOT double-apply top/bottom safe-area insets inside App's SafeAreaView
+    const drawerPanel = tree.root.findAll(
+      (node) =>
+        node.type === ('Animated.View' as any) &&
+        typeof node.props.onPanResponderTerminate === 'function',
+    )[0];
+    const flatDrawerStyle = Object.assign(
+      {},
+      ...(Array.isArray(drawerPanel.props.style)
+        ? drawerPanel.props.style.filter(Boolean)
+        : [drawerPanel.props.style]),
+    );
+    expect(flatDrawerStyle.paddingTop).toBe(10);
+    expect(flatDrawerStyle.paddingBottom).toBe(0);
+
+    // 2. Thread search input is collapsed by default and expands on demand via `Toggle thread search`
+    expect(
+      tree.root.findAll(
+        (node) =>
+          node.type === ('TextInput' as any) &&
+          node.props.accessibilityLabel === 'Filter Inbox threads',
+      ),
+    ).toHaveLength(0);
+
+    const searchToggleBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((node) => node.props.accessibilityLabel === 'Toggle thread search')!;
+    await act(async () => {
+      searchToggleBtn.props.onPress();
+    });
+
+    const filterInput = tree.root
+      .findAllByType('TextInput' as any)
+      .find((node) => node.props.accessibilityLabel === 'Filter Inbox threads')!;
+    expect(filterInput).toBeDefined();
+
+    await act(async () => {
+      filterInput.props.onChangeText('scraping');
+    });
+    expect(
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .filter(
+          (n) =>
+            typeof n.props.accessibilityLabel === 'string' &&
+            n.props.accessibilityLabel.startsWith('Open thread '),
+        )
+        .map((n) => n.props.accessibilityLabel),
+    ).toEqual(['Open thread Optimize scraping pipeline']);
+
+    // Closing search clears query and collapses the search row
+    const closeSearchBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((node) => node.props.accessibilityLabel === 'Close thread search')!;
+    await act(async () => {
+      closeSearchBtn.props.onPress();
+    });
+    expect(
+      tree.root.findAll(
+        (node) =>
+          node.type === ('TextInput' as any) &&
+          node.props.accessibilityLabel === 'Filter Inbox threads',
+      ),
+    ).toHaveLength(0);
+    expect(
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .filter(
+          (n) =>
+            typeof n.props.accessibilityLabel === 'string' &&
+            n.props.accessibilityLabel.startsWith('Open thread '),
+        ),
+    ).toHaveLength(2);
+
+    // 3. Docked bottom mode bar hides while software keyboard is open and reappears on hide
+    expect(
+      tree.root.findAll(
+        (node) =>
+          node.type === ('TouchableOpacity' as any) &&
+          node.props.accessibilityLabel === 'Drawer mode Inbox',
+      ),
+    ).toHaveLength(1);
+    await act(async () => {
+      for (const listener of mockKeyboardShowListeners) {
+        listener({ endCoordinates: { height: 300 } });
+      }
+    });
+    expect(
+      tree.root.findAll(
+        (node) =>
+          node.type === ('TouchableOpacity' as any) &&
+          node.props.accessibilityLabel === 'Drawer mode Inbox',
+      ),
+    ).toHaveLength(0);
+    await act(async () => {
+      for (const listener of mockKeyboardHideListeners) {
+        listener();
+      }
+    });
+    expect(
+      tree.root.findAll(
+        (node) =>
+          node.type === ('TouchableOpacity' as any) &&
+          node.props.accessibilityLabel === 'Drawer mode Inbox',
+      ),
+    ).toHaveLength(1);
+
+    // 4. Workstation selector menu switches machines, opens handoff input, and triggers host settings
+    const selectWorkstationBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((node) => node.props.accessibilityLabel === 'Select workstation')!;
+    expect(
+      selectWorkstationBtn
+        .findAllByType('Text' as any)
+        .map((t) => t.props.children),
+    ).toEqual(['dev-server']);
+
+    await act(async () => {
+      selectWorkstationBtn.props.onPress();
+    });
+
+    // 4a. `Connect link or machine ID` jumps to Settings with handoff input expanded
+    const connectIdMenuBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find(
+        (node) =>
+          node.props.accessibilityLabel === 'Connect link or machine ID',
+      )!;
+    await act(async () => {
+      connectIdMenuBtn.props.onPress();
+    });
+    expect(
+      tree.root.findAll(
+        (node) =>
+          node.type === ('TextInput' as any) &&
+          node.props.accessibilityLabel === 'Machine link or ID',
+      ),
+    ).toHaveLength(1);
+
+    // 4b. Open menu again and trigger `Open workstation host settings`:
+    // - when bridge handles (`handled: true`), keeps current workstation page mounted
+    // - when bridge cannot find host gear (`handled: false`), falls back to dashboard
+    await act(async () => {
+      selectWorkstationBtn.props.onPress();
+    });
+    mockWebViewInjectJavaScript.mockClear();
+    const mountsBeforeHostSettings = mockWebViewMountCount;
+    const hostSettingsBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find(
+        (node) =>
+          node.props.accessibilityLabel === 'Open workstation host settings',
+      )!;
+    await act(async () => {
+      hostSettingsBtn.props.onPress();
+    });
+    expect(controls().props.visible).toBe(false);
+    expect(
+      mockWebViewInjectJavaScript.mock.calls.some(
+        ([script]) =>
+          typeof script === 'string' && script.includes('openHostSettings'),
+      ),
+    ).toBe(true);
+
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-alpha',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_HOST_SETTINGS_RESULT',
+            handled: true,
+          }),
+        },
+      });
+    });
+    expect(mockWebViewMountCount).toBe(mountsBeforeHostSettings);
+
+    // Unsolicited `handled: false` afterwards must NOT navigate away
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-alpha',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_HOST_SETTINGS_RESULT',
+            handled: false,
+          }),
+        },
+      });
+    });
+    expect(mockWebViewMountCount).toBe(mountsBeforeHostSettings);
+
+    // Reopen drawer -> trigger host settings -> `handled: false` falls back to All Machines dashboard
+    const reopenBtn = tree.root.findAll(
+      (node) =>
+        node.type === ('TouchableOpacity' as any) &&
+        node.props.accessibilityLabel === 'Open Antigravity drawer',
+    )[0];
+    await act(async () => {
+      reopenBtn.props.onPress();
+    });
+    await act(async () => {
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find((n) => n.props.accessibilityLabel === 'Select workstation')!
+        .props.onPress();
+    });
+    await act(async () => {
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find(
+          (n) => n.props.accessibilityLabel === 'Open workstation host settings',
+        )!
+        .props.onPress();
+    });
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-alpha',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_HOST_SETTINGS_RESULT',
+            handled: false,
+          }),
+        },
+      });
+    });
+    expect(webView().props.source.uri).toBe('https://antigravity.google.com/');
+
+    // 4c. Switching directly to `mac-studio` from the workstation menu navigates to `/r/workstation-2`
+    await act(async () => {
+      tree.root
+        .findAll(
+          (node) =>
+            node.type === ('TouchableOpacity' as any) &&
+            node.props.accessibilityLabel === 'Open Antigravity drawer',
+        )[0]
+        .props.onPress();
+    });
+    await act(async () => {
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find((n) => n.props.accessibilityLabel === 'Select workstation')!
+        .props.onPress();
+    });
+    const switchStudioBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find(
+        (n) =>
+          n.props.accessibilityLabel === 'Switch to workstation mac-studio',
+      )!;
+    await act(async () => {
+      switchStudioBtn.props.onPress();
+    });
+    expect(controls().props.visible).toBe(false);
+    expect(webView().props.source.uri).toBe(
+      'https://antigravity.google.com/r/workstation-2',
+    );
+  });
+
+  it('keeps workstation pill accurate on non-workstation routes, dismisses popover before drawer on Android Back, resets search query on close, and preserves /u/<n> account prefixes with zero threads', async () => {
+    const RNPlatform = require('react-native').Platform;
+    RNPlatform.OS = 'android';
+    RNPlatform.Version = 34;
+    await act(async () => {
+      tree.unmount();
+    });
+    await act(async () => {
+      tree = renderer.create(<App />);
+    });
+    mockCookieStore.set('https://antigravity.google.com', {
+      SID: { name: 'SID', value: 'multi-account-session', domain: '.google.com' },
+    });
+
+    // 1. Start on All Machines Overview (`/`) with 1 connected workstation (`dev-server`):
+    //    pill must say `All Machines` (NOT `dev-server`) and `dev-server` must NOT be marked selected.
+    await navigate('https://antigravity.google.com/', false);
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_SNAPSHOT',
+            fetchedAtMs: 1_762_280_000_000,
+            activeUrl: 'https://antigravity.google.com/',
+            activeInstanceUuid: null,
+            activeCascadeId: null,
+            instances: [
+              {
+                uuid: 'workstation-1',
+                name: 'dev-server',
+                status: 1,
+                trajectories: {
+                  'thread-alpha': {
+                    summary: 'Redesign sidebar header',
+                    status: 1,
+                    lastModifiedTime: '2026-11-05T10:00:00Z',
+                  },
+                  'thread-beta': {
+                    summary: 'Optimize scraping pipeline',
+                    status: 1,
+                    lastModifiedTime: '2026-11-05T10:05:00Z',
+                  },
+                },
+              },
+            ],
+          }),
+        },
+      });
+    });
+
+    const getOpenHandle = () =>
+      tree.root.findAll(
+        (node) =>
+          node.type === ('TouchableOpacity' as any) &&
+          node.props.accessibilityLabel === 'Open Antigravity drawer',
+      )[0];
+    const getPillLabels = () =>
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find((n) => n.props.accessibilityLabel === 'Select workstation')!
+        .findAllByType('Text' as any)
+        .map((t) => t.props.children);
+
+    await act(async () => {
+      getOpenHandle().props.onPress();
+    });
+    expect(getPillLabels()).toEqual(['All Machines']);
+
+    await act(async () => {
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find((n) => n.props.accessibilityLabel === 'Select workstation')!
+        .props.onPress();
+    });
+    expect(
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find(
+          (n) =>
+            n.props.accessibilityLabel === 'Switch to workstation dev-server',
+        )!.props.accessibilityState.selected,
+    ).toBe(false);
+    expect(
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find(
+          (n) => n.props.accessibilityLabel === 'Open All Machines overview',
+        )!.props.accessibilityState.selected,
+    ).toBe(true);
+
+    // 2. Cloud route (`/remote/c/...`) and unlisted `/r/other-box` must NOT falsely show `dev-server`
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/remote/c/cloud-123',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_ACTIVE_ROUTE',
+            activeUrl: 'https://antigravity.google.com/remote/c/cloud-123',
+            activeInstanceUuid: '__cloud__',
+            activeCascadeId: 'cloud-123',
+          }),
+        },
+      });
+    });
+    expect(getPillLabels()).toEqual(['Cloud Agent']);
+
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/other-box',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_ACTIVE_ROUTE',
+            activeUrl: 'https://antigravity.google.com/r/other-box',
+            activeInstanceUuid: 'other-box',
+            activeCascadeId: null,
+          }),
+        },
+      });
+    });
+    expect(getPillLabels()).toEqual(['other-box']);
+
+    // 3. Expand thread search, enter a query, and keep workstation menu open:
+    //    - 1st Android hardware Back dismisses the workstation menu (drawer stays open)
+    //    - 2nd Android hardware Back closes the drawer AND clears the transient search query
+    await act(async () => {
+      let handled = false;
+      for (const listener of mockBackPressListeners) {
+        handled = listener() || handled;
+      }
+      expect(handled).toBe(true);
+    });
+    expect(controls().props.visible).toBe(true);
+    expect(
+      tree.root.findAll(
+        (n) => n.props.accessibilityLabel === 'Dismiss workstation menu',
+      ),
+    ).toHaveLength(0);
+
+    await act(async () => {
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find((n) => n.props.accessibilityLabel === 'Toggle thread search')!
+        .props.onPress();
+    });
+    await act(async () => {
+      tree.root
+        .findAllByType('TextInput' as any)
+        .find((n) => n.props.accessibilityLabel === 'Filter Inbox threads')!
+        .props.onChangeText('scraping');
+    });
+    expect(
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .filter(
+          (n) =>
+            typeof n.props.accessibilityLabel === 'string' &&
+            n.props.accessibilityLabel.startsWith('Open thread '),
+        ),
+    ).toHaveLength(1);
+
+    await act(async () => {
+      for (const listener of mockBackPressListeners) {
+        listener();
+      }
+    });
+    expect(controls().props.visible).toBe(false);
+
+    // Reopening the drawer starts clean: search bar collapsed and all 2 threads unfiltered
+    await act(async () => {
+      getOpenHandle().props.onPress();
+    });
+    expect(
+      tree.root.findAll(
+        (node) =>
+          node.type === ('TextInput' as any) &&
+          node.props.accessibilityLabel === 'Filter Inbox threads',
+      ),
+    ).toHaveLength(0);
+    expect(
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .filter(
+          (n) =>
+            typeof n.props.accessibilityLabel === 'string' &&
+            n.props.accessibilityLabel.startsWith('Open thread '),
+        ),
+    ).toHaveLength(2);
+
+    // 4. Multi-account `/u/2/` prefix is preserved across workstation switching, All Machines overview,
+    //    and host-settings fallback even when `snapshot.threads` is empty (`0` threads)
+    await navigate('https://antigravity.google.com/u/2/r/workstation-1', false);
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/u/2/r/workstation-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_SNAPSHOT',
+            fetchedAtMs: 1_762_281_000_000,
+            activeUrl: 'https://antigravity.google.com/u/2/r/workstation-1',
+            activeInstanceUuid: 'workstation-1',
+            activeCascadeId: null,
+            instances: [
+              { uuid: 'workstation-1', name: 'dev-server', status: 1, trajectories: {} },
+              { uuid: 'workstation-2', name: 'mac-studio', status: 1, trajectories: {} },
+            ],
+          }),
+        },
+      });
+    });
+
+    await act(async () => {
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find((n) => n.props.accessibilityLabel === 'Select workstation')!
+        .props.onPress();
+    });
+    await act(async () => {
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find(
+          (n) =>
+            n.props.accessibilityLabel === 'Switch to workstation mac-studio',
+        )!
+        .props.onPress();
+    });
+    expect(webView().props.source.uri).toBe(
+      'https://antigravity.google.com/u/2/r/workstation-2',
+    );
+
+    await act(async () => {
+      getOpenHandle().props.onPress();
+    });
+    await act(async () => {
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find((n) => n.props.accessibilityLabel === 'Select workstation')!
+        .props.onPress();
+    });
+    await act(async () => {
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find(
+          (n) => n.props.accessibilityLabel === 'Open All Machines overview',
+        )!
+        .props.onPress();
+    });
+    expect(webView().props.source.uri).toBe(
+      'https://antigravity.google.com/u/2/',
+    );
+    // Pill immediately updates to `All Machines` on explicit navigation before the next bridge snapshot
+    expect(getPillLabels()).toEqual(['All Machines']);
+
+    // Host settings fallback also preserves `/u/2/`
+    await act(async () => {
+      getOpenHandle().props.onPress();
+    });
+    await act(async () => {
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find((n) => n.props.accessibilityLabel === 'Select workstation')!
+        .props.onPress();
+    });
+    await act(async () => {
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find(
+          (n) => n.props.accessibilityLabel === 'Open workstation host settings',
+        )!
+        .props.onPress();
+    });
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/u/2/',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_HOST_SETTINGS_RESULT',
+            handled: false,
+          }),
+        },
+      });
+    });
+    expect(webView().props.source.uri).toBe(
+      'https://antigravity.google.com/u/2/',
+    );
   });
 });

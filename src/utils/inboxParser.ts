@@ -2083,6 +2083,15 @@ export function parseInboxBridgeMessage(
         targetUrl: parsed.targetUrl,
       };
 
+    case 'AGY_INBOX_HOST_SETTINGS_RESULT':
+      if (typeof parsed.handled !== 'boolean') {
+        return null;
+      }
+      return {
+        type: 'AGY_INBOX_HOST_SETTINGS_RESULT',
+        handled: parsed.handled,
+      };
+
     default:
       return null;
   }

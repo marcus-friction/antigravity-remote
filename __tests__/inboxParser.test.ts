@@ -3,6 +3,7 @@ import {
   INBOX_BRIDGE_SCRIPT,
   buildFastThreadSwitchScript,
   buildMarkThreadReadScript,
+  buildOpenHostSettingsScript,
 } from '../src/services/inboxBridge';
 import {
   buildActionNotificationSyncState,
@@ -1232,5 +1233,353 @@ describe('inboxParser', () => {
       deepLinkUrl: 'antigravity-remote://r/box-1?p=c%2Fcli-run',
       shouldAlert: true,
     });
+  });
+
+  it('promotes the workstation iframe to full-bleed on /r/<uuid>, hides outer host header & Google OneBar while preserving overlays, restores on /, and triggers host settings safely', () => {
+    expect(
+      parseInboxBridgeMessage(
+        JSON.stringify({
+          type: 'AGY_INBOX_HOST_SETTINGS_RESULT',
+          handled: true,
+        }),
+      ),
+    ).toEqual({
+      type: 'AGY_INBOX_HOST_SETTINGS_RESULT',
+      handled: true,
+    });
+    expect(
+      parseInboxBridgeMessage(
+        JSON.stringify({
+          type: 'AGY_INBOX_HOST_SETTINGS_RESULT',
+          handled: 'invalid',
+        }),
+      ),
+    ).toBeNull();
+
+    // Enforce Trusted-Types CSP compliance on bridge scripts
+    for (const script of [
+      INBOX_BRIDGE_SCRIPT,
+      buildOpenHostSettingsScript(),
+    ]) {
+      expect(script).not.toMatch(
+        /\b(innerHTML|outerHTML|insertAdjacentHTML|eval)\b|document\.write|new\s+Function/,
+      );
+    }
+
+    interface MockStyle {
+      setProperty: (prop: string, val: string, pri?: string) => void;
+      removeProperty: (prop: string) => void;
+      getPropertyValue: (prop: string) => string;
+      getPropertyPriority: (prop: string) => string;
+    }
+
+    const createStyle = (
+      initial: Record<string, { val: string; pri: string }> = {},
+    ): MockStyle => {
+      const store = new Map<string, { val: string; pri: string }>(
+        Object.entries(initial),
+      );
+      return {
+        setProperty(prop: string, val: string, pri: string = '') {
+          store.set(prop, { val, pri });
+        },
+        removeProperty(prop: string) {
+          store.delete(prop);
+        },
+        getPropertyValue(prop: string) {
+          return store.get(prop)?.val ?? '';
+        },
+        getPropertyPriority(prop: string) {
+          return store.get(prop)?.pri ?? '';
+        },
+      };
+    };
+
+    interface MockElement {
+      tagName: string;
+      className: string;
+      textContent: string;
+      src?: string;
+      parentElement: MockElement | null;
+      children: MockElement[];
+      style: MockStyle;
+      clickCount: number;
+      attrs: Record<string, string>;
+      getAttribute: (name: string) => string | null;
+      querySelector: (selector: string) => MockElement | null;
+      click: () => void;
+    }
+
+    const makeEl = (
+      tagName: string,
+      opts: {
+        className?: string;
+        textContent?: string;
+        src?: string;
+        attrs?: Record<string, string>;
+        initialStyle?: Record<string, { val: string; pri: string }>;
+      } = {},
+    ): MockElement => {
+      const attrs = { ...(opts.attrs ?? {}) };
+      if (opts.src) {
+        attrs.src = opts.src;
+      }
+      const el: MockElement = {
+        tagName: tagName.toUpperCase(),
+        className: opts.className ?? '',
+        textContent: opts.textContent ?? '',
+        src: opts.src,
+        parentElement: null,
+        children: [],
+        style: createStyle(opts.initialStyle),
+        clickCount: 0,
+        attrs,
+        getAttribute: (name: string) =>
+          Object.prototype.hasOwnProperty.call(attrs, name)
+            ? attrs[name]
+            : null,
+        querySelector: (selector: string) => {
+          if (
+            selector.includes('[role="dialog"]') &&
+            el.children.some((c) => c.getAttribute('role') === 'dialog')
+          ) {
+            return el.children.find((c) => c.getAttribute('role') === 'dialog')!;
+          }
+          return null;
+        },
+        click: () => {
+          el.clickCount += 1;
+        },
+      };
+      return el;
+    };
+
+    const append = (parent: MockElement, ...kids: MockElement[]) => {
+      for (const kid of kids) {
+        kid.parentElement = parent;
+        parent.children.push(kid);
+      }
+    };
+
+    // Build realistic Antigravity host DOM on `/r/dev-server`:
+    // body
+    //  ├── appRoot (margin-top: 4px)
+    //  │    ├── hostTopHeader ([A] logo, [dev-server ▾], [⚙️ Settings], [↻ Reload])
+    //  │    └── workspaceMain (padding-top: 56px)
+    //  │         └── hubIframe (src="https://antigravity.static.usercontent.goog/web/...")
+    //  ├── googleOneBar (floating [💬! Feedback] + [Google Account Avatar], display: flex)
+    //  ├── cdkOverlayContainer (.cdk-overlay-container)
+    //  └── appStyle (<style>)
+    const docEl = makeEl('HTML');
+    const body = makeEl('BODY');
+    append(docEl, body);
+
+    const appRoot = makeEl('APP-ROOT', {
+      initialStyle: { 'margin-top': { val: '4px', pri: '' } },
+    });
+    const hostTopHeader = makeEl('HEADER', {
+      initialStyle: { display: { val: 'flex', pri: '' } },
+    });
+    const reloadBtn = makeEl('BUTTON', {
+      attrs: { 'aria-label': 'Reload workstation' },
+      textContent: 'refresh',
+    });
+    const hostGearBtn = makeEl('BUTTON', {
+      attrs: { 'aria-label': 'Workstation settings' },
+      textContent: 'settings',
+    });
+    append(hostTopHeader, hostGearBtn, reloadBtn);
+
+    const workspaceMain = makeEl('MAIN', {
+      initialStyle: { 'padding-top': { val: '56px', pri: '' } },
+    });
+    const hubIframe = makeEl('IFRAME', {
+      src: 'https://antigravity.static.usercontent.goog/web/v1/?iframe=true',
+    });
+    append(workspaceMain, hubIframe);
+    append(appRoot, hostTopHeader, workspaceMain);
+
+    const googleOneBar = makeEl('DIV', {
+      className: 'gb_onebar',
+      initialStyle: { display: { val: 'flex', pri: '' } },
+    });
+    const feedbackBtn = makeEl('BUTTON', {
+      attrs: { 'aria-label': 'Send feedback' },
+    });
+    const avatarBtn = makeEl('BUTTON', {
+      attrs: { 'aria-label': 'Google Account: user@example.com' },
+    });
+    append(googleOneBar, feedbackBtn, avatarBtn);
+
+    const cdkOverlayContainer = makeEl('DIV', {
+      className: 'cdk-overlay-container',
+    });
+    const dialogInsideOverlay = makeEl('DIV', {
+      attrs: { role: 'dialog' },
+    });
+    const dialogCloseBtn = makeEl('BUTTON', {
+      attrs: { 'aria-label': 'Close settings' },
+    });
+    append(dialogInsideOverlay, dialogCloseBtn);
+    append(cdkOverlayContainer, dialogInsideOverlay);
+
+    const appStyle = makeEl('STYLE');
+    append(body, appRoot, googleOneBar, cdkOverlayContainer, appStyle);
+
+    const allButtons = [
+      hostGearBtn,
+      reloadBtn,
+      feedbackBtn,
+      avatarBtn,
+      dialogCloseBtn,
+    ];
+    let currentLocation = {
+      hostname: 'antigravity.google.com',
+      origin: 'https://antigravity.google.com',
+      pathname: '/r/dev-server',
+      search: '',
+      hash: '',
+      href: 'https://antigravity.google.com/r/dev-server',
+    };
+    const postedMessages: any[] = [];
+    const popstateHandlers: Array<() => void> = [];
+
+    const windowObj: any = {
+      location: currentLocation,
+      navigator: { onLine: true },
+      addEventListener: (type: string, cb: () => void) => {
+        if (type === 'popstate') {
+          popstateHandlers.push(cb);
+        }
+      },
+      ReactNativeWebView: {
+        postMessage: (raw: string) => {
+          postedMessages.push(JSON.parse(raw));
+        },
+      },
+    };
+    const documentObj: any = {
+      cookie: '',
+      visibilityState: 'visible',
+      documentElement: docEl,
+      body,
+      querySelectorAll: (selector: string) => {
+        if (selector === 'iframe') {
+          return [hubIframe];
+        }
+        if (selector === 'button, [role="button"]') {
+          return allButtons;
+        }
+        return [];
+      },
+    };
+    const sandbox = vm.createContext({
+      window: windowObj,
+      document: documentObj,
+      navigator: windowObj.navigator,
+      URL,
+      URLSearchParams,
+      setTimeout: () => 1,
+      clearTimeout: () => {},
+      setInterval: () => 1,
+      clearInterval: () => {},
+    });
+
+    vm.runInContext(INBOX_BRIDGE_SCRIPT, sandbox);
+
+    // 1. On `/r/dev-server`, workstation iframe is promoted to full-bleed fixed viewport
+    expect(hubIframe.style.getPropertyValue('position')).toBe('fixed');
+    expect(hubIframe.style.getPropertyPriority('position')).toBe('important');
+    expect(hubIframe.style.getPropertyValue('top')).toBe('0px');
+    expect(hubIframe.style.getPropertyValue('width')).toBe('100%');
+    expect(hubIframe.style.getPropertyValue('height')).toBe('100%');
+    expect(hubIframe.style.getPropertyValue('z-index')).toBe('990');
+
+    // Outer host header AND floating Google feedback/avatar bar are hidden
+    expect(hostTopHeader.style.getPropertyValue('display')).toBe('none');
+    expect(hostTopHeader.style.getPropertyPriority('display')).toBe('important');
+    expect(googleOneBar.style.getPropertyValue('display')).toBe('none');
+    expect(workspaceMain.style.getPropertyValue('padding-top')).toBe('0px');
+    expect(appRoot.style.getPropertyValue('margin-top')).toBe('0px');
+
+    // CDK overlay container and <style> tag are NOT hidden; overlay is elevated above iframe with non-static position
+    expect(cdkOverlayContainer.style.getPropertyValue('display')).toBe('');
+    expect(cdkOverlayContainer.style.getPropertyValue('position')).toBe('relative');
+    expect(cdkOverlayContainer.style.getPropertyValue('z-index')).toBe('2000');
+    expect(appStyle.style.getPropertyValue('display')).toBe('');
+
+    // 2. `buildOpenHostSettingsScript()` clicks the outer host gear button (ignoring feedback, avatar, reload, and dialog buttons)
+    postedMessages.length = 0;
+    vm.runInContext(buildOpenHostSettingsScript(), sandbox);
+    expect(hostGearBtn.clickCount).toBe(1);
+    expect(feedbackBtn.clickCount).toBe(0);
+    expect(avatarBtn.clickCount).toBe(0);
+    expect(reloadBtn.clickCount).toBe(0);
+    expect(dialogCloseBtn.clickCount).toBe(0);
+    expect(postedMessages).toContainEqual({
+      type: 'AGY_INBOX_HOST_SETTINGS_RESULT',
+      handled: true,
+    });
+
+    // Fallback attribute matching clicks an unlabeled SVG gear button with data-testid="host-settings-btn"
+    const svgGearBtn = makeEl('BUTTON', {
+      attrs: { 'data-testid': 'host-settings-btn' },
+    });
+    allButtons.length = 0;
+    allButtons.push(feedbackBtn, avatarBtn, reloadBtn, svgGearBtn);
+    postedMessages.length = 0;
+    vm.runInContext(buildOpenHostSettingsScript(), sandbox);
+    expect(svgGearBtn.clickCount).toBe(1);
+    expect(postedMessages).toContainEqual({
+      type: 'AGY_INBOX_HOST_SETTINGS_RESULT',
+      handled: true,
+    });
+
+    // When no host gear button exists, reports `handled: false`
+    allButtons.length = 0;
+    allButtons.push(feedbackBtn, avatarBtn, reloadBtn);
+    postedMessages.length = 0;
+    vm.runInContext(buildOpenHostSettingsScript(), sandbox);
+    expect(postedMessages).toContainEqual({
+      type: 'AGY_INBOX_HOST_SETTINGS_RESULT',
+      handled: false,
+    });
+
+    // 2b. If the host hides the workstation iframe (e.g. workstation offline / reconnect screen),
+    // `syncFullBleedWorkspace()` restores host chrome instead of blanking out the page
+    (hubIframe as any).hidden = true;
+    expect(windowObj.__agyInboxBridge.syncFullBleedWorkspace()).toBe(false);
+    expect(hubIframe.style.getPropertyValue('position')).toBe('');
+    expect(hostTopHeader.style.getPropertyValue('display')).toBe('flex');
+    (hubIframe as any).hidden = false;
+    expect(windowObj.__agyInboxBridge.syncFullBleedWorkspace()).toBe(true);
+    expect(hubIframe.style.getPropertyValue('position')).toBe('fixed');
+    expect(hostTopHeader.style.getPropertyValue('display')).toBe('none');
+
+    // Menu/popover siblings (`[role="menu"]` / `[popover]`) are also preserved above the full-bleed iframe
+    const menuPopover = makeEl('DIV', {
+      attrs: { role: 'menu', popover: 'auto' },
+    });
+    append(body, menuPopover);
+    windowObj.__agyInboxBridge.syncFullBleedWorkspace();
+    expect(menuPopover.style.getPropertyValue('display')).toBe('');
+    expect(menuPopover.style.getPropertyValue('position')).toBe('relative');
+    expect(menuPopover.style.getPropertyValue('z-index')).toBe('2000');
+
+    // 3. Navigating back to `/` (All Machines overview) restores all original inline styles
+    currentLocation.pathname = '/';
+    currentLocation.href = 'https://antigravity.google.com/';
+    for (const fn of popstateHandlers) {
+      fn();
+    }
+    expect(hubIframe.style.getPropertyValue('position')).toBe('');
+    expect(hostTopHeader.style.getPropertyValue('display')).toBe('flex');
+    expect(googleOneBar.style.getPropertyValue('display')).toBe('flex');
+    expect(workspaceMain.style.getPropertyValue('padding-top')).toBe('56px');
+    expect(appRoot.style.getPropertyValue('margin-top')).toBe('4px');
+    expect(cdkOverlayContainer.style.getPropertyValue('position')).toBe('');
+    expect(cdkOverlayContainer.style.getPropertyValue('z-index')).toBe('');
+
+    windowObj.__agyInboxBridge.stop();
   });
 });

@@ -17,7 +17,6 @@ import {
   View,
   useWindowDimensions,
 } from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   ANTIGRAVITY_DASHBOARD_URL,
   DEFAULT_ACTION_NOTIFICATION_MODE,
@@ -30,6 +29,7 @@ import {
 import {
   InboxAttentionKind,
   InboxFilterTab,
+  InboxInstanceSummary,
   InboxSnapshot,
   InboxThreadItem,
 } from '../types/inbox';
@@ -39,6 +39,7 @@ import {
   KeepAliveMinutes,
 } from '../types/session';
 import {
+  extractAccountPathPrefix,
   formatRelativeTime,
   formatResetCountdown,
 } from '../utils/inboxParser';
@@ -72,6 +73,7 @@ export interface LeftNavigationDrawerProps {
   isKeyboardVisible?: boolean;
   keyboardBottomPadding?: number;
   stage: AuthFlowStage;
+  activeUrl?: string | null;
   snapshot: InboxSnapshot;
   isRefreshing: boolean;
   attentionCount: number;
@@ -81,6 +83,7 @@ export interface LeftNavigationDrawerProps {
   actionNotificationMode?: ActionNotificationMode;
   onOpen: (preferredMode?: DrawerMode) => void;
   onClose: () => void;
+  onRegisterBackHandler?: (interceptor: (() => boolean) | null) => void;
   onRefreshInbox: (forceUsage?: boolean) => void;
   onSelectThread: (thread: InboxThreadItem) => void;
   onMarkThreadRead: (thread: InboxThreadItem) => void;
@@ -88,6 +91,7 @@ export interface LeftNavigationDrawerProps {
   onChangeKeepAliveMinutes?: (minutes: KeepAliveMinutes) => void;
   onChangeActionNotificationMode?: (mode: ActionNotificationMode) => void;
   onNavigateToUrl: (targetUrl: string) => void;
+  onOpenHostSettings?: () => void;
   onReloadSession: () => void;
   onSignOut: () => void;
 }
@@ -242,6 +246,94 @@ function getHandleVisualState(params: {
   };
 }
 
+const ChevronIcon: React.FC<{ expanded: boolean; color?: string }> = ({
+  expanded,
+  color = '#94A3B8',
+}) => (
+  <View style={styles.chevronBox}>
+    <View
+      style={[
+        styles.chevronGlyph,
+        { borderColor: color },
+        expanded ? styles.chevronGlyphUp : styles.chevronGlyphDown,
+      ]}
+    />
+  </View>
+);
+
+const SearchIcon: React.FC<{ color?: string; compact?: boolean }> = ({
+  color = '#94A3B8',
+  compact = false,
+}) => (
+  <View
+    style={compact ? styles.searchIconBoxCompact : styles.searchIconBox}
+  >
+    <View
+      style={[
+        compact ? styles.searchIconLensCompact : styles.searchIconLens,
+        { borderColor: color },
+      ]}
+    />
+    <View
+      style={[
+        compact ? styles.searchIconHandleCompact : styles.searchIconHandle,
+        { backgroundColor: color },
+      ]}
+    />
+  </View>
+);
+
+const InboxNavIcon: React.FC<{ color: string }> = ({ color }) => (
+  <View style={styles.navIconFrame}>
+    <View style={[styles.inboxIconOuter, { borderColor: color }]}>
+      <View style={[styles.inboxIconShelf, { backgroundColor: color }]} />
+    </View>
+  </View>
+);
+
+const UsageNavIcon: React.FC<{ color: string }> = ({ color }) => (
+  <View style={[styles.navIconFrame, styles.usageIconRow]}>
+    <View
+      style={[styles.usageIconBar, { height: 5, backgroundColor: color }]}
+    />
+    <View
+      style={[styles.usageIconBar, { height: 9, backgroundColor: color }]}
+    />
+    <View
+      style={[styles.usageIconBar, { height: 13, backgroundColor: color }]}
+    />
+  </View>
+);
+
+const SettingsNavIcon: React.FC<{ color: string }> = ({ color }) => (
+  <View style={[styles.navIconFrame, styles.settingsIconStack]}>
+    <View style={styles.settingsSliderRow}>
+      <View
+        style={[styles.settingsSliderTrack, { backgroundColor: color }]}
+      />
+      <View
+        style={[
+          styles.settingsSliderKnob,
+          styles.settingsSliderKnobLeft,
+          { borderColor: color },
+        ]}
+      />
+    </View>
+    <View style={styles.settingsSliderRow}>
+      <View
+        style={[styles.settingsSliderTrack, { backgroundColor: color }]}
+      />
+      <View
+        style={[
+          styles.settingsSliderKnob,
+          styles.settingsSliderKnobRight,
+          { borderColor: color },
+        ]}
+      />
+    </View>
+  </View>
+);
+
 export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   visible,
   initialMode,
@@ -249,6 +341,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   isKeyboardVisible = false,
   keyboardBottomPadding = 0,
   stage,
+  activeUrl,
   snapshot,
   isRefreshing,
   attentionCount,
@@ -258,6 +351,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   actionNotificationMode = DEFAULT_ACTION_NOTIFICATION_MODE,
   onOpen,
   onClose,
+  onRegisterBackHandler,
   onRefreshInbox,
   onSelectThread,
   onMarkThreadRead,
@@ -265,12 +359,14 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   onChangeKeepAliveMinutes,
   onChangeActionNotificationMode,
   onNavigateToUrl,
+  onOpenHostSettings,
   onReloadSession,
   onSignOut,
 }) => {
-  const insets = useSafeAreaInsets();
-  const { width: rawWindowWidth } = useWindowDimensions();
+  const { width: rawWindowWidth, height: rawWindowHeight } =
+    useWindowDimensions();
   const safeWindowWidth = rawWindowWidth > 0 ? rawWindowWidth : 390;
+  const safeWindowHeight = rawWindowHeight > 0 ? rawWindowHeight : 680;
   const drawerWidth = Math.min(
     344,
     Math.max(296, Math.round(safeWindowWidth * 0.86)),
@@ -285,6 +381,10 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   const [activeMode, setActiveMode] = useState<DrawerMode>(defaultMode);
   const [selectedTab, setSelectedTab] = useState<InboxFilterTab>('all');
   const [searchQuery, setSearchQuery] = useState('');
+  const [isSearchExpanded, setIsSearchExpanded] = useState(false);
+  const [isMachineMenuOpen, setIsMachineMenuOpen] = useState(false);
+  const [headerRowBottom, setHeaderRowBottom] = useState<number>(48);
+  const [drawerPanelHeight, setDrawerPanelHeight] = useState<number>(0);
   const [handoffText, setHandoffText] = useState('');
   const [isHandoffExpanded, setIsHandoffExpanded] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
@@ -293,6 +393,10 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
 
   const visibleRef = useRef<boolean>(visible);
   visibleRef.current = visible;
+  const isMachineMenuOpenRef = useRef<boolean>(isMachineMenuOpen);
+  isMachineMenuOpenRef.current = isMachineMenuOpen;
+  const handoffTextRef = useRef<string>(handoffText);
+  handoffTextRef.current = handoffText;
   const isDraggingOpenRef = useRef<boolean>(isDraggingOpen);
   isDraggingOpenRef.current = isDraggingOpen;
   const wasVisibleRef = useRef<boolean>(visible);
@@ -376,17 +480,72 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     [],
   );
 
+  const handleDrawerPanelLayout = useCallback(
+    (event: { nativeEvent?: { layout?: { height?: number } } }) => {
+      const measuredHeight = event?.nativeEvent?.layout?.height ?? 0;
+      if (measuredHeight > 0) {
+        setDrawerPanelHeight(Math.round(measuredHeight));
+      }
+    },
+    [],
+  );
+
+  const handleHeaderRowLayout = useCallback(
+    (event: {
+      nativeEvent?: { layout?: { y?: number; height?: number } };
+    }) => {
+      const measuredHeight = event?.nativeEvent?.layout?.height ?? 0;
+      const measuredY = event?.nativeEvent?.layout?.y ?? 10;
+      if (measuredHeight > 0) {
+        setHeaderRowBottom(Math.max(40, Math.round(measuredY + measuredHeight)));
+      }
+    },
+    [],
+  );
+
+  const resetTransientInputs = useCallback(() => {
+    setSearchQuery('');
+    setIsSearchExpanded(false);
+    setIsMachineMenuOpen(false);
+    setValidationError(null);
+    setConfirmingSignOut(false);
+    setIsHandoffExpanded((prev) =>
+      handoffTextRef.current.trim().length > 0 ? prev : false,
+    );
+  }, []);
+
+  useEffect(() => {
+    if (!onRegisterBackHandler) {
+      return;
+    }
+    onRegisterBackHandler(() => {
+      if (isMachineMenuOpenRef.current) {
+        isMachineMenuOpenRef.current = false;
+        setIsMachineMenuOpen(false);
+        return true;
+      }
+      return false;
+    });
+    return () => {
+      onRegisterBackHandler(null);
+    };
+  }, [onRegisterBackHandler]);
+
   useEffect(() => {
     if (visible && !wasVisibleRef.current) {
       const nextMode =
         initialMode ?? (stage === 'authenticated' ? 'inbox' : 'settings');
       setActiveMode(nextMode);
+      setIsMachineMenuOpen(false);
+    } else if (!visible && wasVisibleRef.current) {
+      resetTransientInputs();
     }
-  }, [initialMode, stage, visible]);
+  }, [initialMode, resetTransientInputs, stage, visible]);
 
   useEffect(() => {
     if (focusInboxRequestKey > 0) {
       setActiveMode('inbox');
+      setIsMachineMenuOpen(false);
       setSelectedTab((prev) => (prev === 'running' ? 'all' : prev));
     }
   }, [focusInboxRequestKey]);
@@ -464,13 +623,6 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
       subscription.remove();
     };
   }, [translateX]);
-
-  const resetTransientInputs = useCallback(() => {
-    setSearchQuery('');
-    setValidationError(null);
-    setConfirmingSignOut(false);
-    setIsHandoffExpanded((prev) => (handoffText.trim().length > 0 ? prev : false));
-  }, [handoffText]);
 
   const handleClose = useCallback(() => {
     resetTransientInputs();
@@ -637,6 +789,118 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     [snapshot.instances],
   );
 
+  const sortedInstances = useMemo((): InboxInstanceSummary[] => {
+    const rank = (inst: InboxInstanceSummary): number => {
+      if (
+        inst.uuid === snapshot.activeInstanceUuid &&
+        inst.status === 'connected'
+      ) {
+        return 0;
+      }
+      if (inst.status === 'connected') return 1;
+      if (inst.uuid === snapshot.activeInstanceUuid) return 2;
+      if (inst.status === 'idle') return 3;
+      return 4;
+    };
+    return [...snapshot.instances].sort((a, b) => rank(a) - rank(b));
+  }, [snapshot.activeInstanceUuid, snapshot.instances]);
+
+  const activeInstance = useMemo((): InboxInstanceSummary | null => {
+    if (
+      !snapshot.activeInstanceUuid ||
+      snapshot.activeInstanceUuid === '__cloud__'
+    ) {
+      return null;
+    }
+    return (
+      snapshot.instances.find(
+        (inst) => inst.uuid === snapshot.activeInstanceUuid,
+      ) ?? null
+    );
+  }, [snapshot.activeInstanceUuid, snapshot.instances]);
+
+  const machineSelectorVisuals = useMemo((): {
+    label: string;
+    dotColor: string;
+  } => {
+    if (stage === 'authenticating') {
+      return { label: 'Sign in…', dotColor: '#60A5FA' };
+    }
+    if (stage === 'offline') {
+      return {
+        label:
+          activeInstance?.name ||
+          (snapshot.activeInstanceUuid &&
+          snapshot.activeInstanceUuid !== '__cloud__'
+            ? snapshot.activeInstanceUuid
+            : connectedInstances[0]?.name || 'Offline'),
+        dotColor: '#F87171',
+      };
+    }
+    if (stage !== 'authenticated') {
+      return { label: 'Connecting…', dotColor: '#94A3B8' };
+    }
+    if (activeInstance) {
+      const dotColor =
+        activeInstance.status === 'connected'
+          ? '#34D399'
+          : activeInstance.status === 'disconnected'
+            ? '#F87171'
+            : '#94A3B8';
+      return { label: activeInstance.name, dotColor };
+    }
+    if (snapshot.activeInstanceUuid === '__cloud__') {
+      return { label: 'Cloud Agent', dotColor: '#60A5FA' };
+    }
+    if (snapshot.activeInstanceUuid) {
+      return {
+        label: snapshot.activeInstanceUuid,
+        dotColor: isRefreshing ? '#60A5FA' : '#94A3B8',
+      };
+    }
+    if (connectedInstances.length > 0) {
+      return {
+        label: 'All Machines',
+        dotColor: '#34D399',
+      };
+    }
+    if (snapshot.instances.length > 0) {
+      return {
+        label: 'All Machines',
+        dotColor: '#94A3B8',
+      };
+    }
+    if (isRefreshing) {
+      return { label: 'Syncing…', dotColor: '#60A5FA' };
+    }
+    return { label: 'Workstations', dotColor: '#64748B' };
+  }, [
+    activeInstance,
+    connectedInstances,
+    isRefreshing,
+    snapshot.activeInstanceUuid,
+    snapshot.instances.length,
+    stage,
+  ]);
+
+  const accountPathPrefix = useMemo(() => {
+    const fromActiveUrl = extractAccountPathPrefix(activeUrl);
+    if (fromActiveUrl) {
+      return fromActiveUrl;
+    }
+    for (const thread of snapshot.threads) {
+      const fromThread = extractAccountPathPrefix(thread.targetUrl);
+      if (fromThread) {
+        return fromThread;
+      }
+    }
+    return '';
+  }, [activeUrl, snapshot.threads]);
+
+  const dashboardUrl = accountPathPrefix
+    ? `${ANTIGRAVITY_DASHBOARD_URL}${accountPathPrefix}/`
+    : ANTIGRAVITY_DASHBOARD_URL;
+
   const counts = useMemo(() => {
     let attention = 0;
     let running = 0;
@@ -684,28 +948,23 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     });
   }, [searchQuery, selectedTab, snapshot.threads]);
 
-  const inboxSubtitleText = useMemo(() => {
-    if (stage !== 'authenticated') {
-      return stage === 'authenticating'
-        ? 'Sign in to view workstation threads'
-        : 'Waiting for connection…';
-    }
-    const machineCount = connectedInstances.length;
-    const machineLabel =
-      machineCount === 1
-        ? `1 machine (${connectedInstances[0].name})`
-        : `${machineCount} machines`;
-    const updatedLabel =
-      snapshot.fetchedAtMs > 0 ? formatRelativeTime(snapshot.fetchedAtMs) : '';
-    if (snapshot.fetchedAtMs === 0) {
-      return isRefreshing
-        ? 'Syncing threads from Antigravity…'
-        : 'Waiting for workstation…';
-    }
-    return updatedLabel ? `${machineLabel} • ${updatedLabel}` : machineLabel;
-  }, [connectedInstances, isRefreshing, snapshot.fetchedAtMs, stage]);
-
   const usage = snapshot.usage ?? null;
+
+  const snapshotUpdatedLabel = useMemo(
+    () =>
+      snapshot.fetchedAtMs > 0 ? formatRelativeTime(snapshot.fetchedAtMs) : '',
+    [snapshot.fetchedAtMs],
+  );
+
+  const usageUpdatedLabel = useMemo(() => {
+    if (stage !== 'authenticated') {
+      return '';
+    }
+    if (usage && usage.fetchedAtMs > 0) {
+      return formatRelativeTime(usage.fetchedAtMs);
+    }
+    return snapshotUpdatedLabel;
+  }, [snapshotUpdatedLabel, stage, usage]);
 
   const activityStats = useMemo(() => {
     let totalSteps = 0;
@@ -730,29 +989,6 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
       firstBudgetPausedThread,
     };
   }, [snapshot.threads]);
-
-  const usageSubtitleText = useMemo(() => {
-    if (stage !== 'authenticated') {
-      return stage === 'authenticating'
-        ? 'Sign in to view account usage'
-        : 'Waiting for connection…';
-    }
-    if (usage) {
-      const updatedLabel =
-        usage.fetchedAtMs > 0 ? formatRelativeTime(usage.fetchedAtMs) : '';
-      const hostLabel = usage.sourceInstanceName || 'Workstation';
-      return updatedLabel ? `${hostLabel} • ${updatedLabel}` : hostLabel;
-    }
-    if (isRefreshing) {
-      return 'Syncing usage from Antigravity…';
-    }
-    if (connectedInstances.length > 0) {
-      return connectedInstances.length === 1
-        ? `1 machine (${connectedInstances[0].name})`
-        : `${connectedInstances.length} machines`;
-    }
-    return 'Waiting for workstation…';
-  }, [connectedInstances, isRefreshing, stage, usage]);
 
   const usageStatusDotColor = useMemo(() => {
     if (stage !== 'authenticated' || !usage) {
@@ -792,11 +1028,35 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   };
 
   const handleOpenDashboard = () => {
+    setIsMachineMenuOpen(false);
     setValidationError(null);
     setConfirmingSignOut(false);
     isDraggingOpenRef.current = false;
     setIsDraggingOpen(false);
-    onNavigateToUrl(ANTIGRAVITY_DASHBOARD_URL);
+    onNavigateToUrl(dashboardUrl);
+    onClose();
+  };
+
+  const handleSelectWorkstation = (inst: InboxInstanceSummary) => {
+    const targetUrl = `https://antigravity.google.com${accountPathPrefix}/r/${encodeURIComponent(
+      inst.uuid,
+    )}`;
+    resetTransientInputs();
+    isDraggingOpenRef.current = false;
+    setIsDraggingOpen(false);
+    onNavigateToUrl(targetUrl);
+    onClose();
+  };
+
+  const handleTriggerHostSettings = () => {
+    resetTransientInputs();
+    isDraggingOpenRef.current = false;
+    setIsDraggingOpen(false);
+    if (onOpenHostSettings) {
+      onOpenHostSettings();
+    } else {
+      onNavigateToUrl(dashboardUrl);
+    }
     onClose();
   };
 
@@ -804,6 +1064,8 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     setConfirmingSignOut(false);
     setHandoffText('');
     setIsHandoffExpanded(false);
+    setIsMachineMenuOpen(false);
+    setIsSearchExpanded(false);
     setValidationError(null);
     setSearchQuery('');
     setSelectedTab('all');
@@ -883,6 +1145,23 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
       ? `Open Antigravity drawer (${attentionCount} need attention)`
       : 'Open Antigravity drawer';
 
+  const isSearchVisible = isSearchExpanded || searchQuery.trim().length > 0;
+  const effectiveDrawerHeight =
+    drawerPanelHeight > 0
+      ? drawerPanelHeight
+      : Math.max(240, safeWindowHeight - keyboardBottomPadding);
+  const menuTopOffset = headerRowBottom + 2;
+  const menuBottomReserved = isKeyboardVisible ? 12 : 64;
+  const menuCardMaxHeight = Math.min(
+    420,
+    Math.max(148, effectiveDrawerHeight - menuTopOffset - menuBottomReserved),
+  );
+  const menuScrollMaxHeight = Math.max(120, menuCardMaxHeight - 14);
+  const isAllMachinesActive =
+    stage === 'authenticated' &&
+    snapshot.activeInstanceUuid === null &&
+    snapshot.instances.length > 0;
+
   return (
     <View style={styles.overlayRoot} pointerEvents="box-none">
       <View
@@ -908,218 +1187,202 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
             {
               width: drawerWidth,
               bottom: keyboardBottomPadding,
-              paddingTop: Math.max(insets.top + 12, 20),
-              paddingBottom:
-                keyboardBottomPadding > 0
-                  ? 12
-                  : Math.max(insets.bottom + 14, 20),
+              paddingTop: 10,
+              paddingBottom: isKeyboardVisible ? 10 : 0,
               transform: [{ translateX }],
             },
           ]}
+          onLayout={handleDrawerPanelLayout}
           {...openDrawerPanResponder.panHandlers}
         >
-            {/* Segmented Mode Switcher: Inbox | Usage | Settings */}
-            <View style={styles.modeSwitchTrack}>
+            {/* Row 1: Compact Workstation Selector + Contextual Header Actions */}
+            <View
+              style={styles.sidebarHeaderRow}
+              onLayout={handleHeaderRowLayout}
+            >
               <TouchableOpacity
                 style={[
-                  styles.modeSwitchBtn,
-                  activeMode === 'inbox' ? styles.modeSwitchBtnActive : null,
+                  styles.machineSelectorPill,
+                  isMachineMenuOpen ? styles.machineSelectorPillOpen : null,
                 ]}
-                onPress={() => {
-                  setActiveMode('inbox');
-                  if (stage === 'authenticated' && !isRefreshing) {
-                    onRefreshInbox(false);
-                  }
-                }}
+                activeOpacity={0.82}
+                onPress={() => setIsMachineMenuOpen((prev) => !prev)}
                 accessibilityRole="button"
-                accessibilityState={{ selected: activeMode === 'inbox' }}
-                accessibilityLabel="Drawer mode Inbox"
+                accessibilityState={{ expanded: isMachineMenuOpen }}
+                accessibilityLabel="Select workstation"
               >
-                {attentionCount === 0 && runningCount > 0 ? (
-                  <View
-                    style={[styles.modeStatusDot, { backgroundColor: '#10B981' }]}
-                  />
-                ) : null}
-                <Text
-                  numberOfLines={1}
+                <View
                   style={[
-                    styles.modeSwitchText,
-                    activeMode === 'inbox' ? styles.modeSwitchTextActive : null,
+                    styles.machineSelectorDot,
+                    { backgroundColor: machineSelectorVisuals.dotColor },
                   ]}
-                >
-                  Inbox
+                />
+                <Text style={styles.machineSelectorLabel} numberOfLines={1}>
+                  {machineSelectorVisuals.label}
                 </Text>
-                {badgeCountLabel ? (
-                  <View
-                    style={[
-                      styles.modeCountBadge,
-                      urgentAttentionCount > 0
-                        ? styles.modeCountBadgeUrgent
-                        : styles.modeCountBadgeUnread,
-                    ]}
-                  >
-                    <Text style={styles.modeCountBadgeText}>
-                      {badgeCountLabel}
-                    </Text>
-                  </View>
-                ) : null}
+                <ChevronIcon
+                  expanded={isMachineMenuOpen}
+                  color={isMachineMenuOpen ? '#93C5FD' : '#94A3B8'}
+                />
               </TouchableOpacity>
 
-              <TouchableOpacity
-                style={[
-                  styles.modeSwitchBtn,
-                  activeMode === 'usage' ? styles.modeSwitchBtnActive : null,
-                ]}
-                onPress={() => {
-                  setActiveMode('usage');
-                  if (stage === 'authenticated' && !isRefreshing) {
-                    onRefreshInbox(true);
-                  }
-                }}
-                accessibilityRole="button"
-                accessibilityState={{ selected: activeMode === 'usage' }}
-                accessibilityLabel="Drawer mode Usage"
-              >
-                {usageStatusDotColor ? (
-                  <View
-                    style={[
-                      styles.modeStatusDot,
-                      { backgroundColor: usageStatusDotColor },
-                    ]}
-                  />
-                ) : null}
-                <Text
-                  numberOfLines={1}
-                  style={[
-                    styles.modeSwitchText,
-                    activeMode === 'usage' ? styles.modeSwitchTextActive : null,
-                  ]}
-                >
-                  Usage
-                </Text>
-              </TouchableOpacity>
+              <View style={styles.headerActionsRow}>
+                {activeMode === 'inbox' ? (
+                  <>
+                    <TouchableOpacity
+                      style={[
+                        styles.headerIconBtn,
+                        isSearchVisible ? styles.headerIconBtnActive : null,
+                      ]}
+                      onPress={() => {
+                        setIsMachineMenuOpen(false);
+                        if (isSearchVisible) {
+                          setSearchQuery('');
+                          setIsSearchExpanded(false);
+                          searchInputRef.current?.blur?.();
+                        } else {
+                          setIsSearchExpanded(true);
+                        }
+                      }}
+                      accessibilityRole="button"
+                      accessibilityState={{ expanded: isSearchVisible }}
+                      accessibilityLabel="Toggle thread search"
+                    >
+                      <SearchIcon
+                        color={isSearchVisible ? '#93C5FD' : '#94A3B8'}
+                      />
+                    </TouchableOpacity>
 
-              <TouchableOpacity
-                style={[
-                  styles.modeSwitchBtn,
-                  activeMode === 'settings' ? styles.modeSwitchBtnActive : null,
-                ]}
-                onPress={() => setActiveMode('settings')}
-                accessibilityRole="button"
-                accessibilityState={{ selected: activeMode === 'settings' }}
-                accessibilityLabel="Drawer mode Settings"
-              >
-                <Text
-                  numberOfLines={1}
-                  style={[
-                    styles.modeSwitchText,
-                    activeMode === 'settings'
-                      ? styles.modeSwitchTextActive
-                      : null,
-                  ]}
-                >
-                  Settings
-                </Text>
-              </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.headerIconBtn}
+                      onPress={() => {
+                        setIsMachineMenuOpen(false);
+                        onRefreshInbox(false);
+                      }}
+                      accessibilityRole="button"
+                      accessibilityLabel="Refresh Thread Inbox"
+                    >
+                      {isRefreshing ? (
+                        <ActivityIndicator size="small" color="#93C5FD" />
+                      ) : (
+                        <Text style={styles.headerSyncGlyph}>↻</Text>
+                      )}
+                    </TouchableOpacity>
+                  </>
+                ) : activeMode === 'usage' ? (
+                  <>
+                    {usageUpdatedLabel ? (
+                      <Text style={styles.headerFreshnessText} numberOfLines={1}>
+                        {usageUpdatedLabel}
+                      </Text>
+                    ) : null}
+                    <TouchableOpacity
+                      style={styles.headerIconBtn}
+                      onPress={() => {
+                        setIsMachineMenuOpen(false);
+                        onRefreshInbox(true);
+                      }}
+                      disabled={isRefreshing || stage !== 'authenticated'}
+                      accessibilityRole="button"
+                      accessibilityLabel="Refresh Usage Stats"
+                    >
+                      {isRefreshing ? (
+                        <ActivityIndicator size="small" color="#93C5FD" />
+                      ) : (
+                        <Text style={styles.headerSyncGlyph}>↻</Text>
+                      )}
+                    </TouchableOpacity>
+                  </>
+                ) : (
+                  <Text style={styles.headerModeLabel}>Settings</Text>
+                )}
+              </View>
             </View>
 
             {activeMode === 'inbox' ? (
               <View style={styles.modeBody}>
-                <View style={styles.inboxSubheaderRow}>
-                  <Text style={styles.inboxSubtitle} numberOfLines={1}>
-                    {inboxSubtitleText}
-                  </Text>
-                  <View style={styles.inboxHeaderActions}>
-                    {stage === 'authenticated' ? (
-                      <TouchableOpacity
-                        onPress={handleOpenDashboard}
-                        style={styles.refreshMiniBtn}
-                        accessibilityRole="button"
-                        accessibilityLabel="Open All Machines overview"
-                      >
-                        <Text style={styles.refreshMiniBtnText}>Machines</Text>
-                      </TouchableOpacity>
-                    ) : null}
-                    <TouchableOpacity
-                      onPress={() => onRefreshInbox(false)}
-                      style={styles.refreshMiniBtn}
-                      accessibilityRole="button"
-                      accessibilityLabel="Refresh Thread Inbox"
-                    >
-                      <Text style={styles.refreshMiniBtnText}>
-                        {isRefreshing ? 'Syncing…' : 'Refresh'}
-                      </Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-
-                <View style={styles.tabsRow}>
-                  {(
-                    [
-                      {
-                        key: 'all' as const,
-                        label: 'All',
-                        a11yLabel: 'All',
-                        count: counts.all,
-                      },
-                      {
-                        key: 'attention' as const,
-                        label: 'Attention',
-                        a11yLabel: 'Needs Attention',
-                        count: counts.attention,
-                      },
-                      {
-                        key: 'running' as const,
-                        label: 'Running',
-                        a11yLabel: 'Running',
-                        count: counts.running,
-                      },
-                    ] as const
-                  ).map((tab) => {
-                    const selected = selectedTab === tab.key;
-                    return (
-                      <TouchableOpacity
-                        key={tab.key}
-                        style={[
-                          styles.tabChip,
-                          selected ? styles.tabChipSelected : null,
-                        ]}
-                        onPress={() => setSelectedTab(tab.key)}
-                        accessibilityRole="button"
-                        accessibilityState={{ selected }}
-                        accessibilityLabel={`Inbox tab ${tab.a11yLabel}`}
-                      >
-                        <Text
+                {/* Row 2: Clean Underline Filter Strip + Contextual Read All */}
+                <View style={styles.filterStrip}>
+                  <View style={styles.filterTabsGroup}>
+                    {(
+                      [
+                        {
+                          key: 'all' as const,
+                          label: 'All',
+                          a11yLabel: 'All',
+                          count: counts.all,
+                        },
+                        {
+                          key: 'attention' as const,
+                          label: 'Attention',
+                          a11yLabel: 'Needs Attention',
+                          count: counts.attention,
+                        },
+                        {
+                          key: 'running' as const,
+                          label: 'Running',
+                          a11yLabel: 'Running',
+                          count: counts.running,
+                        },
+                      ] as const
+                    ).map((tab) => {
+                      const selected = selectedTab === tab.key;
+                      return (
+                        <TouchableOpacity
+                          key={tab.key}
                           style={[
-                            styles.tabChipText,
-                            selected ? styles.tabChipTextSelected : null,
+                            styles.filterTabBtn,
+                            selected ? styles.filterTabBtnSelected : null,
                           ]}
-                          numberOfLines={1}
-                        >
-                          {tab.label}
-                        </Text>
-                        <View
-                          style={[
-                            styles.tabCountBadge,
-                            selected ? styles.tabCountBadgeSelected : null,
-                          ]}
+                          onPress={() => setSelectedTab(tab.key)}
+                          accessibilityRole="button"
+                          accessibilityState={{ selected }}
+                          accessibilityLabel={`Inbox tab ${tab.a11yLabel}`}
                         >
                           <Text
                             style={[
-                              styles.tabCountText,
-                              selected ? styles.tabCountTextSelected : null,
+                              styles.filterTabText,
+                              selected ? styles.filterTabTextSelected : null,
+                            ]}
+                            numberOfLines={1}
+                          >
+                            {tab.label}
+                          </Text>
+                          <View
+                            style={[
+                              styles.tabCountBadge,
+                              selected ? styles.tabCountBadgeSelected : null,
                             ]}
                           >
-                            {tab.count}
-                          </Text>
-                        </View>
-                      </TouchableOpacity>
-                    );
-                  })}
+                            <Text
+                              style={[
+                                styles.tabCountText,
+                                selected ? styles.tabCountTextSelected : null,
+                              ]}
+                            >
+                              {tab.count}
+                            </Text>
+                          </View>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+
+                  {counts.dismissible > 0 ? (
+                    <TouchableOpacity
+                      style={styles.readAllInlineBtn}
+                      onPress={onMarkAllRead}
+                      accessibilityRole="button"
+                      accessibilityLabel="Mark all threads as read"
+                    >
+                      <Text style={styles.readAllInlineText}>Read all</Text>
+                    </TouchableOpacity>
+                  ) : null}
                 </View>
 
-                {counts.all > 0 ? (
-                  <View style={styles.toolbarRow}>
+                {isSearchVisible ? (
+                  <View style={styles.searchBarRow}>
+                    <SearchIcon color="#64748B" compact />
                     <TextInput
                       ref={searchInputRef}
                       style={styles.searchInput}
@@ -1129,19 +1392,22 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                       placeholderTextColor="#64748B"
                       autoCapitalize="none"
                       autoCorrect={false}
+                      autoFocus={visible && isSearchExpanded}
                       returnKeyType="search"
                       accessibilityLabel="Filter Inbox threads"
                     />
-                    {counts.dismissible > 0 ? (
-                      <TouchableOpacity
-                        style={styles.markAllButton}
-                        onPress={onMarkAllRead}
-                        accessibilityRole="button"
-                        accessibilityLabel="Mark all threads as read"
-                      >
-                        <Text style={styles.markAllButtonText}>Read all</Text>
-                      </TouchableOpacity>
-                    ) : null}
+                    <TouchableOpacity
+                      style={styles.searchClearBtn}
+                      onPress={() => {
+                        setSearchQuery('');
+                        setIsSearchExpanded(false);
+                        searchInputRef.current?.blur?.();
+                      }}
+                      accessibilityRole="button"
+                      accessibilityLabel="Close thread search"
+                    >
+                      <Text style={styles.searchClearText}>✕</Text>
+                    </TouchableOpacity>
                   </View>
                 ) : null}
 
@@ -1385,25 +1651,6 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
               </View>
             ) : activeMode === 'usage' ? (
               <View style={styles.modeBody}>
-                <View style={styles.inboxSubheaderRow}>
-                  <Text style={styles.inboxSubtitle} numberOfLines={1}>
-                    {usageSubtitleText}
-                  </Text>
-                  <View style={styles.inboxHeaderActions}>
-                    <TouchableOpacity
-                      onPress={() => onRefreshInbox(true)}
-                      disabled={isRefreshing || stage !== 'authenticated'}
-                      style={styles.refreshMiniBtn}
-                      accessibilityRole="button"
-                      accessibilityLabel="Refresh Usage Stats"
-                    >
-                      <Text style={styles.refreshMiniBtnText}>
-                        {isRefreshing ? 'Syncing…' : 'Refresh'}
-                      </Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-
                 <ScrollView
                   style={styles.flexScroll}
                   contentContainerStyle={styles.usageScrollContent}
@@ -2149,6 +2396,301 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
               </ScrollView>
             )}
 
+            {/* Workstation Switcher & Host Controls Popover */}
+            {isMachineMenuOpen ? (
+              <>
+                <Pressable
+                  style={[
+                    styles.machineMenuScrim,
+                    { top: headerRowBottom },
+                    isKeyboardVisible
+                      ? styles.machineMenuScrimKeyboard
+                      : null,
+                  ]}
+                  onPress={() => setIsMachineMenuOpen(false)}
+                  accessibilityRole="button"
+                  accessibilityLabel="Dismiss workstation menu"
+                />
+                <View
+                  style={[
+                    styles.machineMenuCard,
+                    {
+                      top: menuTopOffset,
+                      maxHeight: menuCardMaxHeight,
+                    },
+                  ]}
+                >
+                  <ScrollView
+                    style={{ maxHeight: menuScrollMaxHeight }}
+                    bounces={false}
+                    keyboardShouldPersistTaps="handled"
+                    showsVerticalScrollIndicator={false}
+                  >
+                    <Text style={styles.machineMenuSectionLabel}>
+                      WORKSTATIONS
+                    </Text>
+                    {sortedInstances.length > 0 ? (
+                      sortedInstances.map((inst) => {
+                        const isCurrent =
+                          snapshot.activeInstanceUuid !== null &&
+                          snapshot.activeInstanceUuid === inst.uuid;
+                        const statusColor =
+                          inst.status === 'connected'
+                            ? '#34D399'
+                            : inst.status === 'disconnected'
+                              ? '#F87171'
+                              : '#94A3B8';
+                        const statusLabel =
+                          inst.status === 'connected'
+                            ? snapshotUpdatedLabel
+                              ? `Connected • Synced ${snapshotUpdatedLabel}`
+                              : 'Connected'
+                            : inst.status === 'disconnected'
+                              ? 'Offline'
+                              : 'Idle';
+                        return (
+                          <TouchableOpacity
+                            key={inst.uuid}
+                            style={[
+                              styles.machineMenuItem,
+                              isCurrent ? styles.machineMenuItemActive : null,
+                            ]}
+                            onPress={() => handleSelectWorkstation(inst)}
+                            accessibilityRole="button"
+                            accessibilityState={{ selected: isCurrent }}
+                            accessibilityLabel={`Switch to workstation ${inst.name}`}
+                          >
+                            <View
+                              style={[
+                                styles.machineSelectorDot,
+                                { backgroundColor: statusColor },
+                              ]}
+                            />
+                            <View style={styles.machineMenuItemMeta}>
+                              <Text
+                                style={[
+                                  styles.machineMenuItemTitle,
+                                  isCurrent
+                                    ? styles.machineMenuItemTitleActive
+                                    : null,
+                                ]}
+                                numberOfLines={1}
+                              >
+                                {inst.name}
+                              </Text>
+                              <Text
+                                style={styles.machineMenuItemSub}
+                                numberOfLines={1}
+                              >
+                                {statusLabel}
+                              </Text>
+                            </View>
+                            {isCurrent ? (
+                              <Text style={styles.machineMenuCheck}>✓</Text>
+                            ) : null}
+                          </TouchableOpacity>
+                        );
+                      })
+                    ) : (
+                      <Text style={styles.machineMenuEmptyText}>
+                        {stage !== 'authenticated'
+                          ? 'Sign in to view connected workstations'
+                          : 'No workstations online yet'}
+                      </Text>
+                    )}
+
+                    <View style={styles.machineMenuDivider} />
+
+                    <TouchableOpacity
+                      style={[
+                        styles.machineMenuActionRow,
+                        isAllMachinesActive
+                          ? styles.machineMenuItemActive
+                          : null,
+                      ]}
+                      onPress={handleOpenDashboard}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected: isAllMachinesActive }}
+                      accessibilityLabel="Open All Machines overview"
+                    >
+                      <Text style={styles.machineMenuActionIcon}>⊞</Text>
+                      <Text style={styles.machineMenuActionText}>
+                        All Machines Overview
+                      </Text>
+                      {isAllMachinesActive ? (
+                        <Text style={styles.machineMenuCheck}>✓</Text>
+                      ) : null}
+                    </TouchableOpacity>
+
+                    <TouchableOpacity
+                      style={styles.machineMenuActionRow}
+                      onPress={() => {
+                        setIsMachineMenuOpen(false);
+                        setActiveMode('settings');
+                        setIsHandoffExpanded(true);
+                      }}
+                      accessibilityRole="button"
+                      accessibilityLabel="Connect link or machine ID"
+                    >
+                      <Text style={styles.machineMenuActionIcon}>＋</Text>
+                      <Text style={styles.machineMenuActionText}>
+                        Connect Link or Machine ID…
+                      </Text>
+                    </TouchableOpacity>
+
+                    <TouchableOpacity
+                      style={styles.machineMenuActionRow}
+                      onPress={() => {
+                        setIsMachineMenuOpen(false);
+                        onReloadSession();
+                        handleClose();
+                      }}
+                      accessibilityRole="button"
+                      accessibilityLabel="Reload workstation page"
+                    >
+                      <Text style={styles.machineMenuActionIcon}>↻</Text>
+                      <Text style={styles.machineMenuActionText}>
+                        Reload Workstation Page
+                      </Text>
+                    </TouchableOpacity>
+
+                    <TouchableOpacity
+                      style={styles.machineMenuActionRow}
+                      onPress={handleTriggerHostSettings}
+                      accessibilityRole="button"
+                      accessibilityLabel="Open workstation host settings"
+                    >
+                      <Text style={styles.machineMenuActionIcon}>⚙</Text>
+                      <Text style={styles.machineMenuActionText}>
+                        Workstation Host Settings…
+                      </Text>
+                    </TouchableOpacity>
+                  </ScrollView>
+                </View>
+              </>
+            ) : null}
+
+            {/* Docked Thumb-Zone Mode Bar: Inbox | Usage | Settings */}
+            {!isKeyboardVisible ? (
+              <View style={styles.bottomModeBar}>
+                <TouchableOpacity
+                  style={styles.bottomModeBtn}
+                  onPress={() => {
+                    setIsMachineMenuOpen(false);
+                    setActiveMode('inbox');
+                    if (stage === 'authenticated' && !isRefreshing) {
+                      onRefreshInbox(false);
+                    }
+                  }}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: activeMode === 'inbox' }}
+                  accessibilityLabel="Drawer mode Inbox"
+                >
+                  {attentionCount === 0 && runningCount > 0 ? (
+                    <View
+                      style={[
+                        styles.modeStatusDot,
+                        styles.modeStatusDotOverlay,
+                        { backgroundColor: '#10B981' },
+                      ]}
+                    />
+                  ) : null}
+                  <InboxNavIcon
+                    color={activeMode === 'inbox' ? '#60A5FA' : '#64748B'}
+                  />
+                  <Text
+                    numberOfLines={1}
+                    style={[
+                      styles.modeSwitchText,
+                      activeMode === 'inbox'
+                        ? styles.modeSwitchTextActive
+                        : null,
+                    ]}
+                  >
+                    Inbox
+                  </Text>
+                  {badgeCountLabel ? (
+                    <View
+                      style={[
+                        styles.modeCountBadge,
+                        urgentAttentionCount > 0
+                          ? styles.modeCountBadgeUrgent
+                          : styles.modeCountBadgeUnread,
+                      ]}
+                    >
+                      <Text style={styles.modeCountBadgeText}>
+                        {badgeCountLabel}
+                      </Text>
+                    </View>
+                  ) : null}
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={styles.bottomModeBtn}
+                  onPress={() => {
+                    setIsMachineMenuOpen(false);
+                    setActiveMode('usage');
+                    if (stage === 'authenticated' && !isRefreshing) {
+                      onRefreshInbox(true);
+                    }
+                  }}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: activeMode === 'usage' }}
+                  accessibilityLabel="Drawer mode Usage"
+                >
+                  {usageStatusDotColor ? (
+                    <View
+                      style={[
+                        styles.modeStatusDot,
+                        styles.modeStatusDotOverlay,
+                        { backgroundColor: usageStatusDotColor },
+                      ]}
+                    />
+                  ) : null}
+                  <UsageNavIcon
+                    color={activeMode === 'usage' ? '#60A5FA' : '#64748B'}
+                  />
+                  <Text
+                    numberOfLines={1}
+                    style={[
+                      styles.modeSwitchText,
+                      activeMode === 'usage'
+                        ? styles.modeSwitchTextActive
+                        : null,
+                    ]}
+                  >
+                    Usage
+                  </Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={styles.bottomModeBtn}
+                  onPress={() => {
+                    setIsMachineMenuOpen(false);
+                    setActiveMode('settings');
+                  }}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: activeMode === 'settings' }}
+                  accessibilityLabel="Drawer mode Settings"
+                >
+                  <SettingsNavIcon
+                    color={activeMode === 'settings' ? '#60A5FA' : '#64748B'}
+                  />
+                  <Text
+                    numberOfLines={1}
+                    style={[
+                      styles.modeSwitchText,
+                      activeMode === 'settings'
+                        ? styles.modeSwitchTextActive
+                        : null,
+                    ]}
+                  >
+                    Settings
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            ) : null}
+
             {/* Matching 4px × 112px handle line inside the right edge of the open drawer */}
             <TouchableOpacity
               style={styles.openHandleZone}
@@ -2283,36 +2825,417 @@ const styles = StyleSheet.create({
     paddingRight: OPEN_HANDLE_RIGHT_INSET,
     alignItems: 'flex-end',
     justifyContent: 'center',
+    zIndex: 40,
   },
-  modeSwitchTrack: {
-    flexDirection: 'row',
-    backgroundColor: '#090D16',
-    borderRadius: 11,
-    padding: 3,
-    borderWidth: 1,
-    borderColor: '#1E293B',
-    marginBottom: 12,
-  },
-  modeSwitchBtn: {
-    flex: 1,
+  sidebarHeaderRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 8,
-    paddingHorizontal: 6,
-    borderRadius: 8,
-    gap: 5,
+    justifyContent: 'space-between',
+    gap: 8,
+    marginBottom: 8,
+    zIndex: 35,
   },
-  modeSwitchBtnActive: {
+  machineSelectorPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    maxWidth: '72%',
+    paddingVertical: 6,
+    paddingHorizontal: 11,
+    borderRadius: 9,
     backgroundColor: '#1E293B',
+    borderWidth: 1,
+    borderColor: '#334155',
   },
-  modeSwitchText: {
+  machineSelectorPillOpen: {
+    borderColor: '#60A5FA',
+    backgroundColor: '#172554',
+  },
+  machineSelectorDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 999,
+  },
+  machineSelectorLabel: {
+    flexShrink: 1,
+    color: '#F1F5F9',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  chevronBox: {
+    width: 12,
+    height: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  chevronGlyph: {
+    width: 6,
+    height: 6,
+    transform: [{ rotate: '45deg' }],
+  },
+  chevronGlyphDown: {
+    borderRightWidth: 1.6,
+    borderBottomWidth: 1.6,
+    marginTop: -2,
+  },
+  chevronGlyphUp: {
+    borderLeftWidth: 1.6,
+    borderTopWidth: 1.6,
+    marginTop: 2,
+  },
+  headerActionsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  headerIconBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  headerIconBtnActive: {
+    backgroundColor: 'rgba(59, 130, 246, 0.18)',
+  },
+  headerSyncGlyph: {
+    color: '#94A3B8',
+    fontSize: 16,
+    fontWeight: '600',
+    lineHeight: 18,
+  },
+  headerFreshnessText: {
+    color: '#64748B',
+    fontSize: 11,
+    fontWeight: '500',
+    marginRight: 2,
+  },
+  headerModeLabel: {
+    color: '#64748B',
+    fontSize: 11.5,
+    fontWeight: '600',
+    paddingRight: 4,
+  },
+  searchIconBox: {
+    width: 16,
+    height: 16,
+  },
+  searchIconLens: {
+    position: 'absolute',
+    top: 1,
+    left: 1,
+    width: 10.5,
+    height: 10.5,
+    borderRadius: 999,
+    borderWidth: 1.7,
+  },
+  searchIconHandle: {
+    position: 'absolute',
+    bottom: 2,
+    right: 1,
+    width: 5.5,
+    height: 1.8,
+    borderRadius: 1,
+    transform: [{ rotate: '45deg' }],
+  },
+  searchIconBoxCompact: {
+    width: 14,
+    height: 14,
+  },
+  searchIconLensCompact: {
+    position: 'absolute',
+    top: 1,
+    left: 1,
+    width: 9,
+    height: 9,
+    borderRadius: 999,
+    borderWidth: 1.5,
+  },
+  searchIconHandleCompact: {
+    position: 'absolute',
+    bottom: 1.5,
+    right: 1,
+    width: 4.5,
+    height: 1.6,
+    borderRadius: 1,
+    transform: [{ rotate: '45deg' }],
+  },
+  filterStrip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderBottomWidth: 1,
+    borderBottomColor: '#1E293B',
+    marginBottom: 9,
+    gap: 6,
+  },
+  filterTabsGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    flexShrink: 1,
+  },
+  filterTabBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingTop: 4,
+    paddingBottom: 8,
+    marginBottom: -1,
+    borderBottomWidth: 2,
+    borderBottomColor: 'transparent',
+  },
+  filterTabBtnSelected: {
+    borderBottomColor: '#3B82F6',
+  },
+  filterTabText: {
+    color: '#94A3B8',
+    fontSize: 12.5,
+    fontWeight: '600',
+  },
+  filterTabTextSelected: {
+    color: '#F8FAFC',
+    fontWeight: '700',
+  },
+  tabCountBadge: {
+    minWidth: 17,
+    paddingHorizontal: 5,
+    paddingVertical: 1,
+    borderRadius: 999,
+    backgroundColor: '#1E293B',
+    alignItems: 'center',
+  },
+  tabCountBadgeSelected: {
+    backgroundColor: 'rgba(59, 130, 246, 0.22)',
+  },
+  tabCountText: {
+    color: '#94A3B8',
+    fontSize: 10.5,
+    fontWeight: '700',
+  },
+  tabCountTextSelected: {
+    color: '#93C5FD',
+  },
+  readAllInlineBtn: {
+    paddingVertical: 5,
+    paddingLeft: 6,
+  },
+  readAllInlineText: {
+    color: '#60A5FA',
+    fontSize: 11.5,
+    fontWeight: '600',
+  },
+  searchBarRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: '#020617',
+    borderWidth: 1,
+    borderColor: '#334155',
+    borderRadius: 9,
+    paddingHorizontal: 10,
+    marginBottom: 9,
+  },
+  searchInput: {
+    flex: 1,
+    color: '#F8FAFC',
+    paddingVertical: 7,
+    fontSize: 12.5,
+  },
+  searchClearBtn: {
+    paddingHorizontal: 4,
+    paddingVertical: 4,
+  },
+  searchClearText: {
+    color: '#94A3B8',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  machineMenuScrim: {
+    position: 'absolute',
+    top: 48,
+    left: 0,
+    right: 0,
+    bottom: 54,
+    backgroundColor: 'rgba(2, 6, 23, 0.56)',
+    zIndex: 28,
+  },
+  machineMenuScrimKeyboard: {
+    bottom: 0,
+  },
+  machineMenuCard: {
+    position: 'absolute',
+    top: 50,
+    left: 16,
+    right: 26,
+    backgroundColor: '#0B1120',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#334155',
+    padding: 6,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.55,
+    shadowRadius: 18,
+    elevation: 14,
+    zIndex: 32,
+  },
+  machineMenuSectionLabel: {
+    color: '#64748B',
+    fontSize: 10,
+    fontWeight: '700',
+    letterSpacing: 0.6,
+    paddingHorizontal: 9,
+    paddingTop: 5,
+    paddingBottom: 4,
+  },
+  machineMenuItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 9,
+    paddingHorizontal: 9,
+    paddingVertical: 8,
+    borderRadius: 8,
+  },
+  machineMenuItemActive: {
+    backgroundColor: 'rgba(59, 130, 246, 0.14)',
+  },
+  machineMenuItemMeta: {
+    flex: 1,
+  },
+  machineMenuItemTitle: {
+    color: '#E2E8F0',
+    fontSize: 12.5,
+    fontWeight: '600',
+  },
+  machineMenuItemTitleActive: {
+    color: '#F8FAFC',
+    fontWeight: '700',
+  },
+  machineMenuItemSub: {
+    color: '#64748B',
+    fontSize: 10.5,
+    marginTop: 1,
+  },
+  machineMenuCheck: {
+    color: '#60A5FA',
+    fontSize: 12.5,
+    fontWeight: '700',
+  },
+  machineMenuEmptyText: {
+    color: '#94A3B8',
+    fontSize: 11.5,
+    paddingHorizontal: 9,
+    paddingVertical: 7,
+  },
+  machineMenuDivider: {
+    height: 1,
+    backgroundColor: '#1E293B',
+    marginVertical: 4,
+  },
+  machineMenuActionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 9,
+    paddingHorizontal: 9,
+    paddingVertical: 8.5,
+    borderRadius: 8,
+  },
+  machineMenuActionIcon: {
+    width: 16,
+    textAlign: 'center',
     color: '#94A3B8',
     fontSize: 13,
     fontWeight: '600',
   },
+  machineMenuActionText: {
+    flex: 1,
+    color: '#CBD5E1',
+    fontSize: 12.5,
+    fontWeight: '500',
+  },
+  bottomModeBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginLeft: -16,
+    marginRight: -26,
+    paddingLeft: 8,
+    paddingRight: 18,
+    paddingTop: 6,
+    paddingBottom: 8,
+    backgroundColor: '#0B1120',
+    borderTopWidth: 1,
+    borderTopColor: '#1E293B',
+  },
+  bottomModeBtn: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 3,
+    gap: 3,
+  },
+  navIconFrame: {
+    width: 18,
+    height: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  inboxIconOuter: {
+    width: 15,
+    height: 13,
+    borderRadius: 3,
+    borderWidth: 1.6,
+    justifyContent: 'flex-end',
+    paddingBottom: 3,
+  },
+  inboxIconShelf: {
+    width: '100%',
+    height: 1.5,
+  },
+  usageIconRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 2.5,
+    paddingBottom: 1,
+  },
+  usageIconBar: {
+    width: 2.8,
+    borderRadius: 1.2,
+  },
+  settingsIconStack: {
+    gap: 4.5,
+  },
+  settingsSliderRow: {
+    width: 15,
+    height: 4,
+    justifyContent: 'center',
+  },
+  settingsSliderTrack: {
+    width: '100%',
+    height: 1.5,
+    borderRadius: 1,
+  },
+  settingsSliderKnob: {
+    position: 'absolute',
+    width: 5,
+    height: 5,
+    borderRadius: 999,
+    borderWidth: 1.5,
+    backgroundColor: '#0B1120',
+  },
+  settingsSliderKnobLeft: {
+    left: 2,
+  },
+  settingsSliderKnobRight: {
+    right: 2,
+  },
+  modeSwitchText: {
+    color: '#64748B',
+    fontSize: 10.5,
+    fontWeight: '600',
+  },
   modeSwitchTextActive: {
-    color: '#F8FAFC',
+    color: '#60A5FA',
     fontWeight: '700',
   },
   modeStatusDot: {
@@ -2320,9 +3243,18 @@ const styles = StyleSheet.create({
     height: 7,
     borderRadius: 999,
   },
+  modeStatusDotOverlay: {
+    position: 'absolute',
+    top: 2,
+    left: '56%',
+    zIndex: 2,
+  },
   modeCountBadge: {
-    minWidth: 18,
-    paddingHorizontal: 5,
+    position: 'absolute',
+    top: 0,
+    left: '54%',
+    minWidth: 16,
+    paddingHorizontal: 4,
     paddingVertical: 1,
     borderRadius: 999,
     alignItems: 'center',
@@ -2336,122 +3268,11 @@ const styles = StyleSheet.create({
   },
   modeCountBadgeText: {
     color: '#FFFFFF',
-    fontSize: 10.5,
+    fontSize: 9.5,
     fontWeight: '800',
   },
   modeBody: {
     flex: 1,
-  },
-  inboxSubheaderRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    marginBottom: 10,
-    gap: 8,
-  },
-  inboxHeaderActions: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  inboxSubtitle: {
-    flex: 1,
-    color: '#94A3B8',
-    fontSize: 11.5,
-  },
-  refreshMiniBtn: {
-    paddingHorizontal: 9,
-    paddingVertical: 5,
-    borderRadius: 7,
-    backgroundColor: '#1E293B',
-    borderWidth: 1,
-    borderColor: '#334155',
-  },
-  refreshMiniBtnText: {
-    color: '#CBD5E1',
-    fontSize: 11.5,
-    fontWeight: '600',
-  },
-  tabsRow: {
-    flexDirection: 'row',
-    gap: 6,
-    marginBottom: 9,
-  },
-  tabChip: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 7,
-    paddingHorizontal: 6,
-    borderRadius: 9,
-    backgroundColor: '#1E293B',
-    borderWidth: 1,
-    borderColor: '#334155',
-    gap: 5,
-  },
-  tabChipSelected: {
-    backgroundColor: '#1D4ED8',
-    borderColor: '#60A5FA',
-  },
-  tabChipText: {
-    color: '#CBD5E1',
-    fontSize: 11.5,
-    fontWeight: '600',
-    flexShrink: 1,
-  },
-  tabChipTextSelected: {
-    color: '#FFFFFF',
-    fontWeight: '700',
-  },
-  tabCountBadge: {
-    minWidth: 17,
-    paddingHorizontal: 4,
-    paddingVertical: 1,
-    borderRadius: 999,
-    backgroundColor: '#0F172A',
-    alignItems: 'center',
-  },
-  tabCountBadgeSelected: {
-    backgroundColor: 'rgba(15, 23, 42, 0.45)',
-  },
-  tabCountText: {
-    color: '#94A3B8',
-    fontSize: 10.5,
-    fontWeight: '700',
-  },
-  tabCountTextSelected: {
-    color: '#FFFFFF',
-  },
-  toolbarRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 7,
-    marginBottom: 9,
-  },
-  searchInput: {
-    flex: 1,
-    backgroundColor: '#020617',
-    color: '#F8FAFC',
-    borderWidth: 1,
-    borderColor: '#334155',
-    borderRadius: 9,
-    paddingHorizontal: 10,
-    paddingVertical: 7,
-    fontSize: 12.5,
-  },
-  markAllButton: {
-    paddingHorizontal: 9,
-    paddingVertical: 8,
-    borderRadius: 9,
-    backgroundColor: '#1E293B',
-    borderWidth: 1,
-    borderColor: '#334155',
-  },
-  markAllButtonText: {
-    color: '#93C5FD',
-    fontSize: 11.5,
-    fontWeight: '600',
   },
   errorBanner: {
     backgroundColor: 'rgba(127, 29, 29, 0.28)',

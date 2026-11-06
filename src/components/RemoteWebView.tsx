@@ -33,6 +33,7 @@ import {
   buildFastThreadSwitchScript,
   buildInboxRefreshScript,
   buildMarkThreadReadScript,
+  buildOpenHostSettingsScript,
 } from '../services/inboxBridge';
 import {
   PROJECT_OVERVIEW_SCROLL_SCRIPT,
@@ -73,6 +74,7 @@ import { buildActionNotificationSyncState } from '../utils/actionNotification';
 import {
   applyLocalStateToSnapshot,
   buildInboxSnapshot,
+  extractAccountPathPrefix,
   extractActiveRouteFromUrl,
   parseInboxBridgeMessage,
   reconcileRunningThreadTransitions,
@@ -206,6 +208,7 @@ function buildKeepAliveWebLockScript(acquire: boolean): string {
 const MAX_RENDER_RECOVERY_ATTEMPTS = 3;
 const RENDER_RECOVERY_WINDOW_MS = 30_000;
 const FAST_THREAD_NAV_FALLBACK_MS = 750;
+const HOST_SETTINGS_FALLBACK_MS = 500;
 const INBOX_REFRESH_TIMEOUT_MS = 9_000;
 const MAX_LOCALLY_READ_ENTRIES = 500;
 
@@ -335,10 +338,14 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const pendingFastNavRef = useRef<
     Map<string, { timer: ReturnType<typeof setTimeout>; targetUrl: string }>
   >(new Map());
+  const hostSettingsFallbackTimerRef = useRef<ReturnType<
+    typeof setTimeout
+  > | null>(null);
   const inboxRefreshTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
   const isDrawerOpenRef = useRef<boolean>(false);
+  const drawerBackInterceptorRef = useRef<(() => boolean) | null>(null);
 
   const [isHydrated, setIsHydrated] = useState<boolean>(false);
   const [keepAliveMinutes, setKeepAliveMinutes] = useState<KeepAliveMinutes>(
@@ -350,6 +357,9 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     useState<boolean>(initialIsForeground);
   const [focusInboxRequestKey, setFocusInboxRequestKey] = useState<number>(0);
   const [currentSourceUrl, setCurrentSourceUrl] = useState<string>(
+    ANTIGRAVITY_DASHBOARD_URL,
+  );
+  const [activeHostUrl, setActiveHostUrl] = useState<string>(
     ANTIGRAVITY_DASHBOARD_URL,
   );
   const [stage, setStage] = useState<AuthFlowStage>('hydrating');
@@ -458,6 +468,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       setActionNotificationMode(savedActionNotificationMode);
       actionNotificationModeRef.current = savedActionNotificationMode;
       setCurrentSourceUrl(initialTarget);
+      setActiveHostUrl(initialTarget);
       currentNavUrlRef.current = initialTarget;
       if (incomingDeepLinkUrl) {
         onDeepLinkConsumed();
@@ -596,6 +607,10 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       clearTimeout(inboxRefreshTimeoutRef.current);
       inboxRefreshTimeoutRef.current = null;
     }
+    if (hostSettingsFallbackTimerRef.current) {
+      clearTimeout(hostSettingsFallbackTimerRef.current);
+      hostSettingsFallbackTimerRef.current = null;
+    }
     if (resumeReadSettleTimerRef.current) {
       clearTimeout(resumeReadSettleTimerRef.current);
       resumeReadSettleTimerRef.current = null;
@@ -648,7 +663,17 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         }
 
         if (previous.threads.length === 0) {
-          return previous;
+          if (
+            previous.activeInstanceUuid === effectiveActiveInstanceUuid &&
+            previous.activeCascadeId === effectiveActiveCascadeId
+          ) {
+            return previous;
+          }
+          return {
+            ...previous,
+            activeInstanceUuid: effectiveActiveInstanceUuid,
+            activeCascadeId: effectiveActiveCascadeId,
+          };
         }
         return applyLocalStateToSnapshot(previous, {
           activeInstanceUuid: effectiveActiveInstanceUuid,
@@ -913,6 +938,9 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
 
     const onHardwareBackPress = (): boolean => {
       if (isDrawerOpenRef.current) {
+        if (drawerBackInterceptorRef.current?.()) {
+          return true;
+        }
         isDrawerOpenRef.current = false;
         setIsDrawerOpen(false);
         if (isAppForegroundRef.current) {
@@ -1028,6 +1056,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         renderProcessDeadRef.current = false;
         renderRecoveryTimestampsRef.current = [];
         setCurrentSourceUrl(ANTIGRAVITY_DASHBOARD_URL);
+        setActiveHostUrl(ANTIGRAVITY_DASHBOARD_URL);
         currentNavUrlRef.current = ANTIGRAVITY_DASHBOARD_URL;
         canGoBackRef.current = false;
         if (resetRequest.reason === 'signout') {
@@ -1119,6 +1148,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       if (
         new URL(validation.normalizedUrl).hostname === 'antigravity.google.com'
       ) {
+        setActiveHostUrl(validation.normalizedUrl);
         void saveLastActiveUrl(validation.normalizedUrl);
         const route = extractActiveRouteFromUrl(validation.normalizedUrl);
         activeInstanceUuidRef.current = route.instanceUuid;
@@ -1269,35 +1299,81 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     [requestNotificationPermissionIfNeeded],
   );
 
-  const handleNavigateToUrl = useCallback((targetUrl: string) => {
-    if (isResettingSessionRef.current) return;
-    const validation = validateNavigationUrl(targetUrl);
-    if (!validation.isAllowedInApp || !validation.normalizedUrl) return;
-    setHasNetworkError(false);
-    setPageError(null);
-    renderProcessDeadRef.current = false;
-    renderRecoveryTimestampsRef.current = [];
-    if (stageRef.current === 'offline') {
-      setStage('authenticating');
-    }
-    setCurrentSourceUrl(validation.normalizedUrl);
-    currentNavUrlRef.current = validation.normalizedUrl;
-    const targetRoute = extractActiveRouteFromUrl(validation.normalizedUrl);
-    activeInstanceUuidRef.current = targetRoute.instanceUuid;
-    lastObservedOverviewInstanceRef.current = targetRoute.cascadeId
-      ? null
-      : targetRoute.instanceUuid;
-    canReturnToOverviewRef.current = false;
-    // Explicit native navigation must work even when the source prop already
-    // contains this URL and the browser has since navigated somewhere else.
-    setWebViewInstanceKey((prev) => prev + 1);
-    void saveLastActiveUrl(validation.normalizedUrl);
+  const getDashboardUrlForCurrentAccount = useCallback((): string => {
+    const prefix = extractAccountPathPrefix(currentNavUrlRef.current);
+    return prefix
+      ? `${ANTIGRAVITY_DASHBOARD_URL}${prefix}/`
+      : ANTIGRAVITY_DASHBOARD_URL;
   }, []);
+
+  const registerDrawerBackInterceptor = useCallback(
+    (interceptor: (() => boolean) | null) => {
+      drawerBackInterceptorRef.current = interceptor;
+    },
+    [],
+  );
+
+  const handleNavigateToUrl = useCallback(
+    (targetUrl: string) => {
+      if (isResettingSessionRef.current) return;
+      const validation = validateNavigationUrl(targetUrl);
+      if (!validation.isAllowedInApp || !validation.normalizedUrl) return;
+      setHasNetworkError(false);
+      setPageError(null);
+      renderProcessDeadRef.current = false;
+      renderRecoveryTimestampsRef.current = [];
+      if (stageRef.current === 'offline') {
+        setStage('authenticating');
+      }
+      setCurrentSourceUrl(validation.normalizedUrl);
+      currentNavUrlRef.current = validation.normalizedUrl;
+      if (
+        new URL(validation.normalizedUrl).hostname === 'antigravity.google.com'
+      ) {
+        setActiveHostUrl(validation.normalizedUrl);
+      }
+      const targetRoute = extractActiveRouteFromUrl(validation.normalizedUrl);
+      activeInstanceUuidRef.current = targetRoute.instanceUuid;
+      lastObservedOverviewInstanceRef.current = targetRoute.cascadeId
+        ? null
+        : targetRoute.instanceUuid;
+      canReturnToOverviewRef.current = false;
+      recomputeSnapshotWithLocalState({
+        activeInstanceUuid: targetRoute.instanceUuid,
+        activeCascadeId: targetRoute.cascadeId,
+      });
+      // Explicit native navigation must work even when the source prop already
+      // contains this URL and the browser has since navigated somewhere else.
+      setWebViewInstanceKey((prev) => prev + 1);
+      void saveLastActiveUrl(validation.normalizedUrl);
+    },
+    [recomputeSnapshotWithLocalState],
+  );
 
   const handleSignOut = useCallback(
     () => beginSessionReset('signout'),
     [beginSessionReset],
   );
+
+  const handleOpenHostSettings = useCallback(() => {
+    if (isResettingSessionRef.current) return;
+    if (!webViewRef.current || stageRef.current !== 'authenticated') {
+      handleNavigateToUrl(getDashboardUrlForCurrentAccount());
+      return;
+    }
+    if (hostSettingsFallbackTimerRef.current) {
+      clearTimeout(hostSettingsFallbackTimerRef.current);
+    }
+    hostSettingsFallbackTimerRef.current = setTimeout(() => {
+      hostSettingsFallbackTimerRef.current = null;
+      handleNavigateToUrl(getDashboardUrlForCurrentAccount());
+    }, HOST_SETTINGS_FALLBACK_MS);
+    (
+      hostSettingsFallbackTimerRef.current as { unref?: () => void }
+    )?.unref?.();
+    webViewRef.current.injectJavaScript(INBOX_BRIDGE_SCRIPT);
+    webViewRef.current.injectJavaScript(buildOpenHostSettingsScript());
+  }, [getDashboardUrlForCurrentAccount, handleNavigateToUrl]);
 
   const armInboxRefreshTimeout = useCallback(() => {
     if (inboxRefreshTimeoutRef.current) {
@@ -1580,6 +1656,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         'antigravity.google.com'
     ) {
       currentNavUrlRef.current = activeValidation.normalizedUrl;
+      setActiveHostUrl(activeValidation.normalizedUrl);
       void saveLastActiveUrl(activeValidation.normalizedUrl);
     }
   }, []);
@@ -1715,10 +1792,23 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           }
           break;
         }
+
+        case 'AGY_INBOX_HOST_SETTINGS_RESULT': {
+          if (!hostSettingsFallbackTimerRef.current) {
+            break;
+          }
+          clearTimeout(hostSettingsFallbackTimerRef.current);
+          hostSettingsFallbackTimerRef.current = null;
+          if (!message.handled) {
+            handleNavigateToUrl(getDashboardUrlForCurrentAccount());
+          }
+          break;
+        }
       }
     },
     [
       armInboxRefreshTimeout,
+      getDashboardUrlForCurrentAccount,
       handleNavigateToUrl,
       markThreadReadInWorkstationClock,
       recomputeSnapshotWithLocalState,
@@ -1878,6 +1968,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         isKeyboardVisible={isKeyboardVisible}
         keyboardBottomPadding={keyboardBottomPadding}
         stage={stage}
+        activeUrl={activeHostUrl}
         snapshot={inboxSnapshot}
         isRefreshing={isInboxRefreshing}
         attentionCount={inboxCounts.attention}
@@ -1887,6 +1978,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         actionNotificationMode={actionNotificationMode}
         onOpen={handleOpenDrawer}
         onClose={handleCloseDrawer}
+        onRegisterBackHandler={registerDrawerBackInterceptor}
         onRefreshInbox={handleRefreshInbox}
         onSelectThread={handleSelectInboxThread}
         onMarkThreadRead={handleMarkThreadRead}
@@ -1894,6 +1986,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         onChangeKeepAliveMinutes={handleChangeKeepAliveMinutes}
         onChangeActionNotificationMode={handleChangeActionNotificationMode}
         onNavigateToUrl={handleNavigateToUrl}
+        onOpenHostSettings={handleOpenHostSettings}
         onReloadSession={handleReloadSession}
         onSignOut={handleSignOut}
       />
