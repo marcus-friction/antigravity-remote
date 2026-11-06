@@ -2,7 +2,7 @@ Antigravity Remote is an open-source mobile companion wrapper for accessing http
 
 KEY FEATURES
 • Cross-Workstation Thread Inbox: Monitor pending tool/question approvals (including subagent prompts), execution errors, and unread completions across all connected workstations from a pull-in left navigation drawer, with instant same-workstation switching, preserved scroll position, and one-tap Mark read.
-• Configurable Open-Action Notifications: Receive a live local notification when an agent requires an answer or approval (Off, Approvals, or All Attention), updating automatically with the open action count and opening the thread directly (if 1) or Thread Inbox (if multiple).
+• Configurable Open-Action Notifications: Receive a live local notification when an agent needs approval, asks a question, or finishes (Off, Approvals, or All Attention), updating automatically with the open action count and opening the thread directly (if 1) or Thread Inbox (if multiple).
 • Live Quota & Usage Tracking: Check plan credits, 5-hour and weekly quota pools, and per-model reset countdowns directly in the sidebar Usage tab.
 • Persistent Session Management & Bounded Keep-Alive: Sign in once to resume your workspace across restarts, and keep active workstation connections open across app switches (30m by default while signed in; configurable in Settings to Off, 5m, 15m, 30m, or 60m) with a Stop Keep-Alive notification button.
 • Instant CLI & Desktop Handoff: Paste any /remote-control output link (https://antigravity.google.com/r/<instance-id>), instance ID, or open antigravity-remote://r/<instance-id> deep links directly into your active mobile session.

@@ -17,6 +17,7 @@ import {
   formatRelativeTime,
   parseInboxBridgeMessage,
   parseProtoTimestampMs,
+  reconcileRunningThreadTransitions,
 } from '../src/utils/inboxParser';
 
 describe('inboxParser', () => {
@@ -722,6 +723,65 @@ describe('inboxParser', () => {
     await sandboxWindow.__agyInboxBridge.refresh();
     expect(postedToNative[0].type).toBe('AGY_INBOX_SNAPSHOT');
     expect(postedToNative[0].activeCascadeId).toBe('cascade-99');
+
+    // Simulate Angular Router asynchronously syncing `?p=` on the same `/r/box-alpha` workstation,
+    // followed by Closure JSPB empty-path `URL_CHANGE` (`jspbPayload: "[[]"`) when returning to Project Overview
+    sandboxWindow.history.replaceState(
+      null,
+      '',
+      '/r/box-alpha?p=c%2Fcascade-99',
+    );
+    for (const listener of windowListeners.get('message') ?? []) {
+      listener({
+        origin: 'https://antigravity.static.usercontent.goog',
+        data: {
+          jspbPayload: JSON.stringify([[]]),
+        },
+      });
+    }
+    expect(sandboxWindow.location.href).toBe(
+      'https://antigravity.google.com/r/box-alpha',
+    );
+    expect(postedToNative[postedToNative.length - 1]).toEqual({
+      type: 'AGY_INBOX_ACTIVE_ROUTE',
+      activeUrl: 'https://antigravity.google.com/r/box-alpha',
+      activeInstanceUuid: 'box-alpha',
+      activeCascadeId: null,
+    });
+
+    // Verify `refresh()` queues a follow-up poll if called again while an earlier refresh is still in flight
+    let resolveFirstList!: (value: any) => void;
+    let listCallCount = 0;
+    const origListInstances =
+      MockApiServicePromiseClient.prototype.listInstances;
+    MockApiServicePromiseClient.prototype.listInstances = function () {
+      listCallCount += 1;
+      if (listCallCount === 1) {
+        return new Promise((resolve) => {
+          resolveFirstList = resolve;
+        });
+      }
+      return origListInstances.call(this);
+    };
+    try {
+      postedToNative.length = 0;
+      const firstRefresh = sandboxWindow.__agyInboxBridge.refresh();
+      // Trigger a second refresh (e.g. real-time completion event) before the first resolves
+      const secondRefresh = sandboxWindow.__agyInboxBridge.refresh();
+      await Promise.resolve();
+      resolveFirstList({
+        getInstancesList: () => [],
+      });
+      await firstRefresh;
+      await secondRefresh;
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(listCallCount).toBe(2);
+      expect(
+        postedToNative.filter((m) => m.type === 'AGY_INBOX_SNAPSHOT'),
+      ).toHaveLength(2);
+    } finally {
+      MockApiServicePromiseClient.prototype.listInstances = origListInstances;
+    }
   });
 
   it('builds single-thread vs multi-action Inbox notification payloads, updates silently on decrements, and catches unread replies while backgrounded', () => {
@@ -976,6 +1036,201 @@ describe('inboxParser', () => {
       count: 1,
       deepLinkUrl: 'antigravity-remote://r/box-1?p=c%2Factive-thread',
       shouldAlert: false,
+    });
+  });
+
+  it('marks finished runs as unread (blue state + notification) across sub-second completions, CLI runs, and open drawer while skipping interrupted runs', () => {
+    // 1. Sub-second (+350ms) and same-second (`stepCount > lastUserInputStepIndex + 1`) completions register as unread
+    const fastSnap = buildInboxSnapshot(
+      {
+        type: 'AGY_INBOX_SNAPSHOT',
+        fetchedAtMs: 1_762_270_000_000,
+        activeUrl: 'https://antigravity.google.com/r/box-1',
+        activeInstanceUuid: 'box-1',
+        activeCascadeId: null,
+        instances: [
+          {
+            uuid: 'box-1',
+            name: 'Devbox',
+            status: 1,
+            trajectories: {
+              trajectorySummaries: {
+                'subsecond-reply': {
+                  summary: 'Quick status check',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  lastUserInputTime: '2026-11-05T19:00:00.100Z',
+                  lastModifiedTime: '2026-11-05T19:00:00.450Z',
+                },
+                'samesecond-steps': {
+                  summary: 'Instant one-shot fix',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  stepCount: 5,
+                  lastUserInputStepIndex: 2,
+                  lastUserInputTime: '2026-11-05T19:00:00Z',
+                  lastModifiedTime: '2026-11-05T19:00:00Z',
+                  annotations: {
+                    lastUserViewTime: '2026-11-05T19:00:00Z',
+                  },
+                },
+              },
+            },
+          },
+        ],
+      },
+      {},
+    );
+    expect(fastSnap.threads).toHaveLength(2);
+    for (const thread of fastSnap.threads) {
+      expect(thread.attentionKind).toBe('unread');
+      expect(thread.needsAttention).toBe(true);
+      expect(thread.attentionReason).toBe('Agent finished — unread updates');
+    }
+
+    // 2. Live `running -> idle` transition catches CLI-started / desktop-viewed completions when not actively viewed on screen,
+    // while skipping user-interrupted runs and suppressing threads watched live in the foreground with drawer closed.
+    const knownRunning = new Set<string>();
+    const completedUnread: Record<string, number> = {};
+    const locallyRead: Record<string, number> = {};
+
+    reconcileRunningThreadTransitions({
+      message: {
+        type: 'AGY_INBOX_SNAPSHOT',
+        fetchedAtMs: 1_762_270_010_000,
+        activeUrl: 'https://antigravity.google.com/r/box-1?p=c%2Fwatched-live',
+        activeInstanceUuid: 'box-1',
+        activeCascadeId: 'watched-live',
+        instances: [
+          {
+            uuid: 'box-1',
+            name: 'Devbox',
+            status: 1,
+            trajectories: {
+              trajectorySummaries: {
+                'cli-run': {
+                  summary: 'CLI build pipeline',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  lastModifiedTime: '2026-11-05T19:05:00Z',
+                },
+                'interrupted-run': {
+                  summary: 'Cancelled experiment',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  lastModifiedTime: '2026-11-05T19:05:00Z',
+                },
+                'watched-live': {
+                  summary: 'Watched live in foreground',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  lastUserInputTime: '2026-11-05T19:04:00Z',
+                  lastModifiedTime: '2026-11-05T19:05:00Z',
+                },
+              },
+            },
+          },
+        ],
+      },
+      knownRunningThreadIds: knownRunning,
+      completedUnreadAtByThreadId: completedUnread,
+      locallyReadAtByThreadId: locallyRead,
+      isAppForeground: true,
+      isDrawerOpen: false,
+    });
+    expect(knownRunning.size).toBe(3);
+
+    const finishedSnap = reconcileRunningThreadTransitions({
+      message: {
+        type: 'AGY_INBOX_SNAPSHOT',
+        fetchedAtMs: 1_762_270_020_000,
+        activeUrl: 'https://antigravity.google.com/r/box-1?p=c%2Fwatched-live',
+        activeInstanceUuid: 'box-1',
+        activeCascadeId: 'watched-live',
+        instances: [
+          {
+            uuid: 'box-1',
+            name: 'Devbox',
+            status: 1,
+            trajectories: {
+              trajectorySummaries: {
+                'cli-run': {
+                  summary: 'CLI build pipeline',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  lastModifiedTime: '2026-11-05T19:06:00Z',
+                },
+                'interrupted-run': {
+                  summary: 'Cancelled experiment',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  interrupted: true,
+                  lastModifiedTime: '2026-11-05T19:06:00Z',
+                },
+                'watched-live': {
+                  summary: 'Watched live in foreground',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  lastUserInputTime: '2026-11-05T19:04:00Z',
+                  lastModifiedTime: '2026-11-05T19:06:00Z',
+                },
+              },
+            },
+          },
+        ],
+      },
+      knownRunningThreadIds: knownRunning,
+      completedUnreadAtByThreadId: completedUnread,
+      locallyReadAtByThreadId: locallyRead,
+      isAppForeground: true,
+      isDrawerOpen: false,
+    });
+
+    const cliThread = finishedSnap.threads.find((t) => t.cascadeId === 'cli-run')!;
+    const interruptedThread = finishedSnap.threads.find(
+      (t) => t.cascadeId === 'interrupted-run',
+    )!;
+    const watchedThread = finishedSnap.threads.find(
+      (t) => t.cascadeId === 'watched-live',
+    )!;
+
+    expect(cliThread.attentionKind).toBe('unread');
+    expect(cliThread.needsAttention).toBe(true);
+    expect(cliThread.attentionReason).toBe('Agent finished — unread updates');
+
+    expect(interruptedThread.attentionKind).toBe('idle');
+    expect(interruptedThread.needsAttention).toBe(false);
+    expect(interruptedThread.attentionReason).toBe('Interrupted');
+
+    expect(watchedThread.attentionKind).toBe('idle');
+    expect(watchedThread.needsAttention).toBe(false);
+
+    // Opening the drawer afterwards must NOT retroactively flag `watched-live` as unread
+    const afterDrawerOpen = applyLocalStateToSnapshot(finishedSnap, {
+      activeInstanceUuid: 'box-1',
+      activeCascadeId: 'watched-live',
+      locallyReadAtByThreadId: locallyRead,
+      isAppForeground: true,
+      isDrawerOpen: true,
+    });
+    expect(
+      afterDrawerOpen.threads.find((t) => t.cascadeId === 'watched-live')
+        ?.attentionKind,
+    ).toBe('idle');
+
+    // Notification sync under default `all_attention` alerts for `cli-run` with direct deep link
+    const notifSync = buildActionNotificationSyncState({
+      stage: 'authenticated',
+      mode: 'all_attention',
+      threads: finishedSnap.threads,
+      isAppForeground: true,
+      isDrawerOpen: false,
+      previousOpenThreadIds: new Set(),
+    });
+    expect(notifSync.notification).toMatchObject({
+      count: 1,
+      title: '1 action open • Devbox',
+      body: 'CLI build pipeline — Agent finished — unread updates',
+      deepLinkUrl: 'antigravity-remote://r/box-1?p=c%2Fcli-run',
+      shouldAlert: true,
     });
   });
 });

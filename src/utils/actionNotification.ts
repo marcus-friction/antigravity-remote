@@ -92,9 +92,10 @@ export function buildActionNotificationSyncState(params: {
   const openThreadIds = new Set(matchingThreads.map((t) => t.id));
 
   const openThreads = matchingThreads.filter((thread) => {
-    // Suppress the thread currently open in the foreground WebView; while
-    // backgrounded (`!isAppForeground`), every matching thread counts.
-    const isVisibleOnScreenNow = isAppForeground && thread.isActiveThread;
+    // Suppress the thread currently visible in the foreground WebView; while
+    // backgrounded (`!isAppForeground`) or behind an open drawer, every matching thread counts.
+    const isVisibleOnScreenNow =
+      isAppForeground && !isDrawerOpen && thread.isActiveThread;
     return !isVisibleOnScreenNow;
   });
 

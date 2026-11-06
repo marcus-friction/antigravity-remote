@@ -53,10 +53,11 @@ export const INBOX_BRIDGE_SCRIPT = `
     var lastUsageCache = null;
     var lastUsageFetchedAtMs = 0;
     var inFlightUsagePromise = null;
+    var pendingFollowUpRefresh = false;
     var pendingForcedUsageRefresh = false;
     var cloudTrajectoriesCache = null;
     var activeIframeCascadeId = null;
-    var activeIframeLocationHref = null;
+    var activeIframeInstanceUuid = null;
     var hasIframeRouteOverride = false;
     var pendingFastNav = null;
     var FAST_NAV_CONFIRM_MS = 380;
@@ -64,10 +65,27 @@ export const INBOX_BRIDGE_SCRIPT = `
     var inFlightRefresh = null;
     var isStopped = false;
 
+    function extractInstanceUuidFromHostPath() {
+      var pathname = (window.location && window.location.pathname) || '';
+      var stripped = pathname.replace(/^\\/u\\/\\d+(?=\\/|$)/, '');
+      var instanceMatch = /^\\/r\\/([^/?#]+)/.exec(stripped);
+      if (!instanceMatch) {
+        return null;
+      }
+      var uuid = decodeURIComponent(instanceMatch[1]);
+      return SAFE_ID_RE.test(uuid) ? uuid : null;
+    }
+
     function setIframeCascadeOverride(cascadeId) {
       activeIframeCascadeId = cascadeId || null;
-      activeIframeLocationHref = (window.location && window.location.href) || '';
-      hasIframeRouteOverride = true;
+      activeIframeInstanceUuid = extractInstanceUuidFromHostPath();
+      hasIframeRouteOverride = activeIframeInstanceUuid !== null;
+    }
+
+    function clearIframeCascadeOverride() {
+      activeIframeCascadeId = null;
+      activeIframeInstanceUuid = null;
+      hasIframeRouteOverride = false;
     }
 
     function postToNative(payload) {
@@ -91,17 +109,16 @@ export const INBOX_BRIDGE_SCRIPT = `
     }
 
     function parseRouteFromLocation() {
-      var currentHref = (window.location && window.location.href) || '';
-      if (hasIframeRouteOverride && currentHref !== activeIframeLocationHref) {
-        activeIframeCascadeId = null;
-        activeIframeLocationHref = null;
-        hasIframeRouteOverride = false;
+      var currentInstanceUuid = extractInstanceUuidFromHostPath();
+      if (
+        hasIframeRouteOverride &&
+        currentInstanceUuid !== activeIframeInstanceUuid
+      ) {
+        clearIframeCascadeOverride();
       }
       var pathname = (window.location && window.location.pathname) || '';
       var stripped = pathname.replace(/^\\/u\\/\\d+(?=\\/|$)/, '');
-      var instanceMatch = /^\\/r\\/([^/?#]+)/.exec(stripped);
-      if (instanceMatch) {
-        var uuid = decodeURIComponent(instanceMatch[1]);
+      if (currentInstanceUuid) {
         var search = (window.location && window.location.search) || '';
         var pVal = '';
         try {
@@ -110,7 +127,7 @@ export const INBOX_BRIDGE_SCRIPT = `
         var cleanChild = pVal.replace(/^\\/+/, '');
         var cMatch = /^c\\/([a-zA-Z0-9._-]+)(?:[/?#]|$)/.exec(cleanChild);
         return {
-          instanceUuid: SAFE_ID_RE.test(uuid) ? uuid : null,
+          instanceUuid: currentInstanceUuid,
           cascadeId: hasIframeRouteOverride
             ? activeIframeCascadeId
             : (cMatch && cMatch[1]) || null
@@ -791,12 +808,14 @@ export const INBOX_BRIDGE_SCRIPT = `
     function refresh(forceUsage) {
       var wantForcedUsage = Boolean(forceUsage);
       if (inFlightRefresh) {
+        pendingFollowUpRefresh = true;
         if (wantForcedUsage) {
           pendingForcedUsageRefresh = true;
         }
         return inFlightRefresh;
       }
       var didForceUsageThisRun = wantForcedUsage || pendingForcedUsageRefresh;
+      pendingFollowUpRefresh = false;
       pendingForcedUsageRefresh = false;
 
       inFlightRefresh = getClientWithMetadata()
@@ -1001,9 +1020,20 @@ export const INBOX_BRIDGE_SCRIPT = `
         })
         .then(function() {
           inFlightRefresh = null;
-          if (pendingForcedUsageRefresh && !didForceUsageThisRun) {
+          if (isStopped) {
+            pendingFollowUpRefresh = false;
             pendingForcedUsageRefresh = false;
-            return refresh(true);
+            return;
+          }
+          if (
+            pendingFollowUpRefresh ||
+            (pendingForcedUsageRefresh && !didForceUsageThisRun)
+          ) {
+            var nextForceUsage =
+              pendingForcedUsageRefresh && !didForceUsageThisRun;
+            pendingFollowUpRefresh = false;
+            pendingForcedUsageRefresh = false;
+            return refresh(nextForceUsage);
           }
           pendingForcedUsageRefresh = false;
         });
@@ -1262,8 +1292,9 @@ export const INBOX_BRIDGE_SCRIPT = `
         var frame = findHubIframe();
         var frameSrc = frame ? frame.src : '';
 
-        if (data.type === 'URL_CHANGED' && typeof data.path === 'string') {
-          var changedCascadeId = extractCascadeIdFromIframePath(data.path, frameSrc);
+        if (data.type === 'URL_CHANGED') {
+          var rawChangedPath = typeof data.path === 'string' ? data.path : '';
+          var changedCascadeId = extractCascadeIdFromIframePath(rawChangedPath, frameSrc);
           if (completePendingFastNavIfMatched(changedCascadeId, true)) {
             return;
           }
@@ -1284,13 +1315,14 @@ export const INBOX_BRIDGE_SCRIPT = `
         var jspb = parseJspbPayload(data.jspbPayload);
         if (!jspb) return;
 
-        // Field 1 (index 0): URL_CHANGE, or Field 4 (index 3): URL_RESPONSE
-        var isUrlChangeEvent =
-          Array.isArray(jspb[0]) && typeof jspb[0][0] === 'string';
+        // Field 1 (index 0): URL_CHANGE (empty path "" serializes as [] in Closure JSPB),
+        // or Field 4 (index 3): URL_RESPONSE
+        var isUrlChangeEvent = Array.isArray(jspb[0]);
+        var isUrlResponseEvent = !isUrlChangeEvent && Array.isArray(jspb[3]);
         var reportedPath = isUrlChangeEvent
-          ? jspb[0][0]
-          : Array.isArray(jspb[3]) && typeof jspb[3][0] === 'string'
-            ? jspb[3][0]
+          ? (typeof jspb[0][0] === 'string' ? jspb[0][0] : '')
+          : isUrlResponseEvent
+            ? (typeof jspb[3][0] === 'string' ? jspb[3][0] : '')
             : null;
         if (reportedPath !== null) {
           var extractedCascadeId = extractCascadeIdFromIframePath(reportedPath, frameSrc);
@@ -1346,7 +1378,10 @@ export const INBOX_BRIDGE_SCRIPT = `
       });
     }
 
-    window.addEventListener('popstate', emitActiveRouteFromLocation);
+    window.addEventListener('popstate', function() {
+      clearIframeCascadeOverride();
+      emitActiveRouteFromLocation();
+    });
 
     try {
       if (window.navigation && typeof window.navigation.addEventListener === 'function') {

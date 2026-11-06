@@ -59,7 +59,11 @@ import {
   requestNativeNotificationPermission,
   syncNativeActionNotification,
 } from '../services/webData';
-import { InboxSnapshot, InboxThreadItem } from '../types/inbox';
+import {
+  InboxBridgeMessage,
+  InboxSnapshot,
+  InboxThreadItem,
+} from '../types/inbox';
 import {
   ActionNotificationMode,
   AuthFlowStage,
@@ -71,6 +75,7 @@ import {
   buildInboxSnapshot,
   extractActiveRouteFromUrl,
   parseInboxBridgeMessage,
+  reconcileRunningThreadTransitions,
   resolveActiveRouteFromBridgeMessage,
 } from '../utils/inboxParser';
 import {
@@ -222,6 +227,21 @@ function recordBoundedLocalRead(
   }
 }
 
+function findMatchingThread(
+  threads: readonly InboxThreadItem[],
+  instanceUuid: string | null,
+  cascadeId: string | null,
+): InboxThreadItem | undefined {
+  if (!instanceUuid || !cascadeId) {
+    return undefined;
+  }
+  return threads.find(
+    (t) =>
+      t.instanceUuid === instanceUuid &&
+      (t.cascadeId === cascadeId || t.trajectoryId === cascadeId),
+  );
+}
+
 const COMBINED_INJECTED_SCRIPT = `${KEYBOARD_ADAPTATION_SCRIPT}\n${PROJECT_OVERVIEW_SCROLL_SCRIPT}\n${INBOX_BRIDGE_SCRIPT}`;
 
 const EMPTY_INBOX_SNAPSHOT: InboxSnapshot = {
@@ -297,8 +317,17 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     DEFAULT_ACTION_NOTIFICATION_MODE,
   );
   const inboxSnapshotRef = useRef<InboxSnapshot>(EMPTY_INBOX_SNAPSHOT);
+  const lastSnapshotMessageRef = useRef<Extract<
+    InboxBridgeMessage,
+    { type: 'AGY_INBOX_SNAPSHOT' }
+  > | null>(null);
+  const resumeReadSettleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
   const lastActionNotifSigRef = useRef<string>('');
   const previousOpenActionIdsRef = useRef<Set<string>>(new Set());
+  const knownRunningThreadIdsRef = useRef<Set<string>>(new Set());
+  const completedUnreadMapRef = useRef<Record<string, number>>({});
   const locallyReadMapRef = useRef<Record<string, number>>({});
   const activeInstanceUuidRef = useRef<string | null>(null);
   const lastObservedOverviewInstanceRef = useRef<string | null>(null);
@@ -567,6 +596,10 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       clearTimeout(inboxRefreshTimeoutRef.current);
       inboxRefreshTimeoutRef.current = null;
     }
+    if (resumeReadSettleTimerRef.current) {
+      clearTimeout(resumeReadSettleTimerRef.current);
+      resumeReadSettleTimerRef.current = null;
+    }
   }, []);
 
   useEffect(() => {
@@ -577,6 +610,119 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     };
   }, [clearInboxTimers]);
 
+  const recomputeSnapshotWithLocalState = useCallback(
+    (overrides?: {
+      activeInstanceUuid?: string | null;
+      activeCascadeId?: string | null;
+      isAppForeground?: boolean;
+      isDrawerOpen?: boolean;
+    }) => {
+      setInboxSnapshot((previous) => {
+        const effectiveActiveInstanceUuid =
+          overrides && 'activeInstanceUuid' in overrides
+            ? (overrides.activeInstanceUuid ?? null)
+            : previous.activeInstanceUuid;
+        const effectiveActiveCascadeId =
+          overrides && 'activeCascadeId' in overrides
+            ? (overrides.activeCascadeId ?? null)
+            : previous.activeCascadeId;
+        const effectiveForeground =
+          overrides?.isAppForeground ?? isAppForegroundRef.current;
+        const effectiveDrawerOpen =
+          overrides?.isDrawerOpen ?? isDrawerOpenRef.current;
+
+        const rawMsg = lastSnapshotMessageRef.current;
+        if (rawMsg) {
+          return buildInboxSnapshot(
+            {
+              ...rawMsg,
+              activeInstanceUuid: effectiveActiveInstanceUuid,
+              activeCascadeId: effectiveActiveCascadeId,
+            },
+            locallyReadMapRef.current,
+            currentNavUrlRef.current,
+            effectiveForeground,
+            completedUnreadMapRef.current,
+            effectiveDrawerOpen,
+          );
+        }
+
+        if (previous.threads.length === 0) {
+          return previous;
+        }
+        return applyLocalStateToSnapshot(previous, {
+          activeInstanceUuid: effectiveActiveInstanceUuid,
+          activeCascadeId: effectiveActiveCascadeId,
+          locallyReadAtByThreadId: locallyReadMapRef.current,
+          isAppForeground: effectiveForeground,
+          isDrawerOpen: effectiveDrawerOpen,
+        });
+      });
+    },
+    [],
+  );
+
+  const markThreadReadInWorkstationClock = useCallback(
+    (
+      thread: InboxThreadItem | undefined,
+      syncRemoteMode: 'none' | 'unread_only' | 'dismissible' = 'none',
+    ) => {
+      if (!thread) {
+        return;
+      }
+      // Never stamp a running or approval-waiting thread as read before its run finishes.
+      if (
+        thread.attentionKind === 'running' ||
+        thread.attentionKind === 'approval'
+      ) {
+        return;
+      }
+      if (
+        Object.prototype.hasOwnProperty.call(
+          completedUnreadMapRef.current,
+          thread.id,
+        )
+      ) {
+        delete completedUnreadMapRef.current[thread.id];
+      }
+      const stampMs =
+        thread.lastModifiedAtMs > 0
+          ? Math.max(
+              locallyReadMapRef.current[thread.id] ?? 0,
+              thread.lastModifiedAtMs,
+            )
+          : Math.max(locallyReadMapRef.current[thread.id] ?? 0, 1);
+      recordBoundedLocalRead(locallyReadMapRef.current, thread.id, stampMs);
+
+      const hasServerUnread =
+        thread.attentionKind === 'unread' ||
+        (thread.lastModifiedAtMs > 0 &&
+          thread.lastModifiedAtMs > thread.lastUserViewAtMs);
+      const shouldSyncRemote =
+        thread.source === 'remote-control' &&
+        (syncRemoteMode === 'dismissible'
+          ? hasServerUnread || thread.attentionKind === 'error'
+          : syncRemoteMode === 'unread_only'
+            ? hasServerUnread
+            : false);
+      if (shouldSyncRemote) {
+        const readAtIso = new Date(
+          thread.lastModifiedAtMs > 0
+            ? Math.max(thread.lastModifiedAtMs, thread.lastUserViewAtMs) + 1
+            : Date.now(),
+        ).toISOString();
+        webViewRef.current?.injectJavaScript(
+          buildMarkThreadReadScript({
+            instanceUuid: thread.instanceUuid,
+            cascadeId: thread.cascadeId,
+            readAtIso,
+          }),
+        );
+      }
+    },
+    [],
+  );
+
   // Step 3: Flush & back up cookies whenever the app transitions to background/inactive,
   // and wake up active sessions + 2-Step Verification immediately when returning to active
   useEffect(() => {
@@ -586,38 +732,29 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       'change',
       (nextAppState: AppStateStatus) => {
         if (nextAppState === 'background' || nextAppState === 'inactive') {
+          if (resumeReadSettleTimerRef.current) {
+            clearTimeout(resumeReadSettleTimerRef.current);
+            resumeReadSettleTimerRef.current = null;
+          }
           if (nextAppState === 'background') {
             wasBackgroundedRef.current = true;
           }
           if (isAppForegroundRef.current) {
             const currentSnap = inboxSnapshotRef.current;
-            if (currentSnap.activeInstanceUuid && currentSnap.activeCascadeId) {
-              const activeKey = `${currentSnap.activeInstanceUuid}:${currentSnap.activeCascadeId}`;
-              const activeThread = currentSnap.threads.find(
-                (t) => t.id === activeKey,
+            if (!isDrawerOpenRef.current) {
+              const activeThread = findMatchingThread(
+                currentSnap.threads,
+                currentSnap.activeInstanceUuid,
+                currentSnap.activeCascadeId,
               );
-              recordBoundedLocalRead(
-                locallyReadMapRef.current,
-                activeKey,
-                Math.max(
-                  locallyReadMapRef.current[activeKey] ?? 0,
-                  Date.now(),
-                  (activeThread?.lastModifiedAtMs ?? 0) + 1,
-                ),
-              );
+              markThreadReadInWorkstationClock(activeThread, 'none');
             }
             isAppForegroundRef.current = false;
             setIsAppForeground(false);
-            setInboxSnapshot((previous) =>
-              previous.threads.length === 0
-                ? previous
-                : applyLocalStateToSnapshot(previous, {
-                    activeInstanceUuid: previous.activeInstanceUuid,
-                    activeCascadeId: previous.activeCascadeId,
-                    locallyReadAtByThreadId: locallyReadMapRef.current,
-                    isAppForeground: false,
-                  }),
-            );
+            recomputeSnapshotWithLocalState({
+              isAppForeground: false,
+              isDrawerOpen: isDrawerOpenRef.current,
+            });
           }
           void syncCookiesToVault();
         } else if (nextAppState === 'active') {
@@ -626,46 +763,36 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           if (!isAppForegroundRef.current) {
             isAppForegroundRef.current = true;
             setIsAppForeground(true);
-            const currentSnap = inboxSnapshotRef.current;
-            if (currentSnap.activeInstanceUuid && currentSnap.activeCascadeId) {
-              const activeKey = `${currentSnap.activeInstanceUuid}:${currentSnap.activeCascadeId}`;
-              const activeThread = currentSnap.threads.find(
-                (t) => t.id === activeKey,
-              );
-              const readAtMs = Math.max(
-                locallyReadMapRef.current[activeKey] ?? 0,
-                Date.now(),
-                (activeThread?.lastModifiedAtMs ?? 0) + 1,
-              );
-              recordBoundedLocalRead(
-                locallyReadMapRef.current,
-                activeKey,
-                readAtMs,
-              );
-              if (
-                activeThread &&
-                activeThread.source === 'remote-control' &&
-                activeThread.attentionKind === 'unread'
-              ) {
-                webViewRef.current?.injectJavaScript(
-                  buildMarkThreadReadScript({
-                    instanceUuid: activeThread.instanceUuid,
-                    cascadeId: activeThread.cascadeId,
-                    readAtIso: new Date(readAtMs).toISOString(),
-                  }),
-                );
-              }
+            recomputeSnapshotWithLocalState({
+              isAppForeground: true,
+              isDrawerOpen: isDrawerOpenRef.current,
+            });
+            if (resumeReadSettleTimerRef.current) {
+              clearTimeout(resumeReadSettleTimerRef.current);
             }
-            setInboxSnapshot((previous) =>
-              previous.threads.length === 0
-                ? previous
-                : applyLocalStateToSnapshot(previous, {
-                    activeInstanceUuid: previous.activeInstanceUuid,
-                    activeCascadeId: previous.activeCascadeId,
-                    locallyReadAtByThreadId: locallyReadMapRef.current,
-                    isAppForeground: true,
-                  }),
-            );
+            // Wait briefly before permanently stamping the foreground thread as read so an
+            // incoming `antigravity-remote://inbox` or cross-thread notification deep link
+            // arriving alongside `Activity.onResume` never loses the finished thread's blue state.
+            resumeReadSettleTimerRef.current = setTimeout(() => {
+              resumeReadSettleTimerRef.current = null;
+              if (
+                isResettingSessionRef.current ||
+                !isAppForegroundRef.current ||
+                isDrawerOpenRef.current
+              ) {
+                return;
+              }
+              const settledSnap = inboxSnapshotRef.current;
+              const settledThread = findMatchingThread(
+                settledSnap.threads,
+                settledSnap.activeInstanceUuid,
+                settledSnap.activeCascadeId,
+              );
+              markThreadReadInWorkstationClock(settledThread, 'unread_only');
+            }, 250);
+            (
+              resumeReadSettleTimerRef.current as { unref?: () => void }
+            )?.unref?.();
           }
           if (hydratedRef.current && !isResettingSessionRef.current) {
             if (
@@ -717,7 +844,12 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       }
       subscription.remove();
     };
-  }, [checkPost2faSessionAndAdvance, syncCookiesToVault]);
+  }, [
+    checkPost2faSessionAndAdvance,
+    markThreadReadInWorkstationClock,
+    recomputeSnapshotWithLocalState,
+    syncCookiesToVault,
+  ]);
 
   // Step 3b: Poll for newly issued `.google.com` session cookies while on Google Sign-In
   // so that if the post-2FA redirect ever stalls on the loading bar, it auto-reloads
@@ -783,6 +915,18 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       if (isDrawerOpenRef.current) {
         isDrawerOpenRef.current = false;
         setIsDrawerOpen(false);
+        if (isAppForegroundRef.current) {
+          const currentSnap = inboxSnapshotRef.current;
+          const activeThread = findMatchingThread(
+            currentSnap.threads,
+            currentSnap.activeInstanceUuid,
+            currentSnap.activeCascadeId,
+          );
+          markThreadReadInWorkstationClock(activeThread, 'unread_only');
+        }
+        recomputeSnapshotWithLocalState({
+          isDrawerOpen: false,
+        });
         return true;
       }
       if (canGoBackRef.current && webViewRef.current) {
@@ -806,7 +950,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     return () => {
       subscription.remove();
     };
-  }, []);
+  }, [markThreadReadInWorkstationClock, recomputeSnapshotWithLocalState]);
 
   const handleRootLayout = useCallback(
     (event: LayoutChangeEvent) => {
@@ -850,6 +994,9 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       void clearNativeActionNotification?.();
       lastActionNotifSigRef.current = 'none';
       previousOpenActionIdsRef.current = new Set();
+      knownRunningThreadIdsRef.current = new Set();
+      completedUnreadMapRef.current = {};
+      lastSnapshotMessageRef.current = null;
       clearInboxTimers();
       locallyReadMapRef.current = {};
       activeInstanceUuidRef.current = null;
@@ -978,25 +1125,21 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         recordActiveRouteForBackNavigation(route.instanceUuid, route.cascadeId);
         if (
           isAppForegroundRef.current &&
+          !isDrawerOpenRef.current &&
           route.instanceUuid &&
           route.cascadeId
         ) {
-          recordBoundedLocalRead(
-            locallyReadMapRef.current,
-            `${route.instanceUuid}:${route.cascadeId}`,
-            Date.now(),
+          const activeThread = findMatchingThread(
+            inboxSnapshotRef.current.threads,
+            route.instanceUuid,
+            route.cascadeId,
           );
+          markThreadReadInWorkstationClock(activeThread, 'unread_only');
         }
-        setInboxSnapshot((previous) =>
-          previous.threads.length === 0
-            ? previous
-            : applyLocalStateToSnapshot(previous, {
-                activeInstanceUuid: route.instanceUuid,
-                activeCascadeId: route.cascadeId,
-                locallyReadAtByThreadId: locallyReadMapRef.current,
-                isAppForeground: isAppForegroundRef.current,
-              }),
-        );
+        recomputeSnapshotWithLocalState({
+          activeInstanceUuid: route.instanceUuid,
+          activeCascadeId: route.cascadeId,
+        });
         if (!navState.loading) {
           setHasNetworkError(false);
           setPageError(null);
@@ -1021,6 +1164,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     },
     [
       checkPost2faSessionAndAdvance,
+      markThreadReadInWorkstationClock,
+      recomputeSnapshotWithLocalState,
       recordActiveRouteForBackNavigation,
       recoverFromCookieMismatch,
       syncCookiesToVault,
@@ -1179,50 +1324,50 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const handleOpenDrawer = useCallback(
     (preferredMode?: DrawerMode) => {
       if (isResettingSessionRef.current) return;
+      if (resumeReadSettleTimerRef.current) {
+        clearTimeout(resumeReadSettleTimerRef.current);
+        resumeReadSettleTimerRef.current = null;
+      }
       const resolvedMode: DrawerMode =
         preferredMode ??
         (stageRef.current === 'authenticated' ? 'inbox' : 'settings');
       setDrawerInitialMode(resolvedMode);
       isDrawerOpenRef.current = true;
       setIsDrawerOpen(true);
+      recomputeSnapshotWithLocalState({ isDrawerOpen: true });
       if (stageRef.current === 'authenticated') {
         handleRefreshInbox(resolvedMode === 'usage');
       }
     },
-    [handleRefreshInbox],
+    [handleRefreshInbox, recomputeSnapshotWithLocalState],
   );
 
   const handleCloseDrawer = useCallback(() => {
     isDrawerOpenRef.current = false;
     setIsDrawerOpen(false);
-  }, []);
-
-  const handleMarkThreadRead = useCallback((thread: InboxThreadItem) => {
-    if (isResettingSessionRef.current) return;
-    const readAtMs = Math.max(Date.now(), thread.lastModifiedAtMs + 1);
-    recordBoundedLocalRead(locallyReadMapRef.current, thread.id, readAtMs);
-    setInboxSnapshot((previous) =>
-      applyLocalStateToSnapshot(previous, {
-        activeInstanceUuid: previous.activeInstanceUuid,
-        activeCascadeId: previous.activeCascadeId,
-        locallyReadAtByThreadId: locallyReadMapRef.current,
-        isAppForeground: isAppForegroundRef.current,
-      }),
-    );
-    if (thread.source === 'remote-control') {
-      webViewRef.current?.injectJavaScript(
-        buildMarkThreadReadScript({
-          instanceUuid: thread.instanceUuid,
-          cascadeId: thread.cascadeId,
-          readAtIso: new Date(readAtMs).toISOString(),
-        }),
+    if (isAppForegroundRef.current) {
+      const currentSnap = inboxSnapshotRef.current;
+      const activeThread = findMatchingThread(
+        currentSnap.threads,
+        currentSnap.activeInstanceUuid,
+        currentSnap.activeCascadeId,
       );
+      markThreadReadInWorkstationClock(activeThread, 'unread_only');
     }
-  }, []);
+    recomputeSnapshotWithLocalState({ isDrawerOpen: false });
+  }, [markThreadReadInWorkstationClock, recomputeSnapshotWithLocalState]);
+
+  const handleMarkThreadRead = useCallback(
+    (thread: InboxThreadItem) => {
+      if (isResettingSessionRef.current) return;
+      markThreadReadInWorkstationClock(thread, 'dismissible');
+      recomputeSnapshotWithLocalState();
+    },
+    [markThreadReadInWorkstationClock, recomputeSnapshotWithLocalState],
+  );
 
   const handleMarkAllRead = useCallback(() => {
     if (isResettingSessionRef.current) return;
-    const nowMs = Date.now();
     for (const thread of inboxSnapshot.threads) {
       if (
         thread.attentionKind !== 'unread' &&
@@ -1230,53 +1375,31 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       ) {
         continue;
       }
-      const readAtMs = Math.max(nowMs, thread.lastModifiedAtMs + 1);
-      recordBoundedLocalRead(locallyReadMapRef.current, thread.id, readAtMs);
-      if (thread.source === 'remote-control') {
-        webViewRef.current?.injectJavaScript(
-          buildMarkThreadReadScript({
-            instanceUuid: thread.instanceUuid,
-            cascadeId: thread.cascadeId,
-            readAtIso: new Date(readAtMs).toISOString(),
-          }),
-        );
-      }
+      markThreadReadInWorkstationClock(thread, 'dismissible');
     }
-    setInboxSnapshot((previous) =>
-      applyLocalStateToSnapshot(previous, {
-        activeInstanceUuid: previous.activeInstanceUuid,
-        activeCascadeId: previous.activeCascadeId,
-        locallyReadAtByThreadId: locallyReadMapRef.current,
-        isAppForeground: isAppForegroundRef.current,
-      }),
-    );
-  }, [inboxSnapshot.threads]);
+    recomputeSnapshotWithLocalState();
+  }, [
+    inboxSnapshot.threads,
+    markThreadReadInWorkstationClock,
+    recomputeSnapshotWithLocalState,
+  ]);
 
   const handleSelectInboxThread = useCallback(
     (thread: InboxThreadItem) => {
       if (isResettingSessionRef.current) return;
-      handleCloseDrawer();
-
-      const readAtMs = Math.max(Date.now(), thread.lastModifiedAtMs + 1);
-      recordBoundedLocalRead(locallyReadMapRef.current, thread.id, readAtMs);
-      if (thread.source === 'remote-control' && thread.attentionKind === 'unread') {
-        webViewRef.current?.injectJavaScript(
-          buildMarkThreadReadScript({
-            instanceUuid: thread.instanceUuid,
-            cascadeId: thread.cascadeId,
-            readAtIso: new Date(readAtMs).toISOString(),
-          }),
-        );
+      if (resumeReadSettleTimerRef.current) {
+        clearTimeout(resumeReadSettleTimerRef.current);
+        resumeReadSettleTimerRef.current = null;
       }
+      isDrawerOpenRef.current = false;
+      setIsDrawerOpen(false);
 
-      setInboxSnapshot((previous) =>
-        applyLocalStateToSnapshot(previous, {
-          activeInstanceUuid: thread.instanceUuid,
-          activeCascadeId: thread.cascadeId,
-          locallyReadAtByThreadId: locallyReadMapRef.current,
-          isAppForeground: isAppForegroundRef.current,
-        }),
-      );
+      markThreadReadInWorkstationClock(thread, 'unread_only');
+      recomputeSnapshotWithLocalState({
+        activeInstanceUuid: thread.instanceUuid,
+        activeCascadeId: thread.cascadeId,
+        isDrawerOpen: false,
+      });
 
       const currentRoute = extractActiveRouteFromUrl(currentNavUrlRef.current);
       const isSameActiveInstance =
@@ -1311,7 +1434,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
 
       handleNavigateToUrl(thread.targetUrl);
     },
-    [handleCloseDrawer, handleNavigateToUrl],
+    [
+      handleNavigateToUrl,
+      markThreadReadInWorkstationClock,
+      recomputeSnapshotWithLocalState,
+    ],
   );
 
   // Step 2: Handle incoming deep links and multi-action Inbox opens when mounted
@@ -1319,10 +1446,15 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     if (!isHydrated || isResettingSessionRef.current || !pendingOpenInbox) {
       return;
     }
+    if (resumeReadSettleTimerRef.current) {
+      clearTimeout(resumeReadSettleTimerRef.current);
+      resumeReadSettleTimerRef.current = null;
+    }
     setDrawerInitialMode('inbox');
     setFocusInboxRequestKey((prev) => prev + 1);
     isDrawerOpenRef.current = true;
     setIsDrawerOpen(true);
+    recomputeSnapshotWithLocalState({ isDrawerOpen: true });
     if (stageRef.current === 'authenticated') {
       handleRefreshInbox();
     }
@@ -1332,12 +1464,18 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     isHydrated,
     onOpenInboxConsumed,
     pendingOpenInbox,
+    recomputeSnapshotWithLocalState,
     resetRequest,
   ]);
 
   useEffect(() => {
     if (!isHydrated || isResettingSessionRef.current || !incomingDeepLinkUrl) {
       return;
+    }
+
+    if (resumeReadSettleTimerRef.current) {
+      clearTimeout(resumeReadSettleTimerRef.current);
+      resumeReadSettleTimerRef.current = null;
     }
 
     const validation = validateNavigationUrl(incomingDeepLinkUrl);
@@ -1352,33 +1490,24 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         !renderProcessDeadRef.current &&
         targetRoute.instanceUuid &&
         targetRoute.cascadeId
-          ? inboxSnapshotRef.current.threads.find(
-              (thread) =>
-                thread.instanceUuid === targetRoute.instanceUuid &&
-                thread.cascadeId === targetRoute.cascadeId,
+          ? findMatchingThread(
+              inboxSnapshotRef.current.threads,
+              targetRoute.instanceUuid,
+              targetRoute.cascadeId,
             )
           : undefined;
 
       if (matchingThread) {
         handleSelectInboxThread(matchingThread);
       } else {
-        handleCloseDrawer();
+        isDrawerOpenRef.current = false;
+        setIsDrawerOpen(false);
         if (targetRoute.instanceUuid && targetRoute.cascadeId) {
-          recordBoundedLocalRead(
-            locallyReadMapRef.current,
-            `${targetRoute.instanceUuid}:${targetRoute.cascadeId}`,
-            Date.now(),
-          );
-          setInboxSnapshot((previous) =>
-            previous.threads.length === 0
-              ? previous
-              : applyLocalStateToSnapshot(previous, {
-                  activeInstanceUuid: targetRoute.instanceUuid,
-                  activeCascadeId: targetRoute.cascadeId,
-                  locallyReadAtByThreadId: locallyReadMapRef.current,
-                  isAppForeground: isAppForegroundRef.current,
-                }),
-          );
+          recomputeSnapshotWithLocalState({
+            activeInstanceUuid: targetRoute.instanceUuid,
+            activeCascadeId: targetRoute.cascadeId,
+            isDrawerOpen: false,
+          });
         }
         if (validation.normalizedUrl !== currentNavUrlRef.current) {
           handleNavigateToUrl(validation.normalizedUrl);
@@ -1387,12 +1516,12 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     }
     onDeepLinkConsumed();
   }, [
-    handleCloseDrawer,
     handleNavigateToUrl,
     handleSelectInboxThread,
     incomingDeepLinkUrl,
     isHydrated,
     onDeepLinkConsumed,
+    recomputeSnapshotWithLocalState,
     resetRequest,
   ]);
 
@@ -1480,12 +1609,21 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           }
           setIsInboxRefreshing(false);
           syncVerifiedActiveHostUrl(message.activeUrl);
-          const built = buildInboxSnapshot(
+          lastSnapshotMessageRef.current = message;
+          const built = reconcileRunningThreadTransitions({
             message,
-            locallyReadMapRef.current,
-            currentNavUrlRef.current,
-            isAppForegroundRef.current,
-          );
+            knownRunningThreadIds: knownRunningThreadIdsRef.current,
+            completedUnreadAtByThreadId: completedUnreadMapRef.current,
+            locallyReadAtByThreadId: locallyReadMapRef.current,
+            fallbackActiveUrl: currentNavUrlRef.current,
+            isAppForeground: isAppForegroundRef.current,
+            isDrawerOpen: isDrawerOpenRef.current,
+          });
+          lastSnapshotMessageRef.current = {
+            ...message,
+            activeInstanceUuid: built.activeInstanceUuid,
+            activeCascadeId: built.activeCascadeId,
+          };
           activeInstanceUuidRef.current = built.activeInstanceUuid;
           recordActiveRouteForBackNavigation(
             built.activeInstanceUuid,
@@ -1493,20 +1631,17 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           );
           if (
             isAppForegroundRef.current &&
+            !isDrawerOpenRef.current &&
+            !resumeReadSettleTimerRef.current &&
             built.activeInstanceUuid &&
             built.activeCascadeId
           ) {
-            const activeKey = `${built.activeInstanceUuid}:${built.activeCascadeId}`;
-            const activeThread = built.threads.find((t) => t.id === activeKey);
-            recordBoundedLocalRead(
-              locallyReadMapRef.current,
-              activeKey,
-              Math.max(
-                locallyReadMapRef.current[activeKey] ?? 0,
-                Date.now(),
-                (activeThread?.lastModifiedAtMs ?? 0) + 1,
-              ),
+            const activeThread = findMatchingThread(
+              built.threads,
+              built.activeInstanceUuid,
+              built.activeCascadeId,
             );
+            markThreadReadInWorkstationClock(activeThread, 'none');
           }
           setInboxSnapshot(built);
           break;
@@ -1526,25 +1661,31 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             activeInstanceUuid,
             activeCascadeId,
           );
+          if (lastSnapshotMessageRef.current) {
+            lastSnapshotMessageRef.current = {
+              ...lastSnapshotMessageRef.current,
+              activeInstanceUuid,
+              activeCascadeId,
+            };
+          }
           if (
             isAppForegroundRef.current &&
+            !isDrawerOpenRef.current &&
+            !resumeReadSettleTimerRef.current &&
             activeInstanceUuid &&
             activeCascadeId
           ) {
-            recordBoundedLocalRead(
-              locallyReadMapRef.current,
-              `${activeInstanceUuid}:${activeCascadeId}`,
-              Date.now(),
-            );
-          }
-          setInboxSnapshot((previous) =>
-            applyLocalStateToSnapshot(previous, {
+            const activeThread = findMatchingThread(
+              inboxSnapshotRef.current.threads,
               activeInstanceUuid,
               activeCascadeId,
-              locallyReadAtByThreadId: locallyReadMapRef.current,
-              isAppForeground: isAppForegroundRef.current,
-            }),
-          );
+            );
+            markThreadReadInWorkstationClock(activeThread, 'unread_only');
+          }
+          recomputeSnapshotWithLocalState({
+            activeInstanceUuid,
+            activeCascadeId,
+          });
           break;
         }
 
@@ -1579,6 +1720,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     [
       armInboxRefreshTimeout,
       handleNavigateToUrl,
+      markThreadReadInWorkstationClock,
+      recomputeSnapshotWithLocalState,
       recordActiveRouteForBackNavigation,
       syncVerifiedActiveHostUrl,
     ],

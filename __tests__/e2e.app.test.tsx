@@ -2014,6 +2014,176 @@ describe('Session and navigation regressions', () => {
     expect(clearNativeActionNotification).toHaveBeenCalled();
   });
 
+  it('enters blue FINISHED state and posts OS notification when an agent finishes while backgrounded or on Project Overview, immune to phone clock skew', async () => {
+    const RNPlatform = require('react-native').Platform;
+    RNPlatform.OS = 'android';
+    RNPlatform.Version = 34;
+
+    mockCookieStore.set('https://antigravity.google.com', {
+      SID: { name: 'SID', value: 'finished-run-session', domain: '.google.com' },
+    });
+    await navigate(
+      'https://antigravity.google.com/r/workstation-1?p=c%2Fagent-run-1',
+      false,
+    );
+
+    // Simulate workstation clock 5 minutes BEHIND phone `Date.now()`
+    const workstationStartIso = new Date(Date.now() - 300_000).toISOString();
+    const workstationFinishIso = new Date(Date.now() - 290_000).toISOString();
+    const workstationSecondFinishIso = new Date(
+      Date.now() - 250_000,
+    ).toISOString();
+
+    const deliverRunSnapshot = async (params: {
+      isRunning: boolean;
+      modifiedIso: string;
+      activeCascadeId: string | null;
+      activeUrl: string;
+    }) => {
+      await act(async () => {
+        webView().props.onMessage({
+          nativeEvent: {
+            url: params.activeUrl,
+            data: JSON.stringify({
+              type: 'AGY_INBOX_SNAPSHOT',
+              fetchedAtMs: Date.now(),
+              activeUrl: params.activeUrl,
+              activeInstanceUuid: 'workstation-1',
+              activeCascadeId: params.activeCascadeId,
+              instances: [
+                {
+                  uuid: 'workstation-1',
+                  name: 'Primary Box',
+                  status: 1,
+                  trajectories: {
+                    trajectorySummaries: {
+                      'agent-run-1': {
+                        summary: 'Ship v1.3 feature',
+                        status: params.isRunning
+                          ? 'CASCADE_RUN_STATUS_RUNNING'
+                          : 'CASCADE_RUN_STATUS_IDLE',
+                        notFullyIdle: params.isRunning,
+                        lastUserInputTime: workstationStartIso,
+                        lastModifiedTime: params.modifiedIso,
+                      },
+                    },
+                  },
+                },
+              ],
+            }),
+          },
+        });
+      });
+    };
+
+    // 1. Agent is working in the foreground -> green working state (`runningCount: 1`, `attentionCount: 0`), no notification
+    (syncNativeActionNotification as jest.Mock).mockClear();
+    await deliverRunSnapshot({
+      isRunning: true,
+      modifiedIso: workstationStartIso,
+      activeCascadeId: 'agent-run-1',
+      activeUrl:
+        'https://antigravity.google.com/r/workstation-1?p=c%2Fagent-run-1',
+    });
+    expect(controls().props.runningCount).toBe(1);
+    expect(controls().props.attentionCount).toBe(0);
+    expect(controls().props.urgentAttentionCount).toBe(0);
+    expect(syncNativeActionNotification).not.toHaveBeenCalled();
+
+    // 2. User switches apps (`background`), then agent finishes -> enters BLUE state (`attentionCount: 1`, `urgentAttentionCount: 0`)
+    // and fires OS notification even though phone `Date.now()` was 5 minutes ahead of workstation `lastModifiedTime`!
+    await act(async () => {
+      for (const listener of mockAppStateListeners) {
+        listener('background');
+      }
+    });
+    await deliverRunSnapshot({
+      isRunning: false,
+      modifiedIso: workstationFinishIso,
+      activeCascadeId: 'agent-run-1',
+      activeUrl:
+        'https://antigravity.google.com/r/workstation-1?p=c%2Fagent-run-1',
+    });
+    expect(controls().props.attentionCount).toBe(1);
+    expect(controls().props.urgentAttentionCount).toBe(0);
+    expect(syncNativeActionNotification).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        count: 1,
+        title: '1 action open • Primary Box',
+        body: 'Ship v1.3 feature — Agent finished — unread updates',
+        deepLinkUrl:
+          'antigravity-remote://r/workstation-1?p=c%2Fagent-run-1',
+        shouldAlert: true,
+      }),
+    );
+
+    // 3. Returning to foreground via Inbox (`antigravity-remote://inbox`) keeps the blue `FINISHED` card visible while Sidebar is open,
+    // and closing the Sidebar onto `agent-run-1` clears both the blue state and the OS notification!
+    await act(async () => {
+      for (const listener of mockLinkingListeners) {
+        listener({ url: 'antigravity-remote://inbox' });
+      }
+      for (const listener of mockAppStateListeners) {
+        listener('active');
+      }
+    });
+    expect(controls().props.visible).toBe(true);
+    expect(controls().props.attentionCount).toBe(1);
+    const finishedBadges = tree.root
+      .findAllByType('Text' as any)
+      .filter((node) => node.props.children === 'FINISHED');
+    expect(finishedBadges.length).toBeGreaterThanOrEqual(1);
+
+    (clearNativeActionNotification as jest.Mock).mockClear();
+    await act(async () => {
+      controls().props.onClose();
+    });
+    expect(controls().props.visible).toBe(false);
+    expect(controls().props.attentionCount).toBe(0);
+    expect(clearNativeActionNotification).toHaveBeenCalled();
+
+    // 4. Now start a second run on `agent-run-1`, exit to Project Overview (`activeCascadeId: null`), and let it finish while app is active:
+    // enters BLUE state (`attentionCount: 1`, `urgentAttentionCount: 0`) and notifies!
+    (syncNativeActionNotification as jest.Mock).mockClear();
+    await deliverRunSnapshot({
+      isRunning: true,
+      modifiedIso: workstationSecondFinishIso,
+      activeCascadeId: 'agent-run-1',
+      activeUrl:
+        'https://antigravity.google.com/r/workstation-1?p=c%2Fagent-run-1',
+    });
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_ACTIVE_ROUTE',
+            activeUrl: 'https://antigravity.google.com/r/workstation-1',
+            activeInstanceUuid: 'workstation-1',
+            activeCascadeId: null,
+          }),
+        },
+      });
+    });
+    await deliverRunSnapshot({
+      isRunning: false,
+      modifiedIso: workstationSecondFinishIso,
+      activeCascadeId: null,
+      activeUrl: 'https://antigravity.google.com/r/workstation-1',
+    });
+    expect(controls().props.attentionCount).toBe(1);
+    expect(controls().props.urgentAttentionCount).toBe(0);
+    expect(syncNativeActionNotification).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        count: 1,
+        title: '1 action open • Primary Box',
+        deepLinkUrl:
+          'antigravity-remote://r/workstation-1?p=c%2Fagent-run-1',
+        shouldAlert: true,
+      }),
+    );
+  });
+
   it('does not prematurely enter authenticated stage or prompt for POST_NOTIFICATIONS when Android only has non-auth cookies', async () => {
     const RN = require('react-native');
     const prevOS = RN.Platform.OS;

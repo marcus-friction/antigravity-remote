@@ -118,7 +118,7 @@ function getBadgeVisuals(kind: InboxAttentionKind): {
       };
     case 'unread':
       return {
-        label: 'UNREAD',
+        label: 'FINISHED',
         textColor: '#BFDBFE',
         bgColor: 'rgba(59, 130, 246, 0.2)',
         borderColor: 'rgba(96, 165, 250, 0.45)',
@@ -1244,7 +1244,9 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                                   ? styles.reasonTextApproval
                                   : thread.attentionKind === 'error'
                                     ? styles.reasonTextError
-                                    : null,
+                                    : thread.attentionKind === 'unread'
+                                      ? styles.reasonTextUnread
+                                      : null,
                               ]}
                               numberOfLines={2}
                             >
@@ -1801,9 +1803,9 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                 <View style={styles.keepAliveSection}>
                   <Text style={styles.sectionLabel}>Action Notifications</Text>
                   <Text style={styles.keepAliveDescription}>
-                    Notify when an agent requires an answer or approval. Updates
-                    with open action count; opens the thread (if 1) or Inbox (if
-                    multiple).
+                    Notify when an agent needs approval, asks a question, or
+                    finishes. Updates with open action count; opens the thread
+                    (if 1) or Inbox (if multiple).
                   </Text>
                   <View style={styles.keepAliveRow}>
                     {(
@@ -1861,7 +1863,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                       : keepAliveMinutes > 0
                         ? actionNotificationMode === 'approvals'
                           ? 'Active for blocking approvals & questions • Background updates enabled.'
-                          : 'Active for approvals, questions & unread replies • Background updates enabled.'
+                          : 'Active for approvals, questions & finished runs • Background updates enabled.'
                         : 'Alerts while connected • Select a background timer below to receive alerts after switching apps.'}
                   </Text>
                 </View>
@@ -2543,6 +2545,10 @@ const styles = StyleSheet.create({
   },
   reasonTextError: {
     color: '#FCA5A5',
+  },
+  reasonTextUnread: {
+    color: '#93C5FD',
+    fontWeight: '500',
   },
   cardFooterRow: {
     flexDirection: 'row',

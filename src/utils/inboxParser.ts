@@ -22,6 +22,7 @@ const MAX_USAGE_GROUPS = 16;
 const MAX_USAGE_BUCKETS_PER_GROUP = 16;
 const MAX_USAGE_MODELS = 48;
 const MAX_USAGE_CREDITS = 12;
+const MAX_TRACKED_TRANSITION_ENTRIES = 500;
 const SAFE_ID_PATTERN = /^[a-zA-Z0-9._-]+$/;
 
 const ATTENTION_PRIORITY: Record<InboxAttentionKind, number> = {
@@ -506,7 +507,9 @@ function parseTrajectoriesForSource(params: {
   accountPrefix: string;
   preservedQueryParams: Readonly<Record<string, string>>;
   locallyReadAtByThreadId: Readonly<Record<string, number>>;
+  completedUnreadAtByThreadId?: Readonly<Record<string, number>>;
   isAppForeground?: boolean;
+  isDrawerOpen?: boolean;
 }): InboxThreadItem[] {
   const {
     source,
@@ -518,7 +521,9 @@ function parseTrajectoriesForSource(params: {
     accountPrefix,
     preservedQueryParams,
     locallyReadAtByThreadId,
+    completedUnreadAtByThreadId = {},
     isAppForeground = true,
+    isDrawerOpen = false,
   } = params;
 
   const map = unwrapTrajectoryMap(rawTrajectories);
@@ -697,8 +702,23 @@ function parseTrajectoriesForSource(params: {
       raw.lastUserInputTime ?? raw.last_user_input_time,
     );
 
+    const rawStepCount = raw.stepCount ?? raw.step_count;
+    const stepCount =
+      typeof rawStepCount === 'number' && Number.isFinite(rawStepCount)
+        ? Math.max(0, Math.floor(rawStepCount))
+        : 0;
+
+    const rawLastUserInputStepIndex =
+      raw.lastUserInputStepIndex ?? raw.last_user_input_step_index;
+    const lastUserInputStepIndex =
+      typeof rawLastUserInputStepIndex === 'number' &&
+      Number.isFinite(rawLastUserInputStepIndex)
+        ? Math.floor(rawLastUserInputStepIndex)
+        : null;
+
     const compositeId = `${instanceUuid}:${cascadeId}`;
     const locallyReadAtMs = locallyReadAtByThreadId[compositeId] ?? 0;
+    const completedUnreadAtMs = completedUnreadAtByThreadId[compositeId] ?? 0;
     const seenBaselineMs = Math.max(
       lastUserViewAtMs,
       lastUserInputAtMs,
@@ -709,11 +729,31 @@ function parseTrajectoriesForSource(params: {
       annotations?.markedAsUnread ?? annotations?.marked_as_unread,
     );
     const isLocallyCleared =
-      locallyReadAtMs > 0 && locallyReadAtMs >= lastModifiedAtMs;
+      locallyReadAtMs > 0 &&
+      (lastModifiedAtMs > 0
+        ? locallyReadAtMs >= lastModifiedAtMs
+        : locallyReadAtMs >= completedUnreadAtMs);
+    const hasViewedSinceLastModify =
+      lastUserViewAtMs > 0 &&
+      lastUserViewAtMs >= lastModifiedAtMs &&
+      (lastUserInputAtMs === 0 || lastUserViewAtMs > lastUserInputAtMs);
+    const hasStepsAfterUserInput =
+      lastUserInputStepIndex !== null &&
+      lastUserInputStepIndex >= 0 &&
+      stepCount > lastUserInputStepIndex + 1 &&
+      !hasViewedSinceLastModify &&
+      (lastUserInputAtMs === 0 || lastModifiedAtMs >= lastUserInputAtMs);
     const hasNewOutputSinceUser =
-      seenBaselineMs > 0 && lastModifiedAtMs > seenBaselineMs + 1_000;
+      (seenBaselineMs > 0 && lastModifiedAtMs > seenBaselineMs) ||
+      hasStepsAfterUserInput;
+    const hasUnreadFinishedTransition =
+      completedUnreadAtMs > 0 &&
+      (locallyReadAtMs === 0 || completedUnreadAtMs > locallyReadAtMs);
     const isUnread =
-      !isLocallyCleared && (isMarkedUnreadRemotely || hasNewOutputSinceUser);
+      !isLocallyCleared &&
+      (isMarkedUnreadRemotely ||
+        hasNewOutputSinceUser ||
+        hasUnreadFinishedTransition);
 
     const rawTrajectoryId = raw.trajectoryId ?? raw.trajectory_id;
     const trajectoryId =
@@ -737,6 +777,9 @@ function parseTrajectoriesForSource(params: {
       !isLocallyCleared &&
       (seenBaselineMs === 0 || lastModifiedAtMs >= seenBaselineMs - 1_000);
 
+    const isActivelyViewedOnScreen =
+      isAppForeground && !isDrawerOpen && isActiveThread;
+
     let attentionKind: InboxAttentionKind;
     let needsAttention: boolean;
     let attentionReason: string;
@@ -755,15 +798,15 @@ function parseTrajectoriesForSource(params: {
       attentionKind = 'error';
       needsAttention = true;
       attentionReason = terminationFailure;
-    } else if (
-      !isRunning &&
-      !killed &&
-      !(isAppForeground && isActiveThread) &&
-      isUnread
-    ) {
+    } else if (!isRunning && !killed && !isActivelyViewedOnScreen && isUnread) {
       attentionKind = 'unread';
       needsAttention = true;
-      attentionReason = 'Finished — unread updates';
+      attentionReason =
+        isMarkedUnreadRemotely &&
+        !hasNewOutputSinceUser &&
+        !hasUnreadFinishedTransition
+          ? 'Marked as unread'
+          : 'Agent finished — unread updates';
     } else if (isRunning) {
       attentionKind = 'running';
       needsAttention = false;
@@ -773,7 +816,8 @@ function parseTrajectoriesForSource(params: {
     } else {
       attentionKind = 'idle';
       needsAttention = false;
-      attentionReason = Boolean(raw.interrupted) ? 'Interrupted' : 'Idle';
+      attentionReason =
+        killed || Boolean(raw.interrupted) ? 'Interrupted' : 'Idle';
     }
 
     const annotationTitle =
@@ -786,12 +830,6 @@ function parseTrajectoriesForSource(params: {
       annotationTitle || summaryTitle || `Conversation ${cascadeId.slice(0, 8)}`,
       110,
     );
-
-    const rawStepCount = raw.stepCount ?? raw.step_count;
-    const stepCount =
-      typeof rawStepCount === 'number' && Number.isFinite(rawStepCount)
-        ? Math.max(0, Math.floor(rawStepCount))
-        : 0;
 
     const isPinned = Boolean(annotations?.pinned || annotations?.starred);
 
@@ -1546,6 +1584,8 @@ export function buildInboxSnapshot(
   locallyReadAtByThreadId: Readonly<Record<string, number>> = {},
   fallbackActiveUrl?: string | null,
   isAppForeground: boolean = true,
+  completedUnreadAtByThreadId: Readonly<Record<string, number>> = {},
+  isDrawerOpen: boolean = false,
 ): InboxSnapshot {
   const referenceUrl = message.activeUrl ?? fallbackActiveUrl ?? null;
   const { instanceUuid: activeInstanceUuid, cascadeId: activeCascadeId } =
@@ -1601,7 +1641,9 @@ export function buildInboxSnapshot(
           accountPrefix,
           preservedQueryParams,
           locallyReadAtByThreadId,
+          completedUnreadAtByThreadId,
           isAppForeground,
+          isDrawerOpen,
         }),
       );
     }
@@ -1619,7 +1661,9 @@ export function buildInboxSnapshot(
         accountPrefix,
         preservedQueryParams,
         locallyReadAtByThreadId,
+        completedUnreadAtByThreadId,
         isAppForeground,
+        isDrawerOpen,
       }),
     );
   }
@@ -1660,6 +1704,134 @@ export function buildInboxSnapshot(
   };
 }
 
+function setBoundedTransitionStamp(
+  map: Record<string, number>,
+  key: string,
+  value: number,
+): void {
+  if (Object.prototype.hasOwnProperty.call(map, key)) {
+    delete map[key];
+  }
+  map[key] = value;
+  const keys = Object.keys(map);
+  if (keys.length > MAX_TRACKED_TRANSITION_ENTRIES) {
+    const excess = keys.length - MAX_TRACKED_TRANSITION_ENTRIES;
+    for (let i = 0; i < excess; i++) {
+      delete map[keys[i]];
+    }
+  }
+}
+
+/**
+ * Tracks live `running`/`approval` -> finished transitions across snapshots so
+ * any agent run that completes while the thread is not actively visible on
+ * screen enters the blue `unread` (finished) state and triggers an action
+ * notification, even when `lastUserViewTime` / `lastUserInputTime` are absent,
+ * sub-second, or subject to workstation clock skew.
+ */
+export function reconcileRunningThreadTransitions(params: {
+  message: Extract<InboxBridgeMessage, { type: 'AGY_INBOX_SNAPSHOT' }>;
+  knownRunningThreadIds: Set<string>;
+  completedUnreadAtByThreadId: Record<string, number>;
+  locallyReadAtByThreadId: Record<string, number>;
+  fallbackActiveUrl?: string | null;
+  isAppForeground?: boolean;
+  isDrawerOpen?: boolean;
+}): InboxSnapshot {
+  const {
+    message,
+    knownRunningThreadIds,
+    completedUnreadAtByThreadId,
+    locallyReadAtByThreadId,
+    fallbackActiveUrl,
+    isAppForeground = true,
+    isDrawerOpen = false,
+  } = params;
+
+  const preliminary = buildInboxSnapshot(
+    message,
+    locallyReadAtByThreadId,
+    fallbackActiveUrl,
+    isAppForeground,
+    completedUnreadAtByThreadId,
+    isDrawerOpen,
+  );
+
+  let needsRebuild = false;
+  for (const thread of preliminary.threads) {
+    const isRunActive =
+      thread.attentionKind === 'running' || thread.attentionKind === 'approval';
+    if (isRunActive) {
+      knownRunningThreadIds.add(thread.id);
+      if (
+        Object.prototype.hasOwnProperty.call(
+          completedUnreadAtByThreadId,
+          thread.id,
+        )
+      ) {
+        delete completedUnreadAtByThreadId[thread.id];
+      }
+      if (
+        Object.prototype.hasOwnProperty.call(locallyReadAtByThreadId, thread.id)
+      ) {
+        delete locallyReadAtByThreadId[thread.id];
+      }
+      continue;
+    }
+
+    if (knownRunningThreadIds.delete(thread.id)) {
+      const wasInterrupted = thread.attentionReason === 'Interrupted';
+      if (thread.attentionKind !== 'error' && !wasInterrupted) {
+        const isActivelyViewedOnScreen =
+          isAppForeground && !isDrawerOpen && thread.isActiveThread;
+        if (isActivelyViewedOnScreen) {
+          delete completedUnreadAtByThreadId[thread.id];
+          setBoundedTransitionStamp(
+            locallyReadAtByThreadId,
+            thread.id,
+            Math.max(1, thread.lastModifiedAtMs),
+          );
+        } else {
+          delete locallyReadAtByThreadId[thread.id];
+          setBoundedTransitionStamp(
+            completedUnreadAtByThreadId,
+            thread.id,
+            Math.max(1, thread.lastModifiedAtMs),
+          );
+          if (thread.attentionKind !== 'unread') {
+            needsRebuild = true;
+          }
+        }
+      }
+    }
+  }
+
+  if (knownRunningThreadIds.size > MAX_TRACKED_TRANSITION_ENTRIES) {
+    const presentIds = new Set(preliminary.threads.map((t) => t.id));
+    for (const trackedId of Array.from(knownRunningThreadIds)) {
+      if (!presentIds.has(trackedId)) {
+        knownRunningThreadIds.delete(trackedId);
+      }
+      if (knownRunningThreadIds.size <= MAX_TRACKED_TRANSITION_ENTRIES) {
+        break;
+      }
+    }
+  }
+
+  if (!needsRebuild) {
+    return preliminary;
+  }
+
+  return buildInboxSnapshot(
+    message,
+    locallyReadAtByThreadId,
+    fallbackActiveUrl,
+    isAppForeground,
+    completedUnreadAtByThreadId,
+    isDrawerOpen,
+  );
+}
+
 /**
  * Re-applies active thread & local read state onto an existing `InboxSnapshot`
  * without waiting for a network poll round-trip.
@@ -1671,6 +1843,7 @@ export function applyLocalStateToSnapshot(
     activeCascadeId: string | null;
     locallyReadAtByThreadId: Readonly<Record<string, number>>;
     isAppForeground?: boolean;
+    isDrawerOpen?: boolean;
   },
 ): InboxSnapshot {
   const {
@@ -1678,6 +1851,7 @@ export function applyLocalStateToSnapshot(
     activeCascadeId,
     locallyReadAtByThreadId,
     isAppForeground = true,
+    isDrawerOpen = false,
   } = params;
 
   const updatedThreads = snapshot.threads.map((thread) => {
@@ -1689,11 +1863,16 @@ export function applyLocalStateToSnapshot(
 
     const locallyReadAtMs = locallyReadAtByThreadId[thread.id] ?? 0;
     const isLocallyCleared =
-      locallyReadAtMs > 0 && locallyReadAtMs >= thread.lastModifiedAtMs;
+      locallyReadAtMs > 0 &&
+      (thread.lastModifiedAtMs > 0
+        ? locallyReadAtMs >= thread.lastModifiedAtMs
+        : true);
+    const isActivelyViewedOnScreen =
+      isAppForeground && !isDrawerOpen && isActiveThread;
 
     if (
       thread.attentionKind === 'unread' &&
-      ((isAppForeground && isActiveThread) || isLocallyCleared)
+      (isActivelyViewedOnScreen || isLocallyCleared)
     ) {
       return {
         ...thread,
