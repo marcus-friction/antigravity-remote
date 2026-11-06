@@ -1,3 +1,3 @@
-• Notify & highlight in blue when an agent finishes while backgrounded, on Project Overview, on another thread, or behind the open Sidebar (FINISHED badge, blue handle, and Action Notification).
-• Fix Closure JSPB empty-path Overview transitions and phone-vs-workstation clock skew so finished runs reliably enter the blue state and clear on view or Mark read.
-• Queue follow-up Inbox polls when real-time completion events arrive during an in-flight refresh.
+• Full-bleed workstation view: hides the outer web top bar and floating feedback/avatar chrome on /r/<machine> while preserving host dialogs, menus, and reconnect UI.
+• Compact 2-row Sidebar header with Workstation Switcher & Host Controls menu (switch machines, All Machines, connect ID, reload, and Host Settings) plus on-demand search.
+• Docked bottom mode bar (Inbox, Usage, Settings), single safe-area inset fix, and /u/<n> multi-account routing.
