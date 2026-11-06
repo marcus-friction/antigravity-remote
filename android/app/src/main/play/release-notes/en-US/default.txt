@@ -1,4 +1,3 @@
-• Configurable Action Notifications (Off, Approvals, All Attention) with live open-action count and smart routing (opens single thread directly or Inbox when 2+ actions wait).
-• New Sidebar Usage tab showing live quota pools, model limits, reset timers, and credits.
-• Preserve Project Overview and Inbox scroll position when switching into and back out of threads.
-• Default Inbox filter to All, streamline the Settings drawer, and fix left-drawer close freezes.
+• Notify & highlight in blue when an agent finishes while backgrounded, on Project Overview, on another thread, or behind the open Sidebar (FINISHED badge, blue handle, and Action Notification).
+• Fix Closure JSPB empty-path Overview transitions and phone-vs-workstation clock skew so finished runs reliably enter the blue state and clear on view or Mark read.
+• Queue follow-up Inbox polls when real-time completion events arrive during an in-flight refresh.
