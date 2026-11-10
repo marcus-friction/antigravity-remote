@@ -1,3 +1,3 @@
-• Full-bleed workstation view: hides the outer web top bar and floating feedback/avatar chrome on /r/<machine> while preserving host dialogs, menus, and reconnect UI.
-• Compact 2-row Sidebar header with Workstation Switcher & Host Controls menu (switch machines, All Machines, connect ID, reload, and Host Settings) plus on-demand search.
-• Docked bottom mode bar (Inbox, Usage, Settings), single safe-area inset fix, and /u/<n> multi-account routing.
+• New Projects tab in the Sidebar: browse workspaces grouped by project across connected machines, expand/collapse threads, and tap + New to start a conversation in any project.
+• Easier drawer opening: wider 216dp × 44dp edge touch zone, expanded 200dp × 64dp Android gesture exclusion, and zero dead-zone between taps and short pull-right swipes.
+• Subtle first-use guidance: right-chevron grip and one-time animated Swipe hint that permanently dismisses once you open the drawer.
