@@ -4,6 +4,7 @@ import {
   InboxBridgeMessage,
   InboxInstanceStatus,
   InboxInstanceSummary,
+  InboxProjectGroup,
   InboxSnapshot,
   InboxThreadItem,
   RawBridgeInstancePayload,
@@ -251,6 +252,71 @@ export function extractWorkspaceName(
         return folderName;
       }
     }
+  }
+
+  const directFolderName =
+    extractLastSegmentFromUri(
+      rawTrajectory.workspaceFolderAbsoluteUri ??
+        rawTrajectory.workspace_folder_absolute_uri,
+    ) ??
+    extractLastSegmentFromUri(
+      rawTrajectory.gitRootAbsoluteUri ?? rawTrajectory.git_root_absolute_uri,
+    );
+  if (directFolderName) {
+    return directFolderName;
+  }
+
+  return null;
+}
+
+/**
+ * Extracts the primary workspace URI (e.g. `file:///home/user/project`) from a trajectory summary.
+ */
+export function extractWorkspaceUri(
+  rawTrajectory: Record<string, unknown>,
+): string | null {
+  const workspaces = Array.isArray(rawTrajectory.workspaces)
+    ? rawTrajectory.workspaces
+    : [];
+
+  for (const ws of workspaces) {
+    if (!isRecord(ws)) continue;
+    const rawUri =
+      ws.workspaceFolderAbsoluteUri ??
+      ws.workspace_folder_absolute_uri ??
+      ws.gitRootAbsoluteUri ??
+      ws.git_root_absolute_uri;
+    if (typeof rawUri === 'string' && rawUri.trim()) {
+      return rawUri.trim().replace(/\/+$/, '').slice(0, 512);
+    }
+  }
+
+  const metadata = isRecord(rawTrajectory.trajectoryMetadata)
+    ? rawTrajectory.trajectoryMetadata
+    : isRecord(rawTrajectory.trajectory_metadata)
+      ? rawTrajectory.trajectory_metadata
+      : null;
+
+  if (metadata) {
+    const uris = Array.isArray(metadata.workspaceUris)
+      ? metadata.workspaceUris
+      : Array.isArray(metadata.workspace_uris)
+        ? metadata.workspace_uris
+        : [];
+    for (const uri of uris) {
+      if (typeof uri === 'string' && uri.trim()) {
+        return uri.trim().replace(/\/+$/, '').slice(0, 512);
+      }
+    }
+  }
+
+  const directUri =
+    rawTrajectory.workspaceFolderAbsoluteUri ??
+    rawTrajectory.workspace_folder_absolute_uri ??
+    rawTrajectory.gitRootAbsoluteUri ??
+    rawTrajectory.git_root_absolute_uri;
+  if (typeof directUri === 'string' && directUri.trim()) {
+    return directUri.trim().replace(/\/+$/, '').slice(0, 512);
   }
 
   return null;
@@ -839,6 +905,7 @@ function parseTrajectoriesForSource(params: {
       trajectoryId,
       title,
       workspaceName: extractWorkspaceName(raw),
+      workspaceUri: extractWorkspaceUri(raw),
       instanceUuid,
       instanceName,
       source,
@@ -878,6 +945,7 @@ function parseTrajectoriesForSource(params: {
       trajectoryId: parentCascadeId,
       title: `Conversation ${parentCascadeId.slice(0, 8)}`,
       workspaceName: null,
+      workspaceUri: null,
       instanceUuid,
       instanceName,
       source,
@@ -1927,6 +1995,189 @@ export function applyLocalStateToSnapshot(
 }
 
 /**
+ * Groups snapshot threads and connected workstations into collapsible project
+ * groups for the drawer's `Projects` navigation tab.
+ */
+export function buildProjectGroups(
+  snapshot: InboxSnapshot,
+  activeUrl?: string | null,
+): InboxProjectGroup[] {
+  const referenceUrl = activeUrl ?? snapshot.threads[0]?.targetUrl ?? null;
+  const accountPrefix = extractAccountPathPrefix(referenceUrl);
+  const preservedQueryParams = extractPreservedHostQueryParams(referenceUrl);
+
+  const buildOverviewUrl = (
+    source: 'remote-control' | 'cloud',
+    instanceUuid: string,
+  ): string => {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(preservedQueryParams)) {
+      query.set(key, value);
+    }
+    const querySuffix = query.toString() ? `?${query.toString()}` : '';
+    const candidateUrl =
+      source === 'cloud'
+        ? `${ANTIGRAVITY_DASHBOARD_URL}${accountPrefix}/${querySuffix}`
+        : `${ANTIGRAVITY_DASHBOARD_URL}${accountPrefix}/r/${encodeURIComponent(instanceUuid)}${querySuffix}`;
+    const validation = validateNavigationUrl(candidateUrl);
+    if (
+      validation.isValid &&
+      validation.isAllowedInApp &&
+      validation.normalizedUrl
+    ) {
+      return validation.normalizedUrl;
+    }
+    return source === 'cloud'
+      ? `${ANTIGRAVITY_DASHBOARD_URL}${accountPrefix}/`
+      : `${ANTIGRAVITY_DASHBOARD_URL}${accountPrefix}/r/${encodeURIComponent(instanceUuid)}`;
+  };
+
+  const groupsByKey = new Map<string, InboxProjectGroup>();
+  const instancesWithThreads = new Set<string>();
+
+  for (const thread of snapshot.threads) {
+    instancesWithThreads.add(thread.instanceUuid);
+    const workspaceKey = (
+      thread.workspaceName ??
+      thread.workspaceUri ??
+      '__default__'
+    )
+      .trim()
+      .toLowerCase();
+    const groupKey = `${thread.instanceUuid}:${workspaceKey}`;
+
+    let group = groupsByKey.get(groupKey);
+    if (!group) {
+      const displayName =
+        thread.workspaceName ??
+        (thread.source === 'cloud' ? 'Cloud Agent' : thread.instanceName);
+      group = {
+        id: groupKey,
+        name: displayName,
+        workspaceName: thread.workspaceName,
+        workspaceUri: thread.workspaceUri ?? null,
+        instanceUuid: thread.instanceUuid,
+        instanceName: thread.instanceName,
+        source: thread.source,
+        threads: [],
+        latestModifiedAtMs: 0,
+        attentionCount: 0,
+        urgentCount: 0,
+        runningCount: 0,
+        hasActiveThread: false,
+        newChatUrl: buildOverviewUrl(thread.source, thread.instanceUuid),
+      };
+      groupsByKey.set(groupKey, group);
+    } else if (!group.workspaceUri && thread.workspaceUri) {
+      group.workspaceUri = thread.workspaceUri;
+    }
+
+    group.threads.push(thread);
+    if (thread.lastModifiedAtMs > group.latestModifiedAtMs) {
+      group.latestModifiedAtMs = thread.lastModifiedAtMs;
+    }
+    if (thread.needsAttention) {
+      group.attentionCount++;
+    }
+    if (
+      thread.attentionKind === 'approval' ||
+      thread.attentionKind === 'error'
+    ) {
+      group.urgentCount++;
+    }
+    if (thread.attentionKind === 'running') {
+      group.runningCount++;
+    }
+    if (thread.isActiveThread) {
+      group.hasActiveThread = true;
+    }
+  }
+
+  for (const inst of snapshot.instances) {
+    if (instancesWithThreads.has(inst.uuid)) {
+      continue;
+    }
+    if (
+      inst.status !== 'connected' &&
+      inst.uuid !== snapshot.activeInstanceUuid
+    ) {
+      continue;
+    }
+    const groupKey = `${inst.uuid}:__default__`;
+    groupsByKey.set(groupKey, {
+      id: groupKey,
+      name: inst.name,
+      workspaceName: null,
+      workspaceUri: null,
+      instanceUuid: inst.uuid,
+      instanceName: inst.name,
+      source: 'remote-control',
+      threads: [],
+      latestModifiedAtMs: inst.updatedAtMs ?? 0,
+      attentionCount: 0,
+      urgentCount: 0,
+      runningCount: 0,
+      hasActiveThread: snapshot.activeInstanceUuid === inst.uuid,
+      newChatUrl: buildOverviewUrl('remote-control', inst.uuid),
+    });
+  }
+
+  const groups = Array.from(groupsByKey.values());
+  for (const group of groups) {
+    group.threads.sort((a, b) => {
+      if (a.isActiveThread !== b.isActiveThread) {
+        return a.isActiveThread ? -1 : 1;
+      }
+      const priorityDiff =
+        ATTENTION_PRIORITY[a.attentionKind] -
+        ATTENTION_PRIORITY[b.attentionKind];
+      if (priorityDiff !== 0) {
+        return priorityDiff;
+      }
+      if (a.isPinned !== b.isPinned) {
+        return a.isPinned ? -1 : 1;
+      }
+      if (b.lastModifiedAtMs !== a.lastModifiedAtMs) {
+        return b.lastModifiedAtMs - a.lastModifiedAtMs;
+      }
+      return a.title.localeCompare(b.title);
+    });
+  }
+
+  groups.sort((a, b) => {
+    if (a.hasActiveThread !== b.hasActiveThread) {
+      return a.hasActiveThread ? -1 : 1;
+    }
+    const aHasUrgent = a.urgentCount > 0;
+    const bHasUrgent = b.urgentCount > 0;
+    if (aHasUrgent !== bHasUrgent) {
+      return aHasUrgent ? -1 : 1;
+    }
+    const aHasAttention = a.attentionCount > 0;
+    const bHasAttention = b.attentionCount > 0;
+    if (aHasAttention !== bHasAttention) {
+      return aHasAttention ? -1 : 1;
+    }
+    const aHasRunning = a.runningCount > 0;
+    const bHasRunning = b.runningCount > 0;
+    if (aHasRunning !== bHasRunning) {
+      return aHasRunning ? -1 : 1;
+    }
+    const aIsActiveInst = a.instanceUuid === snapshot.activeInstanceUuid;
+    const bIsActiveInst = b.instanceUuid === snapshot.activeInstanceUuid;
+    if (aIsActiveInst !== bIsActiveInst) {
+      return aIsActiveInst ? -1 : 1;
+    }
+    if (b.latestModifiedAtMs !== a.latestModifiedAtMs) {
+      return b.latestModifiedAtMs - a.latestModifiedAtMs;
+    }
+    return a.name.localeCompare(b.name);
+  });
+
+  return groups;
+}
+
+/**
  * Validates and parses a JSON string posted from `WebView.onMessage`.
  */
 export function parseInboxBridgeMessage(
@@ -2080,6 +2331,26 @@ export function parseInboxBridgeMessage(
         type: 'AGY_INBOX_FAST_NAV_RESULT',
         requestId: parsed.requestId,
         handled: parsed.handled,
+        targetUrl: parsed.targetUrl,
+      };
+
+    case 'AGY_INBOX_START_CHAT_RESULT':
+      if (
+        typeof parsed.requestId !== 'string' ||
+        typeof parsed.handled !== 'boolean' ||
+        typeof parsed.targetUrl !== 'string'
+      ) {
+        return null;
+      }
+      return {
+        type: 'AGY_INBOX_START_CHAT_RESULT',
+        requestId: parsed.requestId,
+        handled: parsed.handled,
+        cascadeId:
+          typeof parsed.cascadeId === 'string' &&
+          SAFE_ID_PATTERN.test(parsed.cascadeId)
+            ? parsed.cascadeId
+            : null,
         targetUrl: parsed.targetUrl,
       };
 

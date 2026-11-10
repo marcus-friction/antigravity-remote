@@ -866,12 +866,13 @@ describe('LeftNavigationDrawer Usage Tab & RemoteWebView E2E', () => {
     );
     expect(modeButtons.map((b) => b.props.accessibilityLabel)).toEqual([
       'Drawer mode Inbox',
+      'Drawer mode Projects',
       'Drawer mode Usage',
       'Drawer mode Settings',
     ]);
 
     // Low quota (14% <= 20%) displays an amber warning dot inside the Usage tab button
-    const usageTabBtn = modeButtons[1];
+    const usageTabBtn = modeButtons[2];
     const usageDot = usageTabBtn.findAllByType('View' as any)[0];
     expect(usageDot).toBeDefined();
     expect(JSON.stringify(usageDot.props.style)).toContain('#F59E0B');

@@ -30,6 +30,7 @@ import {
   InboxAttentionKind,
   InboxFilterTab,
   InboxInstanceSummary,
+  InboxProjectGroup,
   InboxSnapshot,
   InboxThreadItem,
 } from '../types/inbox';
@@ -39,13 +40,14 @@ import {
   KeepAliveMinutes,
 } from '../types/session';
 import {
+  buildProjectGroups,
   extractAccountPathPrefix,
   formatRelativeTime,
   formatResetCountdown,
 } from '../utils/inboxParser';
 import { parseHandoffInput } from '../utils/urlValidator';
 
-export type DrawerMode = 'inbox' | 'usage' | 'settings';
+export type DrawerMode = 'inbox' | 'projects' | 'usage' | 'settings';
 
 /**
  * Shared handle line geometry so the closed pull-in handle and the inner-right
@@ -55,7 +57,8 @@ export type DrawerMode = 'inbox' | 'usage' | 'settings';
  */
 export const HANDLE_LINE_WIDTH = 4;
 export const HANDLE_LINE_HEIGHT = 112;
-export const HANDLE_TOUCH_ZONE_HEIGHT = 148;
+export const HANDLE_TOUCH_ZONE_HEIGHT = 216;
+export const CLOSED_HANDLE_TOUCH_WIDTH = 44;
 export const CLOSED_HANDLE_TOUCH_LEFT = 20;
 export const CLOSED_HANDLE_BAR_INSET = 2; // Visual bar sits at 22dp from left edge
 export const OPEN_HANDLE_RIGHT_INSET = 10;
@@ -72,6 +75,7 @@ export interface LeftNavigationDrawerProps {
   focusInboxRequestKey?: number;
   isKeyboardVisible?: boolean;
   keyboardBottomPadding?: number;
+  hasSeenGuidance?: boolean;
   stage: AuthFlowStage;
   activeUrl?: string | null;
   snapshot: InboxSnapshot;
@@ -83,9 +87,11 @@ export interface LeftNavigationDrawerProps {
   actionNotificationMode?: ActionNotificationMode;
   onOpen: (preferredMode?: DrawerMode) => void;
   onClose: () => void;
+  onDismissGuidance?: () => void;
   onRegisterBackHandler?: (interceptor: (() => boolean) | null) => void;
   onRefreshInbox: (forceUsage?: boolean) => void;
   onSelectThread: (thread: InboxThreadItem) => void;
+  onStartProjectThread?: (project: InboxProjectGroup) => void;
   onMarkThreadRead: (thread: InboxThreadItem) => void;
   onMarkAllRead: () => void;
   onChangeKeepAliveMinutes?: (minutes: KeepAliveMinutes) => void;
@@ -291,6 +297,15 @@ const InboxNavIcon: React.FC<{ color: string }> = ({ color }) => (
   </View>
 );
 
+const ProjectsNavIcon: React.FC<{ color: string }> = ({ color }) => (
+  <View style={styles.navIconFrame}>
+    <View style={styles.projectsIconWrapper}>
+      <View style={[styles.projectsIconTab, { borderColor: color }]} />
+      <View style={[styles.projectsIconFolder, { borderColor: color }]} />
+    </View>
+  </View>
+);
+
 const UsageNavIcon: React.FC<{ color: string }> = ({ color }) => (
   <View style={[styles.navIconFrame, styles.usageIconRow]}>
     <View
@@ -340,6 +355,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   focusInboxRequestKey = 0,
   isKeyboardVisible = false,
   keyboardBottomPadding = 0,
+  hasSeenGuidance = false,
   stage,
   activeUrl,
   snapshot,
@@ -351,9 +367,11 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   actionNotificationMode = DEFAULT_ACTION_NOTIFICATION_MODE,
   onOpen,
   onClose,
+  onDismissGuidance,
   onRegisterBackHandler,
   onRefreshInbox,
   onSelectThread,
+  onStartProjectThread,
   onMarkThreadRead,
   onMarkAllRead,
   onChangeKeepAliveMinutes,
@@ -374,12 +392,19 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   const drawerWidthRef = useRef<number>(drawerWidth);
   drawerWidthRef.current = drawerWidth;
 
+  const lastPrimaryNavModeRef = useRef<'inbox' | 'projects'>(
+    initialMode === 'projects' ? 'projects' : 'inbox',
+  );
   const defaultMode: DrawerMode =
-    initialMode ?? (stage === 'authenticated' ? 'inbox' : 'settings');
+    initialMode ??
+    (stage === 'authenticated' ? lastPrimaryNavModeRef.current : 'settings');
   const defaultModeRef = useRef<DrawerMode>(defaultMode);
   defaultModeRef.current = defaultMode;
   const [activeMode, setActiveMode] = useState<DrawerMode>(defaultMode);
   const [selectedTab, setSelectedTab] = useState<InboxFilterTab>('all');
+  const [collapsedProjectIds, setCollapsedProjectIds] = useState<
+    Record<string, boolean>
+  >({});
   const [searchQuery, setSearchQuery] = useState('');
   const [isSearchExpanded, setIsSearchExpanded] = useState(false);
   const [isMachineMenuOpen, setIsMachineMenuOpen] = useState(false);
@@ -390,9 +415,18 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   const [validationError, setValidationError] = useState<string | null>(null);
   const [confirmingSignOut, setConfirmingSignOut] = useState(false);
   const [isDraggingOpen, setIsDraggingOpen] = useState(false);
+  const [localGuidanceDismissed, setLocalGuidanceDismissed] = useState<boolean>(
+    Boolean(hasSeenGuidance || visible),
+  );
 
   const visibleRef = useRef<boolean>(visible);
   visibleRef.current = visible;
+  const localGuidanceDismissedRef = useRef<boolean>(localGuidanceDismissed);
+  localGuidanceDismissedRef.current = localGuidanceDismissed;
+  const onDismissGuidanceRef = useRef<(() => void) | undefined>(
+    onDismissGuidance,
+  );
+  onDismissGuidanceRef.current = onDismissGuidance;
   const isMachineMenuOpenRef = useRef<boolean>(isMachineMenuOpen);
   isMachineMenuOpenRef.current = isMachineMenuOpen;
   const handoffTextRef = useRef<string>(handoffText);
@@ -416,6 +450,73 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   const translateX = useRef(
     new Animated.Value(visible ? 0 : closedParkX),
   ).current;
+  const handleNudgeX = useRef(new Animated.Value(0)).current;
+
+  const dismissGuidancePermanently = useCallback(() => {
+    if (!localGuidanceDismissedRef.current) {
+      localGuidanceDismissedRef.current = true;
+      setLocalGuidanceDismissed(true);
+      onDismissGuidanceRef.current?.();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (hasSeenGuidance && !localGuidanceDismissedRef.current) {
+      localGuidanceDismissedRef.current = true;
+      setLocalGuidanceDismissed(true);
+    }
+  }, [hasSeenGuidance]);
+
+  useEffect(() => {
+    if (visible) {
+      dismissGuidancePermanently();
+    }
+  }, [dismissGuidancePermanently, visible]);
+
+  const showGuidanceHint =
+    !hasSeenGuidance &&
+    !localGuidanceDismissed &&
+    !visible &&
+    !isDraggingOpen &&
+    !isKeyboardVisible;
+
+  useEffect(() => {
+    if (!showGuidanceHint) {
+      handleNudgeX.stopAnimation?.();
+      handleNudgeX.setValue(0);
+      return;
+    }
+    const anyAnimated = Animated as unknown as {
+      loop?: (anim: unknown) => { start: () => void; stop?: () => void };
+      sequence?: (anims: unknown[]) => unknown;
+    };
+    if (
+      typeof anyAnimated.loop === 'function' &&
+      typeof anyAnimated.sequence === 'function'
+    ) {
+      const pulse = anyAnimated.loop(
+        anyAnimated.sequence([
+          Animated.timing(handleNudgeX, {
+            toValue: 5,
+            duration: 950,
+            useNativeDriver: true,
+          }),
+          Animated.timing(handleNudgeX, {
+            toValue: 0,
+            duration: 950,
+            useNativeDriver: true,
+          }),
+        ]),
+      );
+      pulse.start();
+      return () => {
+        pulse.stop?.();
+        handleNudgeX.stopAnimation?.();
+        handleNudgeX.setValue(0);
+      };
+    }
+    return undefined;
+  }, [handleNudgeX, showGuidanceHint]);
 
   const resetInboxScrollState = useCallback(() => {
     inboxScrollOffsetsRef.current = { all: 0, attention: 0, running: 0 };
@@ -425,6 +526,8 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
 
   useEffect(() => {
     if (stage === 'hydrating') {
+      lastPrimaryNavModeRef.current = 'inbox';
+      setCollapsedProjectIds({});
       resetInboxScrollState();
     }
   }, [resetInboxScrollState, stage]);
@@ -534,7 +637,8 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   useEffect(() => {
     if (visible && !wasVisibleRef.current) {
       const nextMode =
-        initialMode ?? (stage === 'authenticated' ? 'inbox' : 'settings');
+        initialMode ??
+        (stage === 'authenticated' ? lastPrimaryNavModeRef.current : 'settings');
       setActiveMode(nextMode);
       setIsMachineMenuOpen(false);
     } else if (!visible && wasVisibleRef.current) {
@@ -544,6 +648,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
 
   useEffect(() => {
     if (focusInboxRequestKey > 0) {
+      lastPrimaryNavModeRef.current = 'inbox';
       setActiveMode('inbox');
       setIsMachineMenuOpen(false);
       setSelectedTab((prev) => (prev === 'running' ? 'all' : prev));
@@ -632,12 +737,13 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   }, [onClose, resetTransientInputs]);
 
   const handleTapOpen = useCallback(() => {
+    dismissGuidancePermanently();
     setActiveMode(defaultModeRef.current);
     const startOffset = -drawerWidthRef.current + HANDLE_ALIGNMENT_OFFSET;
     translateX.stopAnimation?.();
     translateX.setValue(startOffset);
     onOpen();
-  }, [onOpen, translateX]);
+  }, [dismissGuidancePermanently, onOpen, translateX]);
 
   // Pull-right gesture on the closed handle strip (starts 20dp inside the screen
   // bezel so iOS and Android edge-back gestures at 0..20dp are never triggered).
@@ -647,7 +753,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     const shouldClaimPullRight = (gestureState: { dx: number; dy: number }) =>
       !visibleRef.current &&
       gestureState.dx > 6 &&
-      Math.abs(gestureState.dx) > Math.abs(gestureState.dy) * 1.15;
+      Math.abs(gestureState.dx) > Math.abs(gestureState.dy) * 0.55;
 
     return PanResponder.create({
       onStartShouldSetPanResponder: () => false,
@@ -678,9 +784,10 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
       onPanResponderRelease: (_evt, gestureState) => {
         const width = drawerWidthRef.current;
         const shouldOpen =
-          gestureState.dx > width * 0.24 ||
-          (gestureState.dx > 22 && gestureState.vx > 0.35);
+          gestureState.dx > Math.min(28, width * 0.1) ||
+          (gestureState.dx > 14 && gestureState.vx >= 0.12);
         if (shouldOpen) {
+          dismissGuidancePermanently();
           isDraggingOpenRef.current = false;
           setIsDraggingOpen(false);
           onOpen();
@@ -712,7 +819,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
         }
       },
     });
-  }, [onOpen, translateX]);
+  }, [dismissGuidancePermanently, onOpen, translateX]);
 
   // Push/swipe-left gesture on the open drawer or its inner-right handle line.
   const openDrawerPanResponder = useMemo(() => {
@@ -948,6 +1055,82 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     });
   }, [searchQuery, selectedTab, snapshot.threads]);
 
+  const projectGroups = useMemo(
+    () => buildProjectGroups(snapshot, activeUrl),
+    [activeUrl, snapshot],
+  );
+
+  const filteredProjectGroups = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) {
+      return projectGroups;
+    }
+    const result: InboxProjectGroup[] = [];
+    for (const group of projectGroups) {
+      const groupMatches =
+        group.name.toLowerCase().includes(query) ||
+        group.instanceName.toLowerCase().includes(query) ||
+        (group.workspaceUri?.toLowerCase().includes(query) ?? false);
+      const matchingThreads = group.threads.filter(
+        (thread) =>
+          thread.title.toLowerCase().includes(query) ||
+          thread.attentionReason.toLowerCase().includes(query) ||
+          thread.instanceName.toLowerCase().includes(query) ||
+          (thread.workspaceName?.toLowerCase().includes(query) ?? false),
+      );
+      if (groupMatches || matchingThreads.length > 0) {
+        result.push({
+          ...group,
+          threads:
+            matchingThreads.length > 0 ? matchingThreads : group.threads,
+        });
+      }
+    }
+    return result;
+  }, [projectGroups, searchQuery]);
+
+  const allProjectsCollapsed = useMemo(
+    () =>
+      projectGroups.length > 0 &&
+      projectGroups.every((group) => Boolean(collapsedProjectIds[group.id])),
+    [collapsedProjectIds, projectGroups],
+  );
+
+  const toggleProjectCollapsed = useCallback((projectId: string) => {
+    setCollapsedProjectIds((prev) => ({
+      ...prev,
+      [projectId]: !prev[projectId],
+    }));
+  }, []);
+
+  const toggleAllProjectsCollapsed = useCallback(() => {
+    setCollapsedProjectIds(() => {
+      if (allProjectsCollapsed) {
+        return {};
+      }
+      const next: Record<string, boolean> = {};
+      for (const group of projectGroups) {
+        next[group.id] = true;
+      }
+      return next;
+    });
+  }, [allProjectsCollapsed, projectGroups]);
+
+  const handleStartNewProjectChat = useCallback(
+    (project: InboxProjectGroup) => {
+      resetTransientInputs();
+      isDraggingOpenRef.current = false;
+      setIsDraggingOpen(false);
+      if (onStartProjectThread) {
+        onStartProjectThread(project);
+      } else {
+        onNavigateToUrl(project.newChatUrl);
+        onClose();
+      }
+    },
+    [onClose, onNavigateToUrl, onStartProjectThread, resetTransientInputs],
+  );
+
   const usage = snapshot.usage ?? null;
 
   const snapshotUpdatedLabel = useMemo(
@@ -1069,6 +1252,8 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     setValidationError(null);
     setSearchQuery('');
     setSelectedTab('all');
+    lastPrimaryNavModeRef.current = 'inbox';
+    setCollapsedProjectIds({});
     resetInboxScrollState();
     isDraggingOpenRef.current = false;
     setIsDraggingOpen(false);
@@ -1227,7 +1412,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
               </TouchableOpacity>
 
               <View style={styles.headerActionsRow}>
-                {activeMode === 'inbox' ? (
+                {activeMode === 'inbox' || activeMode === 'projects' ? (
                   <>
                     <TouchableOpacity
                       style={[
@@ -1260,7 +1445,11 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                         onRefreshInbox(false);
                       }}
                       accessibilityRole="button"
-                      accessibilityLabel="Refresh Thread Inbox"
+                      accessibilityLabel={
+                        activeMode === 'projects'
+                          ? 'Refresh Projects'
+                          : 'Refresh Thread Inbox'
+                      }
                     >
                       {isRefreshing ? (
                         <ActivityIndicator size="small" color="#93C5FD" />
@@ -1642,6 +1831,420 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                             {selectedTab === 'running'
                               ? 'Active agent runs will appear here automatically.'
                               : 'Start a conversation on a connected workstation to track it here.'}
+                          </Text>
+                        </>
+                      )}
+                    </View>
+                  )}
+                </ScrollView>
+              </View>
+            ) : activeMode === 'projects' ? (
+              <View style={styles.modeBody}>
+                <View style={styles.projectsSummaryBar}>
+                  <Text style={styles.projectsSummaryText} numberOfLines={1}>
+                    {projectGroups.length}{' '}
+                    {projectGroups.length === 1 ? 'project' : 'projects'} •{' '}
+                    {counts.all} {counts.all === 1 ? 'thread' : 'threads'}
+                  </Text>
+                  <View style={styles.projectsSummaryActionsRow}>
+                    {counts.dismissible > 0 ? (
+                      <TouchableOpacity
+                        style={styles.readAllInlineBtn}
+                        onPress={onMarkAllRead}
+                        accessibilityRole="button"
+                        accessibilityLabel="Mark all project notifications as read"
+                      >
+                        <Text style={styles.readAllInlineText}>Read all</Text>
+                      </TouchableOpacity>
+                    ) : null}
+                    {projectGroups.length > 1 ? (
+                      <TouchableOpacity
+                        style={styles.readAllInlineBtn}
+                        onPress={toggleAllProjectsCollapsed}
+                        accessibilityRole="button"
+                        accessibilityLabel={
+                          allProjectsCollapsed
+                            ? 'Expand all projects'
+                            : 'Collapse all projects'
+                        }
+                      >
+                        <Text style={styles.readAllInlineText}>
+                          {allProjectsCollapsed ? 'Expand all' : 'Collapse all'}
+                        </Text>
+                      </TouchableOpacity>
+                    ) : null}
+                  </View>
+                </View>
+
+                {isSearchVisible ? (
+                  <View style={styles.searchBarRow}>
+                    <SearchIcon color="#64748B" compact />
+                    <TextInput
+                      ref={searchInputRef}
+                      style={styles.searchInput}
+                      value={searchQuery}
+                      onChangeText={setSearchQuery}
+                      placeholder="Filter projects or threads…"
+                      placeholderTextColor="#64748B"
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      autoFocus={visible && isSearchExpanded}
+                      returnKeyType="search"
+                      accessibilityLabel="Filter Projects"
+                    />
+                    <TouchableOpacity
+                      style={styles.searchClearBtn}
+                      onPress={() => {
+                        setSearchQuery('');
+                        setIsSearchExpanded(false);
+                        searchInputRef.current?.blur?.();
+                      }}
+                      accessibilityRole="button"
+                      accessibilityLabel="Close thread search"
+                    >
+                      <Text style={styles.searchClearText}>✕</Text>
+                    </TouchableOpacity>
+                  </View>
+                ) : null}
+
+                {snapshot.error ? (
+                  <View style={styles.errorBanner}>
+                    <Text style={styles.errorBannerText} numberOfLines={2}>
+                      {snapshot.error}
+                    </Text>
+                  </View>
+                ) : null}
+
+                <ScrollView
+                  style={styles.flexScroll}
+                  contentContainerStyle={styles.listContent}
+                  keyboardShouldPersistTaps="handled"
+                  showsVerticalScrollIndicator={false}
+                >
+                  {filteredProjectGroups.length > 0 ? (
+                    filteredProjectGroups.map((group) => {
+                      const isCollapsed =
+                        Boolean(collapsedProjectIds[group.id]) &&
+                        searchQuery.trim().length === 0;
+                      const isExpanded = !isCollapsed;
+                      return (
+                        <View
+                          key={group.id}
+                          style={[
+                            styles.projectCard,
+                            group.hasActiveThread
+                              ? styles.projectCardActive
+                              : null,
+                          ]}
+                        >
+                          <View style={styles.projectHeaderRow}>
+                            <TouchableOpacity
+                              style={styles.projectHeaderToggle}
+                              activeOpacity={0.82}
+                              onPress={() => toggleProjectCollapsed(group.id)}
+                              accessibilityRole="button"
+                              accessibilityState={{ expanded: isExpanded }}
+                              accessibilityLabel={`Project ${group.name}`}
+                            >
+                              <ChevronIcon
+                                expanded={isExpanded}
+                                color={
+                                  group.hasActiveThread ? '#93C5FD' : '#94A3B8'
+                                }
+                              />
+                              <View style={styles.projectHeaderMeta}>
+                                <View style={styles.projectTitleRow}>
+                                  <Text
+                                    style={styles.projectTitleText}
+                                    numberOfLines={1}
+                                  >
+                                    {group.name}
+                                  </Text>
+                                  {group.attentionCount > 0 ? (
+                                    <View
+                                      style={[
+                                        styles.projectStatusBadge,
+                                        group.urgentCount > 0
+                                          ? styles.projectStatusBadgeUrgent
+                                          : styles.projectStatusBadgeUnread,
+                                      ]}
+                                    >
+                                      <Text
+                                        style={styles.projectStatusBadgeText}
+                                      >
+                                        {group.attentionCount}
+                                      </Text>
+                                    </View>
+                                  ) : group.runningCount > 0 ? (
+                                    <View style={styles.projectRunningDot} />
+                                  ) : null}
+                                </View>
+                                <Text
+                                  style={styles.projectSubtitleText}
+                                  numberOfLines={1}
+                                >
+                                  {group.instanceName} • {group.threads.length}{' '}
+                                  {group.threads.length === 1
+                                    ? 'thread'
+                                    : 'threads'}
+                                  {group.latestModifiedAtMs > 0
+                                    ? ` • ${formatRelativeTime(group.latestModifiedAtMs)}`
+                                    : ''}
+                                </Text>
+                              </View>
+                            </TouchableOpacity>
+
+                            <TouchableOpacity
+                              style={styles.projectNewChatBtn}
+                              activeOpacity={0.82}
+                              onPress={() => handleStartNewProjectChat(group)}
+                              accessibilityRole="button"
+                              accessibilityLabel={`New chat in ${group.name}`}
+                            >
+                              <Text style={styles.projectNewChatBtnText}>
+                                + New
+                              </Text>
+                            </TouchableOpacity>
+                          </View>
+
+                          {isExpanded ? (
+                            <View style={styles.projectThreadsContainer}>
+                              {group.threads.length > 0 ? (
+                                group.threads.map((thread, idx) => {
+                                  const badge = getBadgeVisuals(
+                                    thread.attentionKind,
+                                  );
+                                  const canMarkRead =
+                                    thread.attentionKind === 'unread' ||
+                                    thread.attentionKind === 'error';
+                                  const isCurrentThread =
+                                    thread.isActiveThread ||
+                                    (snapshot.activeInstanceUuid ===
+                                      thread.instanceUuid &&
+                                      snapshot.activeCascadeId !== null &&
+                                      (snapshot.activeCascadeId ===
+                                        thread.cascadeId ||
+                                        snapshot.activeCascadeId ===
+                                          thread.trajectoryId)) ||
+                                    Boolean(
+                                      activeUrl &&
+                                        activeUrl === thread.targetUrl,
+                                    );
+                                  return (
+                                    <TouchableOpacity
+                                      key={thread.id}
+                                      style={[
+                                        styles.projectThreadRow,
+                                        idx > 0
+                                          ? styles.projectThreadRowDivider
+                                          : null,
+                                        isCurrentThread
+                                          ? styles.projectThreadRowActive
+                                          : null,
+                                      ]}
+                                      activeOpacity={0.82}
+                                      onPress={() => {
+                                        resetTransientInputs();
+                                        isDraggingOpenRef.current = false;
+                                        setIsDraggingOpen(false);
+                                        onSelectThread(thread);
+                                      }}
+                                      accessibilityRole="button"
+                                      accessibilityLabel={`Open project thread ${thread.title}`}
+                                    >
+                                      <View style={styles.projectThreadTopRow}>
+                                        <View
+                                          style={styles.projectThreadTitleGroup}
+                                        >
+                                          <View
+                                            style={[
+                                              styles.projectThreadDot,
+                                              {
+                                                backgroundColor:
+                                                  badge.accentColor,
+                                              },
+                                            ]}
+                                          />
+                                          <Text
+                                            style={[
+                                              styles.projectThreadTitle,
+                                              isCurrentThread
+                                                ? styles.projectThreadTitleActive
+                                                : null,
+                                            ]}
+                                            numberOfLines={1}
+                                          >
+                                            {thread.title}
+                                          </Text>
+                                        </View>
+                                        <View
+                                          style={styles.projectThreadRightGroup}
+                                        >
+                                          {thread.attentionKind !== 'idle' ? (
+                                            <View
+                                              style={[
+                                                styles.kindBadge,
+                                                {
+                                                  backgroundColor:
+                                                    badge.bgColor,
+                                                  borderColor:
+                                                    badge.borderColor,
+                                                },
+                                              ]}
+                                            >
+                                              <Text
+                                                style={[
+                                                  styles.kindBadgeText,
+                                                  { color: badge.textColor },
+                                                ]}
+                                              >
+                                                {badge.label}
+                                              </Text>
+                                            </View>
+                                          ) : null}
+                                          {isCurrentThread ? (
+                                            <View style={styles.currentBadge}>
+                                              <Text
+                                                style={styles.currentBadgeText}
+                                              >
+                                                OPEN
+                                              </Text>
+                                            </View>
+                                          ) : null}
+                                          <Text style={styles.timestampText}>
+                                            {formatRelativeTime(
+                                              thread.lastModifiedAtMs,
+                                            )}
+                                          </Text>
+                                        </View>
+                                      </View>
+                                      <View
+                                        style={styles.projectThreadBottomRow}
+                                      >
+                                        <Text
+                                          style={[
+                                            styles.projectThreadReason,
+                                            thread.attentionKind === 'approval'
+                                              ? styles.reasonTextApproval
+                                              : thread.attentionKind === 'error'
+                                                ? styles.reasonTextError
+                                                : thread.attentionKind ===
+                                                    'unread'
+                                                  ? styles.reasonTextUnread
+                                                  : null,
+                                          ]}
+                                          numberOfLines={1}
+                                        >
+                                          {thread.attentionReason}
+                                        </Text>
+                                        {canMarkRead ? (
+                                          <TouchableOpacity
+                                            style={styles.markReadChip}
+                                            onPress={() =>
+                                              onMarkThreadRead(thread)
+                                            }
+                                            accessibilityRole="button"
+                                            accessibilityLabel={`Mark project thread ${thread.title} as read`}
+                                          >
+                                            <Text
+                                              style={styles.markReadChipText}
+                                            >
+                                              Mark read
+                                            </Text>
+                                          </TouchableOpacity>
+                                        ) : null}
+                                      </View>
+                                    </TouchableOpacity>
+                                  );
+                                })
+                              ) : (
+                                <View style={styles.projectEmptyThreadsRow}>
+                                  <Text style={styles.projectEmptyThreadsText}>
+                                    No conversations yet — tap + New to start
+                                    one on {group.instanceName}.
+                                  </Text>
+                                </View>
+                              )}
+                            </View>
+                          ) : null}
+                        </View>
+                      );
+                    })
+                  ) : (
+                    <View style={styles.emptyState}>
+                      {stage !== 'authenticated' ? (
+                        <>
+                          <Text style={styles.emptyTitle}>
+                            Sign in required
+                          </Text>
+                          <Text style={styles.emptySubtitle}>
+                            Complete Google Sign-In in the workspace or open
+                            Settings to reload or manage your connection.
+                          </Text>
+                          <TouchableOpacity
+                            style={styles.emptyActionBtn}
+                            onPress={() => setActiveMode('settings')}
+                            accessibilityRole="button"
+                            accessibilityLabel="Open Settings from Projects"
+                          >
+                            <Text style={styles.emptyActionBtnText}>
+                              Open Settings
+                            </Text>
+                          </TouchableOpacity>
+                        </>
+                      ) : isRefreshing && snapshot.fetchedAtMs === 0 ? (
+                        <>
+                          <ActivityIndicator size="small" color="#60A5FA" />
+                          <Text style={styles.emptyTitle}>
+                            Checking connected workstations…
+                          </Text>
+                          <Text style={styles.emptySubtitle}>
+                            Grouping active Antigravity projects across your
+                            machines.
+                          </Text>
+                        </>
+                      ) : projectGroups.length === 0 &&
+                        connectedInstances.length === 0 ? (
+                        <>
+                          <Text style={styles.emptyTitle}>
+                            No connected workstations
+                          </Text>
+                          <Text style={styles.emptySubtitle}>
+                            Run agy --remote-control on your computer, or open a
+                            machine link directly.
+                          </Text>
+                          <TouchableOpacity
+                            style={styles.emptyActionBtn}
+                            onPress={() => {
+                              setActiveMode('settings');
+                              setIsHandoffExpanded(true);
+                            }}
+                            accessibilityRole="button"
+                            accessibilityLabel="Open machine link from Projects"
+                          >
+                            <Text style={styles.emptyActionBtnText}>
+                              Open Link or Machine ID
+                            </Text>
+                          </TouchableOpacity>
+                        </>
+                      ) : searchQuery.trim().length > 0 ? (
+                        <>
+                          <Text style={styles.emptyTitle}>
+                            No matching projects
+                          </Text>
+                          <Text style={styles.emptySubtitle}>
+                            No projects or threads matched &ldquo;
+                            {searchQuery.trim()}&rdquo;.
+                          </Text>
+                        </>
+                      ) : (
+                        <>
+                          <Text style={styles.emptyTitle}>
+                            No projects found
+                          </Text>
+                          <Text style={styles.emptySubtitle}>
+                            Start a conversation on a connected workstation to
+                            browse its projects here.
                           </Text>
                         </>
                       )}
@@ -2570,13 +3173,14 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
               </>
             ) : null}
 
-            {/* Docked Thumb-Zone Mode Bar: Inbox | Usage | Settings */}
+            {/* Docked Thumb-Zone Mode Bar: Inbox | Projects | Usage | Settings */}
             {!isKeyboardVisible ? (
               <View style={styles.bottomModeBar}>
                 <TouchableOpacity
                   style={styles.bottomModeBtn}
                   onPress={() => {
                     setIsMachineMenuOpen(false);
+                    lastPrimaryNavModeRef.current = 'inbox';
                     setActiveMode('inbox');
                     if (stage === 'authenticated' && !isRefreshing) {
                       onRefreshInbox(false);
@@ -2623,6 +3227,36 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                       </Text>
                     </View>
                   ) : null}
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={styles.bottomModeBtn}
+                  onPress={() => {
+                    setIsMachineMenuOpen(false);
+                    lastPrimaryNavModeRef.current = 'projects';
+                    setActiveMode('projects');
+                    if (stage === 'authenticated' && !isRefreshing) {
+                      onRefreshInbox(false);
+                    }
+                  }}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: activeMode === 'projects' }}
+                  accessibilityLabel="Drawer mode Projects"
+                >
+                  <ProjectsNavIcon
+                    color={activeMode === 'projects' ? '#60A5FA' : '#64748B'}
+                  />
+                  <Text
+                    numberOfLines={1}
+                    style={[
+                      styles.modeSwitchText,
+                      activeMode === 'projects'
+                        ? styles.modeSwitchTextActive
+                        : null,
+                    ]}
+                  >
+                    Projects
+                  </Text>
                 </TouchableOpacity>
 
                 <TouchableOpacity
@@ -2723,6 +3357,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
           styles.closedHandleZone,
           isClosedHandleHidden ? styles.closedHandleZoneHidden : null,
         ]}
+        hitSlop={{ top: 24, bottom: 24, left: 16, right: 24 }}
         pointerEvents={
           (visible && !isDraggingOpen) || isKeyboardVisible ? 'none' : 'auto'
         }
@@ -2735,25 +3370,47 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
           <TouchableOpacity
             style={styles.closedHandleButton}
             activeOpacity={0.8}
+            hitSlop={{ top: 24, bottom: 24, left: 16, right: 24 }}
             onPress={handleTapOpen}
             accessibilityRole="button"
             accessibilityLabel="Open Antigravity drawer"
             accessibilityHint={closedHandleAccessibilityLabel}
           >
-            <View
+            <Animated.View
               style={[
-                styles.handleLine,
-                { backgroundColor: handleVisuals.lineColor },
-                handleVisuals.glowColor
-                  ? {
-                      shadowColor: handleVisuals.glowColor,
-                      shadowOpacity: 0.7,
-                      shadowRadius: 7,
-                      elevation: 5,
-                    }
-                  : null,
+                styles.closedHandleVisualGroup,
+                { transform: [{ translateX: handleNudgeX }] },
               ]}
-            />
+            >
+              <View
+                style={[
+                  styles.handleLine,
+                  { backgroundColor: handleVisuals.lineColor },
+                  handleVisuals.glowColor
+                    ? {
+                        shadowColor: handleVisuals.glowColor,
+                        shadowOpacity: 0.7,
+                        shadowRadius: 7,
+                        elevation: 5,
+                      }
+                    : null,
+                ]}
+              />
+              <View
+                style={[
+                  styles.closedHandleChevron,
+                  { borderColor: handleVisuals.lineColor },
+                ]}
+              />
+              {showGuidanceHint ? (
+                <View
+                  testID="drawer-guidance-pill"
+                  style={styles.closedHandleHintPill}
+                >
+                  <Text style={styles.closedHandleHintText}>Swipe</Text>
+                </View>
+              ) : null}
+            </Animated.View>
           </TouchableOpacity>
         ) : null}
       </View>
@@ -2771,7 +3428,7 @@ const styles = StyleSheet.create({
     left: CLOSED_HANDLE_TOUCH_LEFT,
     top: '50%',
     marginTop: -(HANDLE_TOUCH_ZONE_HEIGHT / 2),
-    width: 28,
+    width: CLOSED_HANDLE_TOUCH_WIDTH,
     height: HANDLE_TOUCH_ZONE_HEIGHT,
     justifyContent: 'center',
   },
@@ -2783,6 +3440,34 @@ const styles = StyleSheet.create({
     paddingLeft: CLOSED_HANDLE_BAR_INSET,
     flexDirection: 'row',
     alignItems: 'center',
+  },
+  closedHandleVisualGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  closedHandleChevron: {
+    width: 5,
+    height: 5,
+    marginLeft: 3,
+    borderTopWidth: 1.5,
+    borderRightWidth: 1.5,
+    opacity: 0.75,
+    transform: [{ rotate: '45deg' }],
+  },
+  closedHandleHintPill: {
+    marginLeft: 5,
+    paddingHorizontal: 6,
+    paddingVertical: 2.5,
+    borderRadius: 999,
+    backgroundColor: 'rgba(15, 23, 42, 0.86)',
+    borderWidth: 1,
+    borderColor: 'rgba(96, 165, 250, 0.38)',
+  },
+  closedHandleHintText: {
+    color: '#BFDBFE',
+    fontSize: 9.5,
+    fontWeight: '700',
+    letterSpacing: 0.3,
   },
   handleLine: {
     width: HANDLE_LINE_WIDTH,
@@ -3192,6 +3877,26 @@ const styles = StyleSheet.create({
     width: '100%',
     height: 1.5,
   },
+  projectsIconWrapper: {
+    width: 15,
+    height: 13,
+    justifyContent: 'flex-end',
+  },
+  projectsIconTab: {
+    width: 7,
+    height: 3.5,
+    borderTopLeftRadius: 2,
+    borderTopRightRadius: 2,
+    borderWidth: 1.5,
+    borderBottomWidth: 0,
+    marginBottom: -1,
+  },
+  projectsIconFolder: {
+    width: 15,
+    height: 10.5,
+    borderRadius: 2.5,
+    borderWidth: 1.6,
+  },
   usageIconRow: {
     flexDirection: 'row',
     alignItems: 'flex-end',
@@ -3395,6 +4100,178 @@ const styles = StyleSheet.create({
     color: '#93C5FD',
     fontSize: 10.5,
     fontWeight: '600',
+  },
+  projectsSummaryBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderBottomWidth: 1,
+    borderBottomColor: '#1E293B',
+    paddingBottom: 7,
+    marginBottom: 9,
+    gap: 8,
+  },
+  projectsSummaryActionsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  projectsSummaryText: {
+    flex: 1,
+    color: '#94A3B8',
+    fontSize: 11.5,
+    fontWeight: '600',
+  },
+  projectCard: {
+    backgroundColor: '#1E293B',
+    borderRadius: 11,
+    borderWidth: 1,
+    borderColor: '#334155',
+    overflow: 'hidden',
+  },
+  projectCardActive: {
+    borderColor: 'rgba(96, 165, 250, 0.55)',
+  },
+  projectHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    gap: 8,
+  },
+  projectHeaderToggle: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  projectHeaderMeta: {
+    flex: 1,
+  },
+  projectTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  projectTitleText: {
+    flexShrink: 1,
+    color: '#F8FAFC',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  projectStatusBadge: {
+    minWidth: 17,
+    paddingHorizontal: 5,
+    paddingVertical: 1,
+    borderRadius: 999,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  projectStatusBadgeUnread: {
+    backgroundColor: '#2563EB',
+  },
+  projectStatusBadgeUrgent: {
+    backgroundColor: '#D97706',
+  },
+  projectStatusBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 9.5,
+    fontWeight: '800',
+  },
+  projectRunningDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 999,
+    backgroundColor: '#10B981',
+  },
+  projectSubtitleText: {
+    color: '#94A3B8',
+    fontSize: 10.5,
+    marginTop: 2,
+  },
+  projectNewChatBtn: {
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 7,
+    backgroundColor: 'rgba(37, 99, 235, 0.18)',
+    borderWidth: 1,
+    borderColor: 'rgba(96, 165, 250, 0.4)',
+  },
+  projectNewChatBtnText: {
+    color: '#93C5FD',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  projectThreadsContainer: {
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(51, 65, 85, 0.75)',
+    backgroundColor: 'rgba(15, 23, 42, 0.5)',
+  },
+  projectThreadRow: {
+    paddingHorizontal: 11,
+    paddingVertical: 8.5,
+  },
+  projectThreadRowDivider: {
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(51, 65, 85, 0.55)',
+  },
+  projectThreadRowActive: {
+    backgroundColor: 'rgba(37, 99, 235, 0.16)',
+  },
+  projectThreadTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 6,
+  },
+  projectThreadTitleGroup: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+  },
+  projectThreadDot: {
+    width: 6.5,
+    height: 6.5,
+    borderRadius: 999,
+  },
+  projectThreadTitle: {
+    flex: 1,
+    color: '#E2E8F0',
+    fontSize: 12.5,
+    fontWeight: '600',
+  },
+  projectThreadTitleActive: {
+    color: '#F8FAFC',
+    fontWeight: '700',
+  },
+  projectThreadRightGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+  },
+  projectThreadBottomRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+    marginTop: 2.5,
+    marginLeft: 13.5,
+  },
+  projectThreadReason: {
+    flex: 1,
+    color: '#94A3B8',
+    fontSize: 11,
+  },
+  projectEmptyThreadsRow: {
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  projectEmptyThreadsText: {
+    color: '#94A3B8',
+    fontSize: 11,
+    lineHeight: 16,
   },
   emptyState: {
     alignItems: 'center',

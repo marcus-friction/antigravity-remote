@@ -4,6 +4,7 @@ import {
   buildFastThreadSwitchScript,
   buildMarkThreadReadScript,
   buildOpenHostSettingsScript,
+  buildStartProjectChatScript,
 } from '../src/services/inboxBridge';
 import {
   buildActionNotificationSyncState,
@@ -12,9 +13,11 @@ import {
 import {
   applyLocalStateToSnapshot,
   buildInboxSnapshot,
+  buildProjectGroups,
   describeWaitingSteps,
   extractActiveRouteFromUrl,
   extractWorkspaceName,
+  extractWorkspaceUri,
   formatRelativeTime,
   parseInboxBridgeMessage,
   parseProtoTimestampMs,
@@ -1581,5 +1584,364 @@ describe('inboxParser', () => {
     expect(cdkOverlayContainer.style.getPropertyValue('z-index')).toBe('');
 
     windowObj.__agyInboxBridge.stop();
+  });
+
+  it('extracts workspace URIs, groups threads into sorted project groups, and parses AGY_INBOX_START_CHAT_RESULT', () => {
+    expect(
+      extractWorkspaceUri({
+        workspaces: [{ workspaceFolderAbsoluteUri: 'file:///home/user/repo-a/' }],
+      }),
+    ).toBe('file:///home/user/repo-a');
+    expect(
+      extractWorkspaceUri({
+        workspaceFolderAbsoluteUri: '/Users/dev/project-b',
+      }),
+    ).toBe('/Users/dev/project-b');
+    expect(extractWorkspaceUri({})).toBeNull();
+
+    const snapshot = buildInboxSnapshot(
+      {
+        type: 'AGY_INBOX_SNAPSHOT',
+        fetchedAtMs: 1_762_265_000_000,
+        activeUrl: 'https://antigravity.google.com/u/1/r/box-1?p=c%2Ft-active',
+        activeInstanceUuid: 'box-1',
+        activeCascadeId: 't-active',
+        instances: [
+          {
+            uuid: 'box-1',
+            name: 'Primary Laptop',
+            status: 1,
+            trajectories: {
+              't-active': {
+                summary: 'Active feature work',
+                status: 'CASCADE_RUN_STATUS_IDLE',
+                lastModifiedTime: '2026-11-04T14:10:00Z',
+                lastUserViewTime: '2026-11-04T14:11:00Z',
+                workspaces: [
+                  {
+                    workspaceFolderAbsoluteUri:
+                      'file:///home/dev/antigravity-remote',
+                  },
+                ],
+              },
+              't-approval': {
+                summary: 'Approve deployment',
+                waitingSteps: [
+                  { step: { runCommand: { commandLine: 'npm publish' } } },
+                ],
+                lastModifiedTime: '2026-11-04T14:25:00Z',
+                workspaces: [
+                  {
+                    workspaceFolderAbsoluteUri:
+                      'file:///home/dev/backend-service',
+                  },
+                ],
+              },
+              't-older-same-project': {
+                summary: 'Initial setup',
+                status: 'CASCADE_RUN_STATUS_IDLE',
+                lastModifiedTime: '2026-11-04T13:00:00Z',
+                lastUserViewTime: '2026-11-04T13:05:00Z',
+                workspaces: [
+                  {
+                    workspaceFolderAbsoluteUri:
+                      'file:///home/dev/antigravity-remote',
+                  },
+                ],
+              },
+            },
+          },
+          {
+            uuid: 'box-empty',
+            name: 'Idle Workstation',
+            status: 1,
+            trajectories: {},
+          },
+        ],
+      },
+      {},
+      'https://antigravity.google.com/u/1/r/box-1?p=c%2Ft-active',
+      true,
+    );
+
+    const groups = buildProjectGroups(
+      snapshot,
+      'https://antigravity.google.com/u/1/r/box-1?p=c%2Ft-active',
+    );
+    expect(groups).toHaveLength(3);
+
+    // Group with active thread comes first (`hasActiveThread === true`), followed by urgent approval group, then empty connected machine
+    expect(groups[0]).toMatchObject({
+      name: 'antigravity-remote',
+      workspaceName: 'antigravity-remote',
+      workspaceUri: 'file:///home/dev/antigravity-remote',
+      instanceUuid: 'box-1',
+      instanceName: 'Primary Laptop',
+      hasActiveThread: true,
+      newChatUrl: 'https://antigravity.google.com/u/1/r/box-1',
+    });
+    expect(groups[0].threads.map((t) => t.cascadeId)).toEqual([
+      't-active',
+      't-older-same-project',
+    ]);
+
+    expect(groups[1]).toMatchObject({
+      name: 'backend-service',
+      workspaceUri: 'file:///home/dev/backend-service',
+      instanceUuid: 'box-1',
+      attentionCount: 1,
+      urgentCount: 1,
+    });
+
+    expect(groups[2]).toMatchObject({
+      name: 'Idle Workstation',
+      workspaceName: null,
+      workspaceUri: null,
+      instanceUuid: 'box-empty',
+      threads: [],
+      newChatUrl: 'https://antigravity.google.com/u/1/r/box-empty',
+    });
+
+    const parsedStartResult = parseInboxBridgeMessage(
+      JSON.stringify({
+        type: 'AGY_INBOX_START_CHAT_RESULT',
+        requestId: 'req-42',
+        handled: true,
+        cascadeId: 'new-cascade-99',
+        targetUrl:
+          'https://antigravity.google.com/u/1/r/box-1?p=c%2Fnew-cascade-99',
+      }),
+    );
+    expect(parsedStartResult).toEqual({
+      type: 'AGY_INBOX_START_CHAT_RESULT',
+      requestId: 'req-42',
+      handled: true,
+      cascadeId: 'new-cascade-99',
+      targetUrl:
+        'https://antigravity.google.com/u/1/r/box-1?p=c%2Fnew-cascade-99',
+    });
+
+    const startScript = buildStartProjectChatScript({
+      requestId: 'req-42',
+      instanceUuid: 'box-1',
+      workspaceUri: 'file:///home/dev/antigravity-remote',
+      targetUrl: 'https://antigravity.google.com/u/1/r/box-1',
+    });
+    expect(startScript).toContain('startProjectChat');
+    expect(startScript).toContain('file:///home/dev/antigravity-remote');
+  });
+
+  test('executes startProjectChat inside VM sandbox and handles StartCascade RPC and fallback', async () => {
+    const iframeMessages: Array<{ payload: any; origin: string }> = [];
+    const postedNativeMessages: any[] = [];
+    const proxyCommandCalls: Array<{
+      targetUuid: string;
+      rpcPath: string;
+      jsonBody: string;
+    }> = [];
+    let nextStartCascadeResponse: Record<string, unknown> | null = {
+      cascadeId: 'new-cascade-77',
+    };
+
+    const hubIframe = {
+      tagName: 'IFRAME',
+      src: 'https://antigravity.static.usercontent.goog/web/v1/?iframe=true',
+      contentWindow: {
+        postMessage: (msg: any, origin: string) => {
+          iframeMessages.push({ payload: msg, origin });
+        },
+      },
+      style: {
+        setProperty: () => {},
+        removeProperty: () => {},
+        getPropertyValue: () => '',
+        getPropertyPriority: () => '',
+      },
+      getAttribute: (name: string) =>
+        name === 'src'
+          ? 'https://antigravity.static.usercontent.goog/web/v1/?iframe=true'
+          : null,
+      getBoundingClientRect: () => ({ width: 390, height: 800 }),
+    };
+
+    const locationObj = {
+      hostname: 'antigravity.google.com',
+      origin: 'https://antigravity.google.com',
+      pathname: '/r/box-1',
+      search: '?p=c%2Fold-cascade',
+      hash: '',
+      href: 'https://antigravity.google.com/r/box-1?p=c%2Fold-cascade',
+    };
+
+    function MockProxyCommandRequest(this: any) {
+      this.targetUuid = '';
+      this.rpcPath = '';
+      this.payloadBytes = null;
+    }
+    MockProxyCommandRequest.prototype.setTargetInstanceUuid = function (
+      u: string,
+    ) {
+      this.targetUuid = u;
+    };
+    MockProxyCommandRequest.prototype.setRpcPath = function (p: string) {
+      this.rpcPath = p;
+    };
+    MockProxyCommandRequest.prototype.setPayload = function (b: Uint8Array) {
+      this.payloadBytes = b;
+    };
+    MockProxyCommandRequest.prototype.putHeaders = function () {};
+
+    function MockListInstancesRequest() {}
+
+    function MockApiServicePromiseClient() {}
+    MockApiServicePromiseClient.prototype.listInstances = function () {
+      return Promise.resolve({ getInstancesList: () => [] });
+    };
+    MockApiServicePromiseClient.prototype.proxyCommand = function (req: any) {
+      const jsonBody = req.payloadBytes
+        ? new TextDecoder('utf-8').decode(req.payloadBytes)
+        : '';
+      proxyCommandCalls.push({
+        targetUuid: req.targetUuid,
+        rpcPath: req.rpcPath,
+        jsonBody,
+      });
+      if (req.rpcPath.includes('/StartCascade')) {
+        if (!nextStartCascadeResponse) {
+          return Promise.reject(new Error('StartCascade RPC failed'));
+        }
+        const encoded = new TextEncoder().encode(
+          JSON.stringify(nextStartCascadeResponse),
+        );
+        return Promise.resolve({
+          getPayload_asU8: () => encoded,
+        });
+      }
+      return Promise.resolve({
+        getPayload_asU8: () => new TextEncoder().encode('{}'),
+      });
+    };
+
+    const windowObj: any = {
+      location: locationObj,
+      navigator: { onLine: true },
+      default_GoogleAntigravity: {
+        K: {
+          devtools_jetski_boq_api_proto: {
+            ApiServicePromiseClient: MockApiServicePromiseClient,
+            ProxyCommandRequest: MockProxyCommandRequest,
+            ListInstancesRequest: MockListInstancesRequest,
+          },
+        },
+      },
+      history: {
+        replaceState: (_state: any, _title: string, nextUrl: string) => {
+          const parsed = new URL(nextUrl, locationObj.origin);
+          locationObj.pathname = parsed.pathname;
+          locationObj.search = parsed.search;
+          locationObj.href = parsed.toString();
+        },
+      },
+      addEventListener: () => {},
+      ReactNativeWebView: {
+        postMessage: (raw: string) => {
+          postedNativeMessages.push(JSON.parse(raw));
+        },
+      },
+    };
+
+    const documentObj: any = {
+      cookie: 'SID=12345',
+      visibilityState: 'visible',
+      documentElement: null,
+      body: null,
+      querySelectorAll: (selector: string) =>
+        selector === 'iframe' ? [hubIframe] : [],
+    };
+
+    const sandbox = vm.createContext({
+      window: windowObj,
+      document: documentObj,
+      navigator: windowObj.navigator,
+      TextEncoder,
+      TextDecoder,
+      Uint8Array,
+      URL,
+      URLSearchParams,
+      Promise,
+      setTimeout: () => 1,
+      clearTimeout: () => {},
+      setInterval: () => 1,
+      clearInterval: () => {},
+    });
+
+    vm.runInContext(INBOX_BRIDGE_SCRIPT, sandbox);
+    postedNativeMessages.length = 0;
+    proxyCommandCalls.length = 0;
+
+    // 1. Successful StartCascade with workspaceUri creates thread & navigates iframe
+    await windowObj.__agyInboxBridge.startProjectChat(
+      'req-success',
+      'box-1',
+      'file:///home/dev/antigravity-remote',
+      'https://antigravity.google.com/r/box-1',
+    );
+
+    const startCall = proxyCommandCalls.find((r) =>
+      r.rpcPath.includes('/StartCascade'),
+    );
+    expect(startCall).toBeDefined();
+    expect(startCall!.targetUuid).toBe('box-1');
+    expect(JSON.parse(startCall!.jsonBody)).toMatchObject({
+      workspaceUris: ['file:///home/dev/antigravity-remote'],
+    });
+    expect(iframeMessages).toEqual([
+      {
+        payload: { jspbPayload: JSON.stringify([null, ['/c/new-cascade-77']]) },
+        origin: 'https://antigravity.static.usercontent.goog',
+      },
+      {
+        payload: { jspbPayload: JSON.stringify([null, null, []]) },
+        origin: 'https://antigravity.static.usercontent.goog',
+      },
+    ]);
+    expect(postedNativeMessages).toContainEqual({
+      type: 'AGY_INBOX_START_CHAT_RESULT',
+      requestId: 'req-success',
+      handled: true,
+      cascadeId: 'new-cascade-77',
+      targetUrl:
+        'https://antigravity.google.com/r/box-1?p=c%2Fnew-cascade-77',
+    });
+
+    // 2. Fallback to new-chat overview when StartCascade fails
+    iframeMessages.length = 0;
+    postedNativeMessages.length = 0;
+    nextStartCascadeResponse = null;
+
+    await windowObj.__agyInboxBridge.startProjectChat(
+      'req-fallback',
+      'box-1',
+      null,
+      'https://antigravity.google.com/r/box-1',
+    );
+
+    expect(iframeMessages).toEqual([
+      {
+        payload: { jspbPayload: JSON.stringify([null, ['/']]) },
+        origin: 'https://antigravity.static.usercontent.goog',
+      },
+      {
+        payload: { jspbPayload: JSON.stringify([null, null, []]) },
+        origin: 'https://antigravity.static.usercontent.goog',
+      },
+    ]);
+    expect(postedNativeMessages).toContainEqual({
+      type: 'AGY_INBOX_START_CHAT_RESULT',
+      requestId: 'req-fallback',
+      handled: true,
+      cascadeId: null,
+      targetUrl: 'https://antigravity.google.com/r/box-1',
+    });
   });
 });

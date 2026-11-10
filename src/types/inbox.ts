@@ -28,6 +28,7 @@ export interface InboxThreadItem {
   trajectoryId: string;
   title: string;
   workspaceName: string | null;
+  workspaceUri?: string | null;
   instanceUuid: string;
   instanceName: string;
   source: 'remote-control' | 'cloud';
@@ -45,6 +46,26 @@ export interface InboxThreadItem {
   isActiveThread: boolean;
   isPinned: boolean;
   hasRunningSubagents: boolean;
+}
+
+export interface InboxProjectGroup {
+  /** Stable composite key (`<instanceUuid>:<workspaceKey>`). */
+  id: string;
+  /** Primary display name (workspace folder/repo name, or workstation name when workspace is unscoped). */
+  name: string;
+  workspaceName: string | null;
+  workspaceUri: string | null;
+  instanceUuid: string;
+  instanceName: string;
+  source: 'remote-control' | 'cloud';
+  threads: InboxThreadItem[];
+  latestModifiedAtMs: number;
+  attentionCount: number;
+  urgentCount: number;
+  runningCount: number;
+  hasActiveThread: boolean;
+  /** Verified in-app URL to open the workstation overview / new chat for this project. */
+  newChatUrl: string;
 }
 
 export interface UsageQuotaBucket {
@@ -156,6 +177,13 @@ export type InboxBridgeMessage =
       type: 'AGY_INBOX_FAST_NAV_RESULT';
       requestId: string;
       handled: boolean;
+      targetUrl: string;
+    }
+  | {
+      type: 'AGY_INBOX_START_CHAT_RESULT';
+      requestId: string;
+      handled: boolean;
+      cascadeId?: string | null;
       targetUrl: string;
     }
   | {

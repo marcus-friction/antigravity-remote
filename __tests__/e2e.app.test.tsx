@@ -227,8 +227,10 @@ import {
 } from '../src/services/webData';
 import {
   CLOSED_HANDLE_TOUCH_LEFT,
+  CLOSED_HANDLE_TOUCH_WIDTH,
   HANDLE_LINE_HEIGHT,
   HANDLE_LINE_WIDTH,
+  HANDLE_TOUCH_ZONE_HEIGHT,
   LeftNavigationDrawer,
 } from '../src/components/LeftNavigationDrawer';
 import { RemoteWebView } from '../src/components/RemoteWebView';
@@ -2853,6 +2855,321 @@ describe('Session and navigation regressions', () => {
     });
     expect(webView().props.source.uri).toBe(
       'https://antigravity.google.com/u/2/',
+    );
+  });
+
+  it('shows subtle drawer guidance until first open, opens easily on a short swipe, and navigates projects & new chats in the Projects tab', async () => {
+    expect(HANDLE_TOUCH_ZONE_HEIGHT).toBe(216);
+    expect(CLOSED_HANDLE_TOUCH_WIDTH).toBe(44);
+
+    mockCookieStore.set('https://antigravity.google.com', {
+      SID: { name: 'SID', value: 'projects-session', domain: '.google.com' },
+    });
+    await navigate(
+      'https://antigravity.google.com/r/workstation-1?p=c%2Factive-thread',
+      false,
+    );
+
+    // 1. Before first open, the subtle "Swipe" guidance pill is visible on the closed handle
+    const findGuidancePills = () =>
+      tree.root.findAll(
+        (node) =>
+          node.type === ('View' as any) &&
+          node.props.testID === 'drawer-guidance-pill',
+      );
+    expect(findGuidancePills()).toHaveLength(1);
+    expect(
+      findGuidancePills()[0]
+        .findAllByType('Text' as any)
+        .map((t) => t.props.children),
+    ).toEqual(['Swipe']);
+
+    // 2. Deliver multi-project snapshot across 2 workstations
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Factive-thread',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_SNAPSHOT',
+            fetchedAtMs: 1_762_290_000_000,
+            activeUrl:
+              'https://antigravity.google.com/r/workstation-1?p=c%2Factive-thread',
+            activeInstanceUuid: 'workstation-1',
+            activeCascadeId: 'active-thread',
+            instances: [
+              {
+                uuid: 'workstation-1',
+                name: 'Primary Laptop',
+                status: 1,
+                trajectories: {
+                  'active-thread': {
+                    summary: 'Build native Projects tab',
+                    status: 1,
+                    lastModifiedTime: '2026-11-04T16:10:00Z',
+                    lastUserViewTime: '2026-11-04T16:11:00Z',
+                    workspaces: [
+                      {
+                        workspaceFolderAbsoluteUri:
+                          'file:///home/marcus/projects/antigravity-remote',
+                      },
+                    ],
+                  },
+                  'approval-thread': {
+                    summary: 'Run production migration',
+                    waitingSteps: [
+                      {
+                        step: {
+                          runCommand: { commandLine: 'npm run db:migrate' },
+                        },
+                      },
+                    ],
+                    lastModifiedTime: '2026-11-04T16:20:00Z',
+                    workspaces: [
+                      {
+                        workspaceFolderAbsoluteUri:
+                          'file:///home/marcus/projects/api-gateway',
+                      },
+                    ],
+                  },
+                },
+              },
+              {
+                uuid: 'workstation-2',
+                name: 'Cloud GPU Box',
+                status: 1,
+                trajectories: {},
+              },
+            ],
+          }),
+        },
+      });
+    });
+
+    // 3. Easier drawer gesture: a short 32px diagonal thumb pull-right opens the drawer and permanently dismisses guidance
+    const findClosedDragZone = () =>
+      tree.root.findAll(
+        (node) =>
+          node.type === ('View' as any) &&
+          node.props.testID === 'closed-drawer-handle-zone',
+      )[0];
+    expect(
+      findClosedDragZone().props.onMoveShouldSetPanResponderCapture(
+        {},
+        { dx: 7, dy: 9 },
+      ),
+    ).toBe(true);
+    await act(async () => {
+      findClosedDragZone().props.onPanResponderGrant();
+    });
+    await act(async () => {
+      findClosedDragZone().props.onPanResponderMove(
+        {},
+        { dx: 32, dy: 20, vx: 0.08 },
+      );
+    });
+    await act(async () => {
+      findClosedDragZone().props.onPanResponderRelease(
+        {},
+        { dx: 32, dy: 20, vx: 0.08 },
+      );
+    });
+    expect(controls().props.visible).toBe(true);
+    expect(mockSecureStoreData.get('agy_drawer_guidance_seen_v1')).toBe('true');
+
+    // Close drawer and verify the guidance pill stays permanently dismissed
+    await act(async () => {
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find((n) => n.props.accessibilityLabel === 'Close Antigravity drawer')!
+        .props.onPress();
+    });
+    expect(controls().props.visible).toBe(false);
+    expect(findGuidancePills()).toHaveLength(0);
+
+    // 4. Open drawer and switch to the 2nd tab: Projects
+    await act(async () => {
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find((n) => n.props.accessibilityLabel === 'Open Antigravity drawer')!
+        .props.onPress();
+    });
+    const projectsTabBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((n) => n.props.accessibilityLabel === 'Drawer mode Projects')!;
+    expect(projectsTabBtn).toBeDefined();
+    await act(async () => {
+      projectsTabBtn.props.onPress();
+    });
+
+    const getProjectHeaders = () =>
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .filter(
+          (n) =>
+            typeof n.props.accessibilityLabel === 'string' &&
+            n.props.accessibilityLabel.startsWith('Project '),
+        );
+    expect(getProjectHeaders().map((n) => n.props.accessibilityLabel)).toEqual([
+      'Project antigravity-remote',
+      'Project api-gateway',
+      'Project Cloud GPU Box',
+    ]);
+
+    // Collapse all & Expand all
+    const collapseAllBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((n) => n.props.accessibilityLabel === 'Collapse all projects')!;
+    expect(collapseAllBtn).toBeDefined();
+    await act(async () => {
+      collapseAllBtn.props.onPress();
+    });
+    expect(
+      tree.root.findAll(
+        (n) =>
+          n.type === ('TouchableOpacity' as any) &&
+          typeof n.props.accessibilityLabel === 'string' &&
+          n.props.accessibilityLabel.startsWith('Open project thread '),
+      ),
+    ).toHaveLength(0);
+
+    const expandAllBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((n) => n.props.accessibilityLabel === 'Expand all projects')!;
+    await act(async () => {
+      expandAllBtn.props.onPress();
+    });
+    expect(
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .filter(
+          (n) =>
+            typeof n.props.accessibilityLabel === 'string' &&
+            n.props.accessibilityLabel.startsWith('Open project thread '),
+        )
+        .map((n) => n.props.accessibilityLabel),
+    ).toEqual([
+      'Open project thread Build native Projects tab',
+      'Open project thread Run production migration',
+    ]);
+
+    // Filter projects via search bar
+    await act(async () => {
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find((n) => n.props.accessibilityLabel === 'Toggle thread search')!
+        .props.onPress();
+    });
+    const filterInput = tree.root.findAll(
+      (n) =>
+        n.type === ('TextInput' as any) &&
+        n.props.accessibilityLabel === 'Filter Projects',
+    )[0];
+    await act(async () => {
+      filterInput.props.onChangeText('api-gateway');
+    });
+    expect(getProjectHeaders().map((n) => n.props.accessibilityLabel)).toEqual([
+      'Project api-gateway',
+    ]);
+    await act(async () => {
+      filterInput.props.onChangeText('');
+    });
+
+    // 5. Start a new chat in `antigravity-remote` on the active workstation ->
+    // injects `startProjectChat` and handles `AGY_INBOX_START_CHAT_RESULT` in-place without remounting
+    const mountsBeforeStartChat = mockWebViewMountCount;
+    mockWebViewInjectJavaScript.mockClear();
+    const newChatBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find(
+        (n) =>
+          n.props.accessibilityLabel === 'New chat in antigravity-remote',
+      )!;
+    await act(async () => {
+      newChatBtn.props.onPress();
+    });
+    expect(controls().props.visible).toBe(false);
+
+    const startChatCall = mockWebViewInjectJavaScript.mock.calls.find(
+      ([script]) =>
+        typeof script === 'string' &&
+        script.includes('window.__agyInboxBridge.startProjectChat('),
+    );
+    expect(startChatCall).toBeDefined();
+    const requestIdMatch = (startChatCall![0] as string).match(
+      /"requestId":"(start-chat-[^"]+)"/,
+    );
+    expect(requestIdMatch).not.toBeNull();
+    const startRequestId = requestIdMatch![1];
+
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Factive-thread',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_START_CHAT_RESULT',
+            requestId: startRequestId,
+            handled: true,
+            cascadeId: 'fresh-cascade-1',
+            targetUrl:
+              'https://antigravity.google.com/r/workstation-1?p=c%2Ffresh-cascade-1',
+          }),
+        },
+      });
+    });
+    expect(mockWebViewMountCount).toBe(mountsBeforeStartChat);
+    expect(controls().props.activeUrl).toBe(
+      'https://antigravity.google.com/r/workstation-1?p=c%2Ffresh-cascade-1',
+    );
+
+    // 6. Starting a new chat on another workstation (`Cloud GPU Box`) also invokes `startProjectChat`
+    // and navigates directly to the created cascade URL when `handled: false` is returned
+    await act(async () => {
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find((n) => n.props.accessibilityLabel === 'Open Antigravity drawer')!
+        .props.onPress();
+    });
+    await act(async () => {
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find((n) => n.props.accessibilityLabel === 'Drawer mode Projects')!
+        .props.onPress();
+    });
+    mockWebViewInjectJavaScript.mockClear();
+    await act(async () => {
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find(
+          (n) => n.props.accessibilityLabel === 'New chat in Cloud GPU Box',
+        )!
+        .props.onPress();
+    });
+    const crossStartCall = mockWebViewInjectJavaScript.mock.calls.find(
+      ([script]) =>
+        typeof script === 'string' &&
+        script.includes('window.__agyInboxBridge.startProjectChat('),
+    );
+    expect(crossStartCall).toBeDefined();
+    const crossReqId = (crossStartCall![0] as string).match(
+      /"requestId":"(start-chat-[^"]+)"/,
+    )![1];
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Ffresh-cascade-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_START_CHAT_RESULT',
+            requestId: crossReqId,
+            handled: false,
+            cascadeId: 'gpu-cascade-7',
+            targetUrl:
+              'https://antigravity.google.com/r/workstation-2?p=c%2Fgpu-cascade-7',
+          }),
+        },
+      });
+    });
+    expect(webView().props.source.uri).toBe(
+      'https://antigravity.google.com/r/workstation-2?p=c%2Fgpu-cascade-7',
     );
   });
 });

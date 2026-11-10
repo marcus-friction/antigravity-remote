@@ -66,6 +66,8 @@ export const SECURE_STORE_LAST_URL_KEY = 'agy_last_active_url_v1';
 export const SECURE_STORE_KEEP_ALIVE_MINUTES_KEY = 'agy_keep_alive_minutes_v1';
 export const SECURE_STORE_ACTION_NOTIFICATIONS_KEY =
   'agy_action_notifications_v1';
+export const SECURE_STORE_DRAWER_GUIDANCE_SEEN_KEY =
+  'agy_drawer_guidance_seen_v1';
 export const KEEP_ALIVE_DURATION_OPTIONS = [0, 5, 15, 30, 60] as const;
 export const DEFAULT_KEEP_ALIVE_MINUTES = 30;
 export const AUTO_NOTIFICATION_KEEP_ALIVE_MINUTES = 30;

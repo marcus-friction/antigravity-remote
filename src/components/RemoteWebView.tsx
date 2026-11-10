@@ -34,6 +34,7 @@ import {
   buildInboxRefreshScript,
   buildMarkThreadReadScript,
   buildOpenHostSettingsScript,
+  buildStartProjectChatScript,
 } from '../services/inboxBridge';
 import {
   PROJECT_OVERVIEW_SCROLL_SCRIPT,
@@ -43,11 +44,13 @@ import {
   backupCookiesFromWebView,
   clearSession,
   getActionNotificationMode,
+  getDrawerGuidanceSeen,
   getGoogleSessionSignature,
   getKeepAliveMinutes,
   getLastActiveUrl,
   hydrateCookiesToWebView,
   saveActionNotificationMode,
+  saveDrawerGuidanceSeen,
   saveKeepAliveMinutes,
   saveLastActiveUrl,
   suspendSessionPersistence,
@@ -62,6 +65,7 @@ import {
 } from '../services/webData';
 import {
   InboxBridgeMessage,
+  InboxProjectGroup,
   InboxSnapshot,
   InboxThreadItem,
 } from '../types/inbox';
@@ -208,6 +212,7 @@ function buildKeepAliveWebLockScript(acquire: boolean): string {
 const MAX_RENDER_RECOVERY_ATTEMPTS = 3;
 const RENDER_RECOVERY_WINDOW_MS = 30_000;
 const FAST_THREAD_NAV_FALLBACK_MS = 750;
+const START_PROJECT_CHAT_FALLBACK_MS = 2_400;
 const HOST_SETTINGS_FALLBACK_MS = 500;
 const INBOX_REFRESH_TIMEOUT_MS = 9_000;
 const MAX_LOCALLY_READ_ENTRIES = 500;
@@ -365,6 +370,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const [stage, setStage] = useState<AuthFlowStage>('hydrating');
   const [hasNetworkError, setHasNetworkError] = useState<boolean>(false);
   const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
+  const [hasSeenDrawerGuidance, setHasSeenDrawerGuidance] =
+    useState<boolean>(false);
   const [drawerInitialMode, setDrawerInitialMode] =
     useState<DrawerMode>('inbox');
   const [isInboxRefreshing, setIsInboxRefreshing] = useState<boolean>(false);
@@ -444,11 +451,13 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         savedUrl,
         savedKeepAliveMinutes,
         savedActionNotificationMode,
+        savedDrawerGuidanceSeen,
         sessionSignature,
       ] = await Promise.all([
         getLastActiveUrl(),
         getKeepAliveMinutes(),
         getActionNotificationMode(),
+        getDrawerGuidanceSeen(),
         getGoogleSessionSignature(),
       ]);
 
@@ -467,6 +476,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       keepAliveMinutesRef.current = savedKeepAliveMinutes;
       setActionNotificationMode(savedActionNotificationMode);
       actionNotificationModeRef.current = savedActionNotificationMode;
+      setHasSeenDrawerGuidance(savedDrawerGuidanceSeen);
       setCurrentSourceUrl(initialTarget);
       setActiveHostUrl(initialTarget);
       currentNavUrlRef.current = initialTarget;
@@ -1397,6 +1407,15 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     [armInboxRefreshTimeout],
   );
 
+  const handleDismissDrawerGuidance = useCallback(() => {
+    setHasSeenDrawerGuidance((prev) => {
+      if (!prev) {
+        void saveDrawerGuidanceSeen(true);
+      }
+      return true;
+    });
+  }, []);
+
   const handleOpenDrawer = useCallback(
     (preferredMode?: DrawerMode) => {
       if (isResettingSessionRef.current) return;
@@ -1404,6 +1423,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         clearTimeout(resumeReadSettleTimerRef.current);
         resumeReadSettleTimerRef.current = null;
       }
+      handleDismissDrawerGuidance();
       const resolvedMode: DrawerMode =
         preferredMode ??
         (stageRef.current === 'authenticated' ? 'inbox' : 'settings');
@@ -1415,7 +1435,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         handleRefreshInbox(resolvedMode === 'usage');
       }
     },
-    [handleRefreshInbox, recomputeSnapshotWithLocalState],
+    [
+      handleDismissDrawerGuidance,
+      handleRefreshInbox,
+      recomputeSnapshotWithLocalState,
+    ],
   );
 
   const handleCloseDrawer = useCallback(() => {
@@ -1515,6 +1539,55 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       markThreadReadInWorkstationClock,
       recomputeSnapshotWithLocalState,
     ],
+  );
+
+  const handleStartProjectThread = useCallback(
+    (project: InboxProjectGroup) => {
+      if (isResettingSessionRef.current) return;
+      if (resumeReadSettleTimerRef.current) {
+        clearTimeout(resumeReadSettleTimerRef.current);
+        resumeReadSettleTimerRef.current = null;
+      }
+      isDrawerOpenRef.current = false;
+      setIsDrawerOpen(false);
+      recomputeSnapshotWithLocalState({
+        activeInstanceUuid: project.instanceUuid,
+        activeCascadeId: null,
+        isDrawerOpen: false,
+      });
+
+      if (
+        project.source === 'remote-control' &&
+        stageRef.current === 'authenticated' &&
+        !renderProcessDeadRef.current &&
+        webViewRef.current
+      ) {
+        const requestId = `start-chat-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const fallbackTimer = setTimeout(() => {
+          pendingFastNavRef.current.delete(requestId);
+          handleNavigateToUrl(project.newChatUrl);
+        }, START_PROJECT_CHAT_FALLBACK_MS);
+        (fallbackTimer as { unref?: () => void })?.unref?.();
+        pendingFastNavRef.current.set(requestId, {
+          timer: fallbackTimer,
+          targetUrl: project.newChatUrl,
+        });
+
+        webViewRef.current.injectJavaScript(INBOX_BRIDGE_SCRIPT);
+        webViewRef.current.injectJavaScript(
+          buildStartProjectChatScript({
+            requestId,
+            instanceUuid: project.instanceUuid,
+            workspaceUri: project.workspaceUri,
+            targetUrl: project.newChatUrl,
+          }),
+        );
+        return;
+      }
+
+      handleNavigateToUrl(project.newChatUrl);
+    },
+    [handleNavigateToUrl, recomputeSnapshotWithLocalState],
   );
 
   // Step 2: Handle incoming deep links and multi-action Inbox opens when mounted
@@ -1793,6 +1866,38 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           break;
         }
 
+        case 'AGY_INBOX_START_CHAT_RESULT': {
+          const pending = pendingFastNavRef.current.get(message.requestId);
+          if (!pending) {
+            break;
+          }
+          clearTimeout(pending.timer);
+          pendingFastNavRef.current.delete(message.requestId);
+          const candidateValidation = validateNavigationUrl(message.targetUrl);
+          const effectiveUrl =
+            candidateValidation.isAllowedInApp &&
+            candidateValidation.normalizedUrl
+              ? candidateValidation.normalizedUrl
+              : pending.targetUrl;
+          if (!message.handled) {
+            handleNavigateToUrl(effectiveUrl);
+          } else {
+            syncVerifiedActiveHostUrl(effectiveUrl);
+            const fastRoute = extractActiveRouteFromUrl(effectiveUrl);
+            const resolvedCascadeId = message.cascadeId || fastRoute.cascadeId;
+            activeInstanceUuidRef.current = fastRoute.instanceUuid;
+            recordActiveRouteForBackNavigation(
+              fastRoute.instanceUuid,
+              resolvedCascadeId,
+            );
+            recomputeSnapshotWithLocalState({
+              activeInstanceUuid: fastRoute.instanceUuid,
+              activeCascadeId: resolvedCascadeId,
+            });
+          }
+          break;
+        }
+
         case 'AGY_INBOX_HOST_SETTINGS_RESULT': {
           if (!hostSettingsFallbackTimerRef.current) {
             break;
@@ -1967,6 +2072,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         focusInboxRequestKey={focusInboxRequestKey}
         isKeyboardVisible={isKeyboardVisible}
         keyboardBottomPadding={keyboardBottomPadding}
+        hasSeenGuidance={hasSeenDrawerGuidance}
         stage={stage}
         activeUrl={activeHostUrl}
         snapshot={inboxSnapshot}
@@ -1978,9 +2084,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         actionNotificationMode={actionNotificationMode}
         onOpen={handleOpenDrawer}
         onClose={handleCloseDrawer}
+        onDismissGuidance={handleDismissDrawerGuidance}
         onRegisterBackHandler={registerDrawerBackInterceptor}
         onRefreshInbox={handleRefreshInbox}
         onSelectThread={handleSelectInboxThread}
+        onStartProjectThread={handleStartProjectThread}
         onMarkThreadRead={handleMarkThreadRead}
         onMarkAllRead={handleMarkAllRead}
         onChangeKeepAliveMinutes={handleChangeKeepAliveMinutes}

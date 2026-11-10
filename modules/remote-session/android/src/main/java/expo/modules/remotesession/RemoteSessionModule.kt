@@ -194,8 +194,8 @@ class RemoteSessionModule : Module() {
       val height = view.height
       if (height <= 0) return
       val density = view.resources.displayMetrics.density
-      val halfZonePx = (74f * density).toInt()
-      val edgeWidthPx = (48f * density).toInt()
+      val halfZonePx = (100f * density).toInt()
+      val edgeWidthPx = (64f * density).toInt()
       val centerY = height / 2
       view.systemGestureExclusionRects = listOf(
         Rect(

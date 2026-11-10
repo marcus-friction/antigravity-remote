@@ -27,6 +27,7 @@ export const INBOX_BRIDGE_SCRIPT = `
     }
 
     var GET_TRAJECTORIES_PATH = '/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories';
+    var START_CASCADE_PATH = '/exa.language_server_pb.LanguageServerService/StartCascade';
     var UPDATE_ANNOTATIONS_PATH = '/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations';
     var RETRIEVE_QUOTA_SUMMARY_PATH = '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary';
     var GET_USER_STATUS_PATH = '/exa.language_server_pb.LanguageServerService/GetUserStatus';
@@ -1667,6 +1668,213 @@ export const INBOX_BRIDGE_SCRIPT = `
       }
     }
 
+    function extractCreatedCascadeId(res) {
+      if (!res || typeof res !== 'object') return null;
+      var candidate =
+        res.cascadeId ||
+        res.cascade_id ||
+        res.trajectoryId ||
+        res.trajectory_id ||
+        (res.response &&
+          typeof res.response === 'object' &&
+          (res.response.cascadeId || res.response.cascade_id)) ||
+        null;
+      return typeof candidate === 'string' && SAFE_ID_RE.test(candidate)
+        ? candidate
+        : null;
+    }
+
+    function buildCascadeTargetUrl(baseUrl, cascadeId) {
+      try {
+        var parsed = new URL(baseUrl);
+        parsed.searchParams.set('p', 'c/' + cascadeId);
+        return parsed.toString();
+      } catch (_) {
+        var sep = String(baseUrl || '').indexOf('?') === -1 ? '?p=' : '&p=';
+        return String(baseUrl || '') + sep + encodeURIComponent('c/' + cascadeId);
+      }
+    }
+
+    function navigateIframeToNewChatOverview(requestId, instanceUuid, targetUrl) {
+      var route = parseRouteFromLocation();
+      var frame = findHubIframe();
+      if (
+        route.instanceUuid === instanceUuid &&
+        frame &&
+        frame.contentWindow &&
+        frame.src
+      ) {
+        try {
+          var frameOrigin = new URL(frame.src).origin;
+          frame.contentWindow.postMessage(
+            { jspbPayload: JSON.stringify([null, ['/']]) },
+            frameOrigin
+          );
+          frame.contentWindow.postMessage(
+            { jspbPayload: JSON.stringify([null, null, []]) },
+            frameOrigin
+          );
+          clearHostChildPathParam();
+          setIframeCascadeOverride(null);
+          postToNative({
+            type: 'AGY_INBOX_START_CHAT_RESULT',
+            requestId: requestId,
+            handled: true,
+            cascadeId: null,
+            targetUrl: targetUrl
+          });
+          postToNative({
+            type: 'AGY_INBOX_ACTIVE_ROUTE',
+            activeUrl: window.location.href,
+            activeInstanceUuid: instanceUuid,
+            activeCascadeId: null
+          });
+          return true;
+        } catch (_) {}
+      }
+      postToNative({
+        type: 'AGY_INBOX_START_CHAT_RESULT',
+        requestId: requestId,
+        handled: false,
+        cascadeId: null,
+        targetUrl: targetUrl
+      });
+      return false;
+    }
+
+    function startProjectChat(requestId, instanceUuid, workspaceUri, targetUrl) {
+      if (!instanceUuid || instanceUuid === '__cloud__') {
+        postToNative({
+          type: 'AGY_INBOX_START_CHAT_RESULT',
+          requestId: requestId,
+          handled: false,
+          cascadeId: null,
+          targetUrl: targetUrl
+        });
+        return Promise.resolve(false);
+      }
+
+      return getClientWithMetadata()
+        .then(function(ctx) {
+          if (!ctx) {
+            return null;
+          }
+          var cleanUri =
+            typeof workspaceUri === 'string' && workspaceUri.trim()
+              ? workspaceUri.trim()
+              : null;
+          var primaryBody = cleanUri
+            ? JSON.stringify({
+                metadata: {
+                  ideName: 'antigravity',
+                  extensionName: 'antigravity',
+                  locale: 'en'
+                },
+                workspaceUris: [cleanUri]
+              })
+            : DEFAULT_LS_METADATA_BODY;
+
+          return callProxyJson(
+            ctx,
+            instanceUuid,
+            START_CASCADE_PATH,
+            primaryBody,
+            1800
+          )
+            .then(function(res) {
+              var cid = extractCreatedCascadeId(res);
+              if (cid || !cleanUri) {
+                return cid;
+              }
+              return callProxyJson(
+                ctx,
+                instanceUuid,
+                START_CASCADE_PATH,
+                DEFAULT_LS_METADATA_BODY,
+                1800
+              ).then(extractCreatedCascadeId);
+            })
+            .catch(function() {
+              if (!cleanUri) return null;
+              return callProxyJson(
+                ctx,
+                instanceUuid,
+                START_CASCADE_PATH,
+                DEFAULT_LS_METADATA_BODY,
+                1800
+              )
+                .then(extractCreatedCascadeId)
+                .catch(function() {
+                  return null;
+                });
+            });
+        })
+        .then(function(cascadeId) {
+          if (!cascadeId) {
+            return navigateIframeToNewChatOverview(
+              requestId,
+              instanceUuid,
+              targetUrl
+            );
+          }
+
+          scheduleRefresh(250);
+          var createdUrl = buildCascadeTargetUrl(targetUrl, cascadeId);
+          var route = parseRouteFromLocation();
+          var frame = findHubIframe();
+          if (
+            route.instanceUuid === instanceUuid &&
+            frame &&
+            frame.contentWindow &&
+            frame.src
+          ) {
+            try {
+              var frameOrigin = new URL(frame.src).origin;
+              frame.contentWindow.postMessage(
+                { jspbPayload: JSON.stringify([null, ['/c/' + cascadeId]]) },
+                frameOrigin
+              );
+              frame.contentWindow.postMessage(
+                { jspbPayload: JSON.stringify([null, null, []]) },
+                frameOrigin
+              );
+              syncHostLocationUrl(createdUrl);
+              setIframeCascadeOverride(cascadeId);
+              postToNative({
+                type: 'AGY_INBOX_START_CHAT_RESULT',
+                requestId: requestId,
+                handled: true,
+                cascadeId: cascadeId,
+                targetUrl: createdUrl
+              });
+              postToNative({
+                type: 'AGY_INBOX_ACTIVE_ROUTE',
+                activeUrl: createdUrl,
+                activeInstanceUuid: instanceUuid,
+                activeCascadeId: cascadeId
+              });
+              return true;
+            } catch (_) {}
+          }
+
+          postToNative({
+            type: 'AGY_INBOX_START_CHAT_RESULT',
+            requestId: requestId,
+            handled: false,
+            cascadeId: cascadeId,
+            targetUrl: createdUrl
+          });
+          return true;
+        })
+        .catch(function() {
+          return navigateIframeToNewChatOverview(
+            requestId,
+            instanceUuid,
+            targetUrl
+          );
+        });
+    }
+
     function extractCascadeIdFromIframePath(rawPath, frameSrc) {
       if (typeof rawPath !== 'string' || !rawPath) return null;
       var normalized = rawPath.indexOf('/') === 0 ? rawPath : '/' + rawPath;
@@ -1844,6 +2052,7 @@ export const INBOX_BRIDGE_SCRIPT = `
       scheduleRefresh: scheduleRefresh,
       markThreadRead: markThreadRead,
       fastNavigate: fastNavigate,
+      startProjectChat: startProjectChat,
       syncFullBleedWorkspace: syncFullBleedWorkspace,
       restoreHostChrome: restoreHostChrome,
       openHostSettings: openHostSettings,
@@ -1964,6 +2173,49 @@ export function buildOpenHostSettingsScript(): string {
       window.ReactNativeWebView.postMessage(JSON.stringify({
         type: 'AGY_INBOX_HOST_SETTINGS_RESULT',
         handled: false
+      }));
+    }
+  } catch (_) {}
+  return true;
+})();
+`;
+}
+
+export function buildStartProjectChatScript(params: {
+  requestId: string;
+  instanceUuid: string;
+  workspaceUri?: string | null;
+  targetUrl: string;
+}): string {
+  const serialized = JSON.stringify({
+    requestId: params.requestId,
+    instanceUuid: params.instanceUuid,
+    workspaceUri: params.workspaceUri ?? null,
+    targetUrl: params.targetUrl,
+  });
+
+  return `
+(function() {
+  var args = ${serialized};
+  try {
+    if (window.__agyInboxBridge && typeof window.__agyInboxBridge.startProjectChat === 'function') {
+      window.__agyInboxBridge.startProjectChat(
+        args.requestId,
+        args.instanceUuid,
+        args.workspaceUri,
+        args.targetUrl
+      );
+      return true;
+    }
+  } catch (_) {}
+  try {
+    if (window.ReactNativeWebView && typeof window.ReactNativeWebView.postMessage === 'function') {
+      window.ReactNativeWebView.postMessage(JSON.stringify({
+        type: 'AGY_INBOX_START_CHAT_RESULT',
+        requestId: args.requestId,
+        handled: false,
+        cascadeId: null,
+        targetUrl: args.targetUrl
       }));
     }
   } catch (_) {}
