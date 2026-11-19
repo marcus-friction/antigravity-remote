@@ -1,3 +1,3 @@
-• New Projects tab in the Sidebar: browse workspaces grouped by project across connected machines, expand/collapse threads, and tap + New to start a conversation in any project.
-• Easier drawer opening: wider 216dp × 44dp edge touch zone, expanded 200dp × 64dp Android gesture exclusion, and zero dead-zone between taps and short pull-right swipes.
-• Subtle first-use guidance: right-chevron grip and one-time animated Swipe hint that permanently dismisses once you open the drawer.
+• Fix software keyboard layout so the workspace and Sidebar sit flush above the keyboard without double push-up or bottom bar overlap across Android edge-to-edge and Chromium M139+ WebView.
+• Reliably hide and restore the drawer pull-handle and bottom mode bar across animated, floating, and split-screen keyboard transitions.
+• Pin full-bleed /r/<machine> workstation frames to the unobscured visual viewport while typing.
