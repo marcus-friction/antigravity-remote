@@ -20,12 +20,34 @@ class MainActivity : ReactActivity() {
 
     // Antigravity IME insets
     val contentView = findViewById<android.view.View>(android.R.id.content)
+    var lastImeVisible = false
     androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(contentView) { view, insets ->
+      val imeVisible = insets.isVisible(androidx.core.view.WindowInsetsCompat.Type.ime())
       val ime = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.ime())
-      val bars = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars())
-      view.setPadding(0, 0, 0, (ime.bottom - bars.bottom).coerceAtLeast(0))
-      insets
+      val imeBottom = ime.bottom.coerceAtLeast(0)
+      val paddingChanged = view.paddingBottom != imeBottom
+      if (paddingChanged) {
+        view.setPadding(0, 0, 0, imeBottom)
+      }
+      if (imeVisible != lastImeVisible) {
+        lastImeVisible = imeVisible
+        if (!paddingChanged) {
+          view.requestLayout()
+        }
+      }
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        androidx.core.view.WindowInsetsCompat.Builder(insets)
+          .setInsets(
+            androidx.core.view.WindowInsetsCompat.Type.ime(),
+            androidx.core.graphics.Insets.NONE,
+          )
+          .setVisible(androidx.core.view.WindowInsetsCompat.Type.ime(), false)
+          .build()
+      } else {
+        androidx.core.view.WindowInsetsCompat.CONSUMED
+      }
     }
+    // End Antigravity IME insets
   }
 
   /**

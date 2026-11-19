@@ -1761,7 +1761,7 @@ describe('Session and navigation regressions', () => {
     expect(mockWebViewMountCount).toBe(mountsBeforeFastSwitch + 1);
     expect(webView().props.source.uri).not.toContain('spoofed-workstation');
 
-    // 5. Reopen drawer, verify keyboard inset while open, and verify Android hardware Back closes drawer before WebView history
+    // 5. Reopen drawer, verify keyboard state while open (without duplicate JS bottom padding on Android), and verify Android hardware Back closes drawer before WebView history
     mockWebViewGoBack.mockClear();
     const reopenHandle = tree.root.findAll(
       (node) =>
@@ -1779,7 +1779,8 @@ describe('Session and navigation regressions', () => {
       }
     });
     expect(controls().props.visible).toBe(true);
-    expect(controls().props.keyboardBottomPadding).toBeGreaterThan(0);
+    expect(controls().props.isKeyboardVisible).toBe(true);
+    expect(controls().props.keyboardBottomPadding).toBe(0);
 
     await act(async () => {
       for (const listener of mockKeyboardHideListeners) {
@@ -3171,5 +3172,150 @@ describe('Session and navigation regressions', () => {
     expect(webView().props.source.uri).toBe(
       'https://antigravity.google.com/r/workstation-2?p=c%2Fgpu-cascade-7',
     );
+  });
+
+  it('prevents duplicate keyboard bottom padding on Android while preserving visibility state and iOS drawer-aware insets', async () => {
+    const RN = require('react-native');
+    const prevOS = RN.Platform.OS;
+
+    const findWebViewWrapperStyle = (targetTree: ReactTestRenderer) => {
+      const wv = targetTree.root.findByType('WebView' as any);
+      let cursor: any = wv.parent;
+      while (cursor && cursor.type !== 'View') {
+        cursor = cursor.parent;
+      }
+      return Array.isArray(cursor?.props?.style)
+        ? Object.assign({}, ...cursor.props.style.filter(Boolean))
+        : (cursor?.props?.style ?? {});
+    };
+
+    let iosTree!: ReactTestRenderer;
+    let androidTree!: ReactTestRenderer;
+    await act(async () => {
+      tree.unmount();
+    });
+    try {
+      // 1. iOS: WKWebView manages its own keyboard viewport without duplicate wrapper paddingBottom,
+      // while LeftNavigationDrawer receives docked keyboardBottomPadding (ignoring floating iPad keyboards)
+      RN.Platform.OS = 'ios';
+      await act(async () => {
+        iosTree = renderer.create(<App />);
+      });
+      const iosControls = () => iosTree.root.findByType(LeftNavigationDrawer);
+
+      await act(async () => {
+        for (const listener of mockKeyboardShowListeners) {
+          listener({ endCoordinates: { height: 320, screenY: 524 } });
+        }
+      });
+      expect(findWebViewWrapperStyle(iosTree).paddingBottom).toBeUndefined();
+      expect(iosControls().props.isKeyboardVisible).toBe(true);
+      expect(iosControls().props.keyboardBottomPadding).toBe(320);
+
+      // Floating / undocked iPadOS keyboard (`screenY + height < windowHeight - 24`) does not add phantom bottom padding
+      await act(async () => {
+        for (const listener of mockKeyboardShowListeners) {
+          listener({ endCoordinates: { height: 254, screenY: 320 } });
+        }
+      });
+      expect(iosControls().props.isKeyboardVisible).toBe(true);
+      expect(iosControls().props.keyboardBottomPadding).toBe(0);
+
+      await act(async () => {
+        for (const listener of mockKeyboardHideListeners) {
+          listener();
+        }
+      });
+      expect(iosControls().props.isKeyboardVisible).toBe(false);
+
+      // Open drawer on iOS and focus drawer input -> drawer gets keyboardBottomPadding, WebView wrapper never spikes on close
+      await act(async () => {
+        iosTree.root
+          .findAllByType('TouchableOpacity' as any)
+          .find(
+            (n) => n.props.accessibilityLabel === 'Open Antigravity drawer',
+          )!
+          .props.onPress();
+      });
+      mockWebViewInjectJavaScript.mockClear();
+      await act(async () => {
+        for (const listener of mockKeyboardShowListeners) {
+          listener({ endCoordinates: { height: 300 } });
+        }
+      });
+      expect(iosControls().props.visible).toBe(true);
+      expect(iosControls().props.isKeyboardVisible).toBe(true);
+      expect(iosControls().props.keyboardBottomPadding).toBe(300);
+      expect(findWebViewWrapperStyle(iosTree).paddingBottom).toBeUndefined();
+      expect(mockWebViewInjectJavaScript).not.toHaveBeenCalled();
+
+      // Closing the drawer while keyboard is still closing never applies a transient paddingBottom spike to webViewWrapper
+      await act(async () => {
+        iosControls().props.onClose();
+      });
+      expect(iosControls().props.visible).toBe(false);
+      expect(findWebViewWrapperStyle(iosTree).paddingBottom).toBeUndefined();
+
+      await act(async () => {
+        iosTree.unmount();
+      });
+      iosTree = undefined as any;
+
+      // 2. Android: native MainActivity handles IME padding & consumption, so JS never double-pads WebView or drawer,
+      // and Android 11+ animated IME Frame-1 `height: 0` events still mark keyboard as visible
+      RN.Platform.OS = 'android';
+      await act(async () => {
+        androidTree = renderer.create(<App />);
+      });
+      const androidControls = () =>
+        androidTree.root.findByType(LeftNavigationDrawer);
+
+      // Frame-1 animated IME show event on Android 11+ where height is still 0
+      await act(async () => {
+        for (const listener of mockKeyboardShowListeners) {
+          listener({ endCoordinates: { height: 0 } });
+        }
+      });
+      expect(androidControls().props.isKeyboardVisible).toBe(true);
+      expect(androidControls().props.keyboardBottomPadding).toBe(0);
+      expect(
+        findWebViewWrapperStyle(androidTree).paddingBottom,
+      ).toBeUndefined();
+      expect(
+        androidTree.root.findAll(
+          (node) =>
+            node.type === ('TouchableOpacity' as any) &&
+            node.props.accessibilityLabel === 'Open Antigravity drawer',
+        ),
+      ).toHaveLength(0);
+
+      // Full-height keyboardDidShow on Android also keeps JS padding at 0 (no double push-up)
+      await act(async () => {
+        for (const listener of mockKeyboardShowListeners) {
+          listener({ endCoordinates: { height: 324 } });
+        }
+      });
+      expect(androidControls().props.isKeyboardVisible).toBe(true);
+      expect(androidControls().props.keyboardBottomPadding).toBe(0);
+      expect(
+        findWebViewWrapperStyle(androidTree).paddingBottom,
+      ).toBeUndefined();
+
+      // Backgrounding clears stuck keyboard visibility if OS dismisses IME while paused
+      await act(async () => {
+        for (const listener of mockAppStateListeners) {
+          listener('background');
+        }
+      });
+      expect(androidControls().props.isKeyboardVisible).toBe(false);
+    } finally {
+      if (iosTree) {
+        await act(async () => iosTree.unmount());
+      }
+      if (androidTree) {
+        await act(async () => androidTree.unmount());
+      }
+      RN.Platform.OS = prevOS;
+    }
   });
 });

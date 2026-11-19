@@ -43,10 +43,20 @@ function checkNative(root) {
     signing.includes('signingConfig signingConfigs.release') &&
       signing.includes('throw new GradleException'),
   );
+  const mainActivity = read(
+    'android/app/src/main/java/com/frictionventures/antigravityremote/MainActivity.kt',
+  );
   assert(
-    read(
-      'android/app/src/main/java/com/frictionventures/antigravityremote/MainActivity.kt',
-    ).includes('// Antigravity IME insets'),
+    mainActivity.includes('// Antigravity IME insets') &&
+      mainActivity.includes('// End Antigravity IME insets') &&
+      mainActivity.includes('view.setPadding(0, 0, 0, imeBottom)') &&
+      mainActivity.includes('androidx.core.graphics.Insets.NONE') &&
+      mainActivity.includes(
+        '.setVisible(androidx.core.view.WindowInsetsCompat.Type.ime(), false)',
+      ) &&
+      mainActivity.includes('androidx.core.view.WindowInsetsCompat.CONSUMED') &&
+      !mainActivity.includes('ime.bottom - bars.bottom'),
+    'Missing or outdated Android IME inset consumption in MainActivity.kt',
   );
   const rules = read(
     'android/app/src/main/res/xml/remote_data_extraction_rules.xml',

@@ -11,6 +11,7 @@ const {
 } = require('expo/config-plugins');
 
 const KEYBOARD_TAG = '// Antigravity IME insets';
+const KEYBOARD_END_TAG = '// End Antigravity IME insets';
 
 module.exports = function withRemoteSecurity(config) {
   config = withAndroidManifest(config, (mod) => {
@@ -70,7 +71,55 @@ module.exports = function withRemoteSecurity(config) {
     return mod;
   });
   config = withMainActivity(config, (mod) => {
-    if (mod.modResults.contents.includes(KEYBOARD_TAG)) return mod;
+    const imeBlock = `${KEYBOARD_TAG}
+    val contentView = findViewById<android.view.View>(android.R.id.content)
+    var lastImeVisible = false
+    androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(contentView) { view, insets ->
+      val imeVisible = insets.isVisible(androidx.core.view.WindowInsetsCompat.Type.ime())
+      val ime = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.ime())
+      val imeBottom = ime.bottom.coerceAtLeast(0)
+      val paddingChanged = view.paddingBottom != imeBottom
+      if (paddingChanged) {
+        view.setPadding(0, 0, 0, imeBottom)
+      }
+      if (imeVisible != lastImeVisible) {
+        lastImeVisible = imeVisible
+        if (!paddingChanged) {
+          view.requestLayout()
+        }
+      }
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        androidx.core.view.WindowInsetsCompat.Builder(insets)
+          .setInsets(
+            androidx.core.view.WindowInsetsCompat.Type.ime(),
+            androidx.core.graphics.Insets.NONE,
+          )
+          .setVisible(androidx.core.view.WindowInsetsCompat.Type.ime(), false)
+          .build()
+      } else {
+        androidx.core.view.WindowInsetsCompat.CONSUMED
+      }
+    }
+    ${KEYBOARD_END_TAG}`;
+    if (mod.modResults.contents.includes(KEYBOARD_TAG)) {
+      if (mod.modResults.contents.includes(KEYBOARD_END_TAG)) {
+        mod.modResults.contents = mod.modResults.contents.replace(
+          /\/\/ Antigravity IME insets[\s\S]*?\/\/ End Antigravity IME insets/,
+          imeBlock,
+        );
+      } else {
+        mod.modResults.contents = mod.modResults.contents.replace(
+          /\/\/ Antigravity IME insets[\s\S]*?ViewCompat\.setOnApplyWindowInsetsListener\(contentView\)\s*\{[\s\S]*?\n\s*\}/,
+          imeBlock,
+        );
+      }
+      if (!mod.modResults.contents.includes(KEYBOARD_END_TAG)) {
+        throw new Error(
+          'Failed to update existing Antigravity IME block in MainActivity',
+        );
+      }
+      return mod;
+    }
     const anchor = 'super.onCreate(null)';
     if (!mod.modResults.contents.includes(anchor))
       throw new Error(
@@ -78,16 +127,7 @@ module.exports = function withRemoteSecurity(config) {
       );
     mod.modResults.contents = mod.modResults.contents.replace(
       anchor,
-      `${anchor}
-
-    ${KEYBOARD_TAG}
-    val contentView = findViewById<android.view.View>(android.R.id.content)
-    androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(contentView) { view, insets ->
-      val ime = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.ime())
-      val bars = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars())
-      view.setPadding(0, 0, 0, (ime.bottom - bars.bottom).coerceAtLeast(0))
-      insets
-    }`,
+      `${anchor}\n\n    ${imeBlock}`,
     );
     return mod;
   });

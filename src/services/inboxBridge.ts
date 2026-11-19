@@ -1367,15 +1367,79 @@ export const INBOX_BRIDGE_SCRIPT = `
       }
 
       if (hasStyleApi(frame)) {
+        var vv = window.visualViewport;
+        var vvScale =
+          vv && typeof vv.scale === 'number' && isFinite(vv.scale) ? vv.scale : 1;
+        var vvHeight =
+          vv &&
+          typeof vv.height === 'number' &&
+          isFinite(vv.height) &&
+          vv.height > 0
+            ? vv.height
+            : 0;
+        var vvWidth =
+          vv &&
+          typeof vv.width === 'number' &&
+          isFinite(vv.width) &&
+          vv.width > 0
+            ? vv.width
+            : 0;
+        var vvTop =
+          vv && typeof vv.offsetTop === 'number' && isFinite(vv.offsetTop)
+            ? Math.max(0, vv.offsetTop)
+            : 0;
+        var vvLeft =
+          vv && typeof vv.offsetLeft === 'number' && isFinite(vv.offsetLeft)
+            ? Math.max(0, vv.offsetLeft)
+            : 0;
+        var innerH =
+          typeof window.innerHeight === 'number' &&
+          isFinite(window.innerHeight) &&
+          window.innerHeight > 0
+            ? window.innerHeight
+            : 0;
+        var innerW =
+          typeof window.innerWidth === 'number' &&
+          isFinite(window.innerWidth) &&
+          window.innerWidth > 0
+            ? window.innerWidth
+            : 0;
+        var useVisualBounds =
+          Math.abs(vvScale - 1) < 0.05 &&
+          vvHeight > 0 &&
+          innerH > 0 &&
+          (innerH - vvHeight > 2 ||
+            vvTop > 1 ||
+            (vvWidth > 0 && innerW - vvWidth > 2) ||
+            vvLeft > 1);
+
         recordAndSetStyle(frame, 'position', 'fixed', 'important');
-        recordAndSetStyle(frame, 'top', '0px', 'important');
-        recordAndSetStyle(frame, 'left', '0px', 'important');
-        recordAndSetStyle(frame, 'right', '0px', 'important');
-        recordAndSetStyle(frame, 'bottom', '0px', 'important');
-        recordAndSetStyle(frame, 'width', '100%', 'important');
-        recordAndSetStyle(frame, 'height', '100%', 'important');
-        recordAndSetStyle(frame, 'max-width', '100%', 'important');
-        recordAndSetStyle(frame, 'max-height', '100%', 'important');
+        if (useVisualBounds) {
+          var heightPx = Math.round(vvHeight) + 'px';
+          var widthPx = vvWidth > 0 ? Math.round(vvWidth) + 'px' : '100%';
+          recordAndSetStyle(frame, 'top', Math.round(vvTop) + 'px', 'important');
+          recordAndSetStyle(
+            frame,
+            'left',
+            Math.round(vvLeft) + 'px',
+            'important'
+          );
+          recordAndSetStyle(frame, 'right', 'auto', 'important');
+          recordAndSetStyle(frame, 'bottom', 'auto', 'important');
+          recordAndSetStyle(frame, 'width', widthPx, 'important');
+          recordAndSetStyle(frame, 'height', heightPx, 'important');
+          recordAndSetStyle(frame, 'max-width', widthPx, 'important');
+          recordAndSetStyle(frame, 'max-height', heightPx, 'important');
+        } else {
+          recordAndSetStyle(frame, 'top', '0px', 'important');
+          recordAndSetStyle(frame, 'left', '0px', 'important');
+          recordAndSetStyle(frame, 'right', '0px', 'important');
+          recordAndSetStyle(frame, 'bottom', '0px', 'important');
+          recordAndSetStyle(frame, 'width', '100%', 'important');
+          recordAndSetStyle(frame, 'height', '100%', 'important');
+          recordAndSetStyle(frame, 'max-width', '100%', 'important');
+          recordAndSetStyle(frame, 'max-height', '100%', 'important');
+        }
         recordAndSetStyle(frame, 'margin', '0px', 'important');
         recordAndSetStyle(frame, 'border', '0px', 'important');
         recordAndSetStyle(frame, 'z-index', '990', 'important');
@@ -2014,6 +2078,26 @@ export const INBOX_BRIDGE_SCRIPT = `
       }
     } catch (_) {}
 
+    function onVisualViewportChange() {
+      if (!isStopped) {
+        syncFullBleedWorkspace();
+      }
+    }
+
+    try {
+      if (
+        window.visualViewport &&
+        typeof window.visualViewport.addEventListener === 'function'
+      ) {
+        window.visualViewport.addEventListener('resize', onVisualViewportChange, {
+          passive: true
+        });
+        window.visualViewport.addEventListener('scroll', onVisualViewportChange, {
+          passive: true
+        });
+      }
+    } catch (_) {}
+
     syncFullBleedWorkspace();
 
     window.addEventListener('focus', function() {
@@ -2067,6 +2151,21 @@ export const INBOX_BRIDGE_SCRIPT = `
             domObserver.disconnect();
           } catch (_) {}
         }
+        try {
+          if (
+            window.visualViewport &&
+            typeof window.visualViewport.removeEventListener === 'function'
+          ) {
+            window.visualViewport.removeEventListener(
+              'resize',
+              onVisualViewportChange
+            );
+            window.visualViewport.removeEventListener(
+              'scroll',
+              onVisualViewportChange
+            );
+          }
+        } catch (_) {}
         restoreHostChrome();
       }
     };

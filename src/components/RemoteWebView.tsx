@@ -7,13 +7,13 @@ import {
   BackHandler,
   Keyboard,
   KeyboardEvent,
-  LayoutChangeEvent,
   PermissionsAndroid,
   Platform,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
+  useWindowDimensions,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
@@ -102,8 +102,12 @@ import { TopStatusBanner } from './TopStatusBanner';
  */
 const KEYBOARD_ADAPTATION_SCRIPT = `
 (function() {
-  if (window.__agyKeyboardAssistInstalled) return true;
-  window.__agyKeyboardAssistInstalled = true;
+  if (
+    !window.location ||
+    (window.location.protocol !== 'https:' && window.location.protocol !== 'about:')
+  ) {
+    return true;
+  }
 
   function isEditableElement(el) {
     if (!el || !el.tagName) return false;
@@ -114,19 +118,92 @@ const KEYBOARD_ADAPTATION_SCRIPT = `
     return role === 'textbox' || role === 'combobox' || role === 'searchbox';
   }
 
+  function isAxisLocked(el) {
+    if (!el) return false;
+    var inlineOv = (el.style && (el.style.overflowY || el.style.overflow)) || '';
+    if (inlineOv === 'hidden' || inlineOv === 'clip') return true;
+    if (typeof window.getComputedStyle === 'function') {
+      try {
+        var cs = window.getComputedStyle(el);
+        var oy = (cs && (cs.overflowY || cs.overflow)) || '';
+        if (oy === 'hidden' || oy === 'clip') return true;
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  function isDocumentScrollLocked() {
+    return Boolean(
+      document &&
+        (isAxisLocked(document.body) || isAxisLocked(document.documentElement))
+    );
+  }
+
+  function hasOverflowHiddenAncestor(el) {
+    var cursor = el ? el.parentElement : null;
+    while (
+      cursor &&
+      cursor !== document.body &&
+      cursor !== document.documentElement
+    ) {
+      if (isAxisLocked(cursor)) {
+        return true;
+      }
+      cursor = cursor.parentElement;
+    }
+    return false;
+  }
+
   function keepActiveInputVisible() {
-    var active = document.activeElement;
-    if (!isEditableElement(active)) return;
     try {
+      if (isDocumentScrollLocked()) {
+        var vv = window.visualViewport;
+        var vvOffset = vv && typeof vv.offsetTop === 'number' ? vv.offsetTop : 0;
+        if (vvOffset <= 0) {
+          var se =
+            document.scrollingElement ||
+            document.documentElement ||
+            document.body;
+          if (
+            window.scrollY > 0 ||
+            window.pageYOffset > 0 ||
+            (se && se.scrollTop > 0)
+          ) {
+            window.scrollTo(0, 0);
+          }
+        }
+        return;
+      }
+      var active = document.activeElement;
+      if (!isEditableElement(active) || hasOverflowHiddenAncestor(active)) {
+        return;
+      }
+      if (typeof active.getBoundingClientRect === 'function') {
+        var rect = active.getBoundingClientRect();
+        var vh =
+          (window.visualViewport && window.visualViewport.height) ||
+          window.innerHeight ||
+          0;
+        if (vh > 0 && rect.top >= 0 && rect.bottom <= vh) {
+          return;
+        }
+      }
       active.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     } catch (_) {}
   }
 
   function scheduleScrollSync() {
     keepActiveInputVisible();
-    setTimeout(keepActiveInputVisible, 80);
-    setTimeout(keepActiveInputVisible, 220);
+    setTimeout(keepActiveInputVisible, 100);
+    setTimeout(keepActiveInputVisible, 260);
   }
+
+  if (typeof window.__agyKeyboardAssistSchedule === 'function') {
+    window.__agyKeyboardAssistSchedule();
+    return true;
+  }
+  window.__agyKeyboardAssistInstalled = true;
+  window.__agyKeyboardAssistSchedule = scheduleScrollSync;
 
   document.addEventListener('focusin', scheduleScrollSync, true);
   window.addEventListener('resize', scheduleScrollSync, { passive: true });
@@ -298,13 +375,15 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   onOpenInboxConsumed,
 }) => {
   const insets = useSafeAreaInsets();
+  const { height: windowHeight } = useWindowDimensions();
+  const windowHeightRef = useRef<number>(windowHeight);
+  windowHeightRef.current = windowHeight;
   const initialIsForeground =
     AppState.currentState !== 'background' &&
     AppState.currentState !== 'inactive';
   const webViewRef = useRef<WebView | null>(null);
   const hydratedRef = useRef(false);
   const canGoBackRef = useRef<boolean>(false);
-  const uncompressedHeightRef = useRef<number>(0);
   const cookieRecoveryAttemptsRef = useRef<number>(0);
   const isResettingSessionRef = useRef(false);
   const currentNavUrlRef = useRef<string>(ANTIGRAVITY_DASHBOARD_URL);
@@ -387,7 +466,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const [initializationAttempt, setInitializationAttempt] = useState(0);
   const [pageError, setPageError] = useState<string | null>(null);
   const [rawKeyboardHeight, setRawKeyboardHeight] = useState<number>(0);
-  const [rootLayoutHeight, setRootLayoutHeight] = useState<number>(0);
+  const [isKeyboardOpen, setIsKeyboardOpen] = useState<boolean>(false);
 
   const syncCookiesToVault = useCallback(async () => {
     if (!hydratedRef.current || isResettingSessionRef.current) return;
@@ -773,6 +852,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           }
           if (nextAppState === 'background') {
             wasBackgroundedRef.current = true;
+            setIsKeyboardOpen(false);
+            setRawKeyboardHeight(0);
           }
           if (isAppForegroundRef.current) {
             const currentSnap = inboxSnapshotRef.current;
@@ -922,12 +1003,43 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
 
     const onKeyboardShow = (event: KeyboardEvent) => {
-      const height = event?.endCoordinates?.height ?? 0;
-      setRawKeyboardHeight(height > 0 ? height : 0);
-      webViewRef.current?.injectJavaScript(KEYBOARD_ADAPTATION_SCRIPT);
+      const coords = event?.endCoordinates;
+      const height = coords?.height ?? 0;
+      const sanitizedHeight = height > 0 ? height : 0;
+      if (Platform.OS === 'android') {
+        setRawKeyboardHeight(sanitizedHeight);
+        setIsKeyboardOpen(true);
+      } else {
+        const winHeight = windowHeightRef.current;
+        const screenY = coords?.screenY;
+        let dockedOverlap = sanitizedHeight;
+        if (
+          sanitizedHeight > 0 &&
+          typeof screenY === 'number' &&
+          Number.isFinite(screenY) &&
+          winHeight > 0
+        ) {
+          // Floating or undocked iPadOS keyboards sit above the bottom of the window
+          // and do not dock against the bottom edge.
+          if (screenY + sanitizedHeight < winHeight - 24) {
+            dockedOverlap = 0;
+          } else {
+            dockedOverlap = Math.max(
+              0,
+              Math.min(sanitizedHeight, winHeight - screenY),
+            );
+          }
+        }
+        setRawKeyboardHeight(dockedOverlap);
+        setIsKeyboardOpen(sanitizedHeight > 0);
+      }
+      if (!isDrawerOpenRef.current) {
+        webViewRef.current?.injectJavaScript(KEYBOARD_ADAPTATION_SCRIPT);
+      }
     };
 
     const onKeyboardHide = () => {
+      setIsKeyboardOpen(false);
       setRawKeyboardHeight(0);
     };
 
@@ -990,38 +1102,17 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     };
   }, [markThreadReadInWorkstationClock, recomputeSnapshotWithLocalState]);
 
-  const handleRootLayout = useCallback(
-    (event: LayoutChangeEvent) => {
-      const measuredHeight = event?.nativeEvent?.layout?.height ?? 0;
-      if (measuredHeight <= 0) {
-        return;
-      }
-      setRootLayoutHeight(measuredHeight);
-      if (
-        rawKeyboardHeight === 0 ||
-        measuredHeight > uncompressedHeightRef.current
-      ) {
-        uncompressedHeightRef.current = measuredHeight;
-      }
-    },
-    [rawKeyboardHeight],
-  );
-
-  // Calculate how much bottom inset the WebView needs when the keyboard is open.
-  // On Android 15/16 (targetSdk 36) edge-to-edge and iOS, the native root view
-  // does not shrink automatically (`nativeShrinkAmount === 0`), so we pad the
-  // bottom of `webViewWrapper` by the exact keyboard height minus safe area bottom.
-  const nativeShrinkAmount =
-    uncompressedHeightRef.current > 0 && rootLayoutHeight > 0
-      ? Math.max(0, uncompressedHeightRef.current - rootLayoutHeight)
-      : 0;
-
+  // On Android, MainActivity's WindowInsets listener already pads android.R.id.content
+  // by the exact IME bottom inset and zeroes Type.ime() before it reaches the WebView.
+  // On iOS, WKWebView natively manages its own scroll insets and visualViewport (with
+  // INBOX_BRIDGE_SCRIPT pinning promoted full-bleed workstation iframes to visualViewport),
+  // so only the native LeftNavigationDrawer overlay needs a docked iOS keyboard offset.
   const keyboardBottomPadding =
-    rawKeyboardHeight > 0
-      ? Math.max(0, rawKeyboardHeight - nativeShrinkAmount - insets.bottom)
+    Platform.OS === 'ios' && rawKeyboardHeight > 0
+      ? Math.max(0, rawKeyboardHeight - insets.bottom)
       : 0;
 
-  const isKeyboardVisible = rawKeyboardHeight > 0;
+  const isKeyboardVisible = isKeyboardOpen || rawKeyboardHeight > 0;
 
   const beginSessionReset = useCallback(
     (reason: 'signout' | 'recovery') => {
@@ -1424,6 +1515,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         resumeReadSettleTimerRef.current = null;
       }
       handleDismissDrawerGuidance();
+      Keyboard.dismiss?.();
       const resolvedMode: DrawerMode =
         preferredMode ??
         (stageRef.current === 'authenticated' ? 'inbox' : 'settings');
@@ -1601,6 +1693,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     }
     setDrawerInitialMode('inbox');
     setFocusInboxRequestKey((prev) => prev + 1);
+    Keyboard.dismiss?.();
     isDrawerOpenRef.current = true;
     setIsDrawerOpen(true);
     recomputeSnapshotWithLocalState({ isDrawerOpen: true });
@@ -1998,17 +2091,10 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   }
 
   return (
-    <View style={styles.root} onLayout={handleRootLayout}>
+    <View style={styles.root}>
       <TopStatusBanner stage={stage} onRetryPress={handleReloadSession} />
 
-      <View
-        style={[
-          styles.webViewWrapper,
-          keyboardBottomPadding > 0
-            ? { paddingBottom: keyboardBottomPadding }
-            : null,
-        ]}
-      >
+      <View style={styles.webViewWrapper}>
         <WebView
           key={`agy-webview-${webViewInstanceKey}`}
           ref={webViewRef}

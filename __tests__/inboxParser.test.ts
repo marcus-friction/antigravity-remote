@@ -1460,6 +1460,17 @@ describe('inboxParser', () => {
           postedMessages.push(JSON.parse(raw));
         },
       },
+      innerWidth: 390,
+      innerHeight: 760,
+      visualViewport: {
+        width: 390,
+        height: 760,
+        offsetTop: 0,
+        offsetLeft: 0,
+        scale: 1,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      },
     };
     const documentObj: any = {
       cookie: '',
@@ -1568,6 +1579,24 @@ describe('inboxParser', () => {
     expect(menuPopover.style.getPropertyValue('display')).toBe('');
     expect(menuPopover.style.getPropertyValue('position')).toBe('relative');
     expect(menuPopover.style.getPropertyValue('z-index')).toBe('2000');
+
+    // 2c. When software keyboard shrinks/scrolls `visualViewport` (e.g. iOS WKWebView),
+    // `syncFullBleedWorkspace()` pins the promoted iframe to the unobscured visualViewport
+    // and restores `100%` once the keyboard closes
+    windowObj.visualViewport.height = 458;
+    windowObj.visualViewport.offsetTop = 24;
+    windowObj.__agyInboxBridge.syncFullBleedWorkspace();
+    expect(hubIframe.style.getPropertyValue('top')).toBe('24px');
+    expect(hubIframe.style.getPropertyValue('height')).toBe('458px');
+    expect(hubIframe.style.getPropertyValue('max-height')).toBe('458px');
+    expect(hubIframe.style.getPropertyValue('bottom')).toBe('auto');
+
+    windowObj.visualViewport.height = 760;
+    windowObj.visualViewport.offsetTop = 0;
+    windowObj.__agyInboxBridge.syncFullBleedWorkspace();
+    expect(hubIframe.style.getPropertyValue('top')).toBe('0px');
+    expect(hubIframe.style.getPropertyValue('height')).toBe('100%');
+    expect(hubIframe.style.getPropertyValue('bottom')).toBe('0px');
 
     // 3. Navigating back to `/` (All Machines overview) restores all original inline styles
     currentLocation.pathname = '/';
