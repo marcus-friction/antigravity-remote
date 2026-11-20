@@ -1,3 +1,3 @@
-• Show the active project name directly in the thread header above the conversation title so you always know which project you are in.
-• Tap the project name in the thread header to jump straight to the Projects tab in the sidebar.
-• Automatically tracks project context across thread switches, subagent views, and newly started project chats.
+• Fix premature completion notifications when an agent finishes its turn while background commands, timers, workflows, or subagents are still running.
+• Track live non-daemon background tasks across connected workstations (while still notifying normally when only long-running daemons like dev servers remain).
+• Keep nested subagents, hidden tool tasks, and active Battle Mode runs in Working status until all work truly completes, and skip notifications for user-canceled runs.
