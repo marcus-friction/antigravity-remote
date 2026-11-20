@@ -1,5 +1,6 @@
 import { ANTIGRAVITY_DASHBOARD_URL } from '../constants/config';
 import {
+  ActiveThreadProjectContext,
   DirectoryEntry,
   InboxAttentionKind,
   InboxBridgeMessage,
@@ -28,6 +29,7 @@ const MAX_USAGE_BUCKETS_PER_GROUP = 16;
 const MAX_USAGE_MODELS = 48;
 const MAX_USAGE_CREDITS = 12;
 const MAX_TRACKED_TRANSITION_ENTRIES = 500;
+const MAX_SUBAGENT_PARENT_ENTRIES = 1000;
 const SAFE_ID_PATTERN = /^[a-zA-Z0-9._-]+$/;
 
 /**
@@ -212,6 +214,48 @@ export function extractActiveRouteFromUrl(rawUrl?: string | null): {
     return { instanceUuid: null, cascadeId: null };
   } catch {
     return { instanceUuid: null, cascadeId: null };
+  }
+}
+
+/**
+ * Extracts an explicit `project` query parameter from an `https://antigravity.google.com`
+ * host URL or its nested `p` child path (e.g. `?p=c%2F<cascadeId>%3Fproject%3D<projectId>`).
+ */
+export function extractProjectIdFromUrl(rawUrl?: string | null): string | null {
+  if (!rawUrl || typeof rawUrl !== 'string') {
+    return null;
+  }
+  const sanitizeProjectId = (candidate: string | null): string | null => {
+    if (!candidate) return null;
+    const trimmed = candidate.trim();
+    if (
+      !trimmed ||
+      trimmed === 'outside-of-project' ||
+      !SAFE_ID_PATTERN.test(trimmed)
+    ) {
+      return null;
+    }
+    return trimmed;
+  };
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.hostname.toLowerCase() !== 'antigravity.google.com') {
+      return null;
+    }
+    const direct = sanitizeProjectId(parsed.searchParams.get('project'));
+    if (direct) {
+      return direct;
+    }
+    const childParam = parsed.searchParams.get('p') ?? '';
+    const queryIdx = childParam.indexOf('?');
+    if (queryIdx !== -1) {
+      const childQuery = childParam.slice(queryIdx + 1).split('#')[0];
+      const childParams = new URLSearchParams(childQuery);
+      return sanitizeProjectId(childParams.get('project'));
+    }
+    return null;
+  } catch {
+    return null;
   }
 }
 
@@ -605,6 +649,7 @@ function parseTrajectoriesForSource(params: {
   completedUnreadAtByThreadId?: Readonly<Record<string, number>>;
   isAppForeground?: boolean;
   isDrawerOpen?: boolean;
+  subagentParentByKey?: Record<string, string>;
 }): InboxThreadItem[] {
   const {
     source,
@@ -619,6 +664,7 @@ function parseTrajectoriesForSource(params: {
     completedUnreadAtByThreadId = {},
     isAppForeground = true,
     isDrawerOpen = false,
+    subagentParentByKey,
   } = params;
 
   const map = unwrapTrajectoryMap(rawTrajectories);
@@ -639,7 +685,7 @@ function parseTrajectoriesForSource(params: {
 
   // Pass 1: Bubble child subagent waiting prompts and running states up to their parent conversation.
   const bubbledByParentCascadeId = new Map<string, BubbledChildInfo>();
-  for (const [, raw] of entries) {
+  for (const [childCascadeId, raw] of entries) {
     const metadata = isRecord(raw.trajectoryMetadata)
       ? raw.trajectoryMetadata
       : isRecord(raw.trajectory_metadata)
@@ -652,13 +698,29 @@ function parseTrajectoriesForSource(params: {
       continue;
     }
 
+    const parentCascadeId =
+      trajectoryIdToCascadeId.get(rawParentId) ?? rawParentId;
+    if (
+      subagentParentByKey &&
+      Object.keys(subagentParentByKey).length < MAX_SUBAGENT_PARENT_ENTRIES
+    ) {
+      subagentParentByKey[`${instanceUuid}:${childCascadeId}`] =
+        parentCascadeId;
+      const childTrajId = raw.trajectoryId ?? raw.trajectory_id;
+      if (
+        typeof childTrajId === 'string' &&
+        childTrajId !== childCascadeId &&
+        SAFE_ID_PATTERN.test(childTrajId) &&
+        Object.keys(subagentParentByKey).length < MAX_SUBAGENT_PARENT_ENTRIES
+      ) {
+        subagentParentByKey[`${instanceUuid}:${childTrajId}`] = parentCascadeId;
+      }
+    }
+
     const killed = Boolean(raw.killed);
     if (killed) {
       continue;
     }
-
-    const parentCascadeId =
-      trajectoryIdToCascadeId.get(rawParentId) ?? rawParentId;
     const waitingSteps = Array.isArray(raw.waitingSteps)
       ? raw.waitingSteps
       : Array.isArray(raw.waiting_steps)
@@ -1926,6 +1988,7 @@ export function buildInboxSnapshot(
   const instances: InboxInstanceSummary[] = [];
   const allThreads: InboxThreadItem[] = [];
   const allProjects: InboxServerProject[] = [];
+  const subagentParentByKey: Record<string, string> = {};
   const seenInstanceUuids = new Set<string>();
 
   for (const rawInst of message.instances.slice(0, MAX_INSTANCES_PER_SNAPSHOT)) {
@@ -1993,6 +2056,7 @@ export function buildInboxSnapshot(
           completedUnreadAtByThreadId,
           isAppForeground,
           isDrawerOpen,
+          subagentParentByKey,
         }),
       );
     }
@@ -2013,6 +2077,7 @@ export function buildInboxSnapshot(
         completedUnreadAtByThreadId,
         isAppForeground,
         isDrawerOpen,
+        subagentParentByKey,
       }),
     );
   }
@@ -2039,10 +2104,13 @@ export function buildInboxSnapshot(
       ? message.fetchedAtMs
       : Date.now();
 
+  const hasSubagentParents = Object.keys(subagentParentByKey).length > 0;
+
   return {
     instances,
     threads: allThreads,
     projects: allProjects,
+    ...(hasSubagentParents ? { subagentParentByKey } : {}),
     fetchedAtMs: resolvedFetchedAtMs,
     activeInstanceUuid,
     activeCascadeId,
@@ -2572,6 +2640,213 @@ export function buildProjectGroups(
   });
 
   return groups;
+}
+
+export interface PendingThreadProjectFallback {
+  instanceUuid: string;
+  cascadeId: string | null;
+  projectId: string | null;
+  projectName: string;
+}
+
+/**
+ * Resolves the active thread's display project context for the thread header,
+ * matching server projects (`ListProjects`/`ReadProjects` & `GetWorkspaceInfos`),
+ * trajectory workspace metadata, parent threads for active subagents, URL
+ * `?project=` params, and newly-created thread fallbacks.
+ */
+export function resolveActiveThreadProject(
+  snapshot: InboxSnapshot,
+  options?: {
+    activeUrl?: string | null;
+    fallbackProject?: PendingThreadProjectFallback | null;
+  },
+): ActiveThreadProjectContext | null {
+  const activeInstanceUuid = snapshot.activeInstanceUuid;
+  const activeCascadeId = snapshot.activeCascadeId;
+  if (!activeInstanceUuid || !activeCascadeId) {
+    return null;
+  }
+
+  const candidateIds: string[] = [activeCascadeId];
+  const subagentParents = snapshot.subagentParentByKey;
+  if (subagentParents) {
+    const visited = new Set<string>([activeCascadeId]);
+    let cursor = activeCascadeId;
+    for (let depth = 0; depth < 6; depth++) {
+      const parentId = subagentParents[`${activeInstanceUuid}:${cursor}`];
+      if (!parentId || visited.has(parentId)) {
+        break;
+      }
+      visited.add(parentId);
+      candidateIds.push(parentId);
+      cursor = parentId;
+    }
+  }
+
+  let resolvedThread: InboxThreadItem | undefined;
+  for (const cid of candidateIds) {
+    resolvedThread = snapshot.threads.find(
+      (t) =>
+        t.instanceUuid === activeInstanceUuid &&
+        (t.cascadeId === cid || t.trajectoryId === cid),
+    );
+    if (resolvedThread) {
+      break;
+    }
+  }
+
+  const lookupIds = new Set<string>(candidateIds);
+  if (resolvedThread) {
+    lookupIds.add(resolvedThread.cascadeId);
+    lookupIds.add(resolvedThread.trajectoryId);
+  }
+
+  const instanceProjects = (snapshot.projects ?? []).filter(
+    (proj) => proj.instanceUuid === activeInstanceUuid,
+  );
+  const nonArchivedProjects = instanceProjects.filter((proj) => !proj.archived);
+  const archivedProjects = instanceProjects.filter((proj) => proj.archived);
+
+  const matchProjectForThread = (
+    projects: readonly InboxServerProject[],
+  ): InboxServerProject | undefined => {
+    if (projects.length === 0) {
+      return undefined;
+    }
+    if (resolvedThread?.projectId) {
+      const byProjectId = projects.find(
+        (proj) => proj.projectId === resolvedThread.projectId,
+      );
+      if (byProjectId) {
+        return byProjectId;
+      }
+    }
+    const byConversationId = projects.find((proj) =>
+      proj.conversationIds.some((cid) => lookupIds.has(cid)),
+    );
+    if (byConversationId) {
+      return byConversationId;
+    }
+    if (resolvedThread?.workspaceUri) {
+      const targetUriKey = normalizeWorkspaceUriKey(resolvedThread.workspaceUri);
+      if (targetUriKey) {
+        const byWorkspaceUri = projects.find((proj) =>
+          proj.workspaceUris.some(
+            (uri) => normalizeWorkspaceUriKey(uri) === targetUriKey,
+          ),
+        );
+        if (byWorkspaceUri) {
+          return byWorkspaceUri;
+        }
+      }
+    }
+    if (resolvedThread?.workspaceName) {
+      const targetName = resolvedThread.workspaceName.trim().toLowerCase();
+      if (targetName) {
+        const nameMatches = projects.filter((proj) => {
+          if (proj.name.trim().toLowerCase() === targetName) {
+            return true;
+          }
+          return proj.workspaceUris.some((uri) => {
+            const seg = extractLastSegmentFromUri(uri);
+            return seg ? seg.trim().toLowerCase() === targetName : false;
+          });
+        });
+        if (nameMatches.length === 1) {
+          return nameMatches[0];
+        }
+      }
+    }
+    return undefined;
+  };
+
+  let matchedServerProject =
+    matchProjectForThread(nonArchivedProjects) ??
+    matchProjectForThread(archivedProjects);
+
+  if (!matchedServerProject && options?.activeUrl) {
+    const urlProjectId = extractProjectIdFromUrl(options.activeUrl);
+    if (urlProjectId) {
+      matchedServerProject =
+        nonArchivedProjects.find((proj) => proj.projectId === urlProjectId) ??
+        archivedProjects.find((proj) => proj.projectId === urlProjectId);
+    }
+  }
+
+  const instanceName =
+    resolvedThread?.instanceName ??
+    snapshot.instances.find((inst) => inst.uuid === activeInstanceUuid)?.name ??
+    (activeInstanceUuid === '__cloud__' ? 'Cloud Agent' : null);
+
+  const rawFallback = options?.fallbackProject ?? null;
+  const matchingFallback =
+    rawFallback &&
+    rawFallback.instanceUuid === activeInstanceUuid &&
+    (rawFallback.cascadeId === null ||
+      lookupIds.has(rawFallback.cascadeId)) &&
+    rawFallback.projectName.trim().length > 0
+      ? rawFallback
+      : null;
+
+  if (matchedServerProject) {
+    return {
+      instanceUuid: activeInstanceUuid,
+      cascadeId: activeCascadeId,
+      projectId: matchedServerProject.projectId,
+      projectName: truncateText(matchedServerProject.name, 72),
+      instanceName,
+    };
+  }
+
+  if (resolvedThread) {
+    const workspaceLabel =
+      resolvedThread.workspaceName ??
+      extractLastSegmentFromUri(resolvedThread.workspaceUri);
+    if (workspaceLabel) {
+      return {
+        instanceUuid: activeInstanceUuid,
+        cascadeId: activeCascadeId,
+        projectId: resolvedThread.projectId ?? null,
+        projectName: truncateText(workspaceLabel, 72),
+        instanceName,
+      };
+    }
+    if (matchingFallback) {
+      return {
+        instanceUuid: activeInstanceUuid,
+        cascadeId: activeCascadeId,
+        projectId: matchingFallback.projectId,
+        projectName: truncateText(matchingFallback.projectName, 72),
+        instanceName,
+      };
+    }
+    const fallbackDisplay =
+      resolvedThread.source === 'cloud'
+        ? 'Cloud Agent'
+        : resolvedThread.instanceName;
+    if (fallbackDisplay && fallbackDisplay.trim()) {
+      return {
+        instanceUuid: activeInstanceUuid,
+        cascadeId: activeCascadeId,
+        projectId: resolvedThread.projectId ?? null,
+        projectName: truncateText(fallbackDisplay, 72),
+        instanceName,
+      };
+    }
+  }
+
+  if (matchingFallback) {
+    return {
+      instanceUuid: activeInstanceUuid,
+      cascadeId: activeCascadeId,
+      projectId: matchingFallback.projectId,
+      projectName: truncateText(matchingFallback.projectName, 72),
+      instanceName,
+    };
+  }
+
+  return null;
 }
 
 /**

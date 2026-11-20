@@ -38,6 +38,7 @@ import {
   buildMarkThreadReadScript,
   buildOpenHostSettingsScript,
   buildStartProjectChatScript,
+  buildSyncThreadContextScript,
 } from '../services/inboxBridge';
 import {
   PROJECT_OVERVIEW_SCROLL_SCRIPT,
@@ -67,6 +68,7 @@ import {
   syncNativeActionNotification,
 } from '../services/webData';
 import {
+  ActiveThreadProjectContext,
   CreateProjectRequestParams,
   CreateProjectResult,
   DirectoryListingResult,
@@ -82,6 +84,7 @@ import {
 } from '../types/session';
 import { buildActionNotificationSyncState } from '../utils/actionNotification';
 import {
+  PendingThreadProjectFallback,
   applyLocalStateToSnapshot,
   buildInboxSnapshot,
   extractAccountPathPrefix,
@@ -89,6 +92,7 @@ import {
   parseInboxBridgeMessage,
   reconcileRunningThreadTransitions,
   resolveActiveRouteFromBridgeMessage,
+  resolveActiveThreadProject,
 } from '../utils/inboxParser';
 import {
   isGoogleCookieErrorUrl,
@@ -458,6 +462,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const isComposingNewThreadRef = useRef<boolean>(false);
   const wasAuthenticatedRef = useRef<boolean>(false);
   const drawerBackInterceptorRef = useRef<(() => boolean) | null>(null);
+  const activeThreadProjectRef = useRef<ActiveThreadProjectContext | null>(null);
+  const lastSyncedThreadProjectSigRef = useRef<string | null>(null);
 
   const [isHydrated, setIsHydrated] = useState<boolean>(false);
   const [keepAliveMinutes, setKeepAliveMinutes] = useState<KeepAliveMinutes>(
@@ -484,6 +490,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const [isInboxRefreshing, setIsInboxRefreshing] = useState<boolean>(false);
   const [inboxSnapshot, setInboxSnapshot] =
     useState<InboxSnapshot>(EMPTY_INBOX_SNAPSHOT);
+  const [pendingThreadProject, setPendingThreadProject] =
+    useState<PendingThreadProjectFallback | null>(null);
   const [webViewInstanceKey, setWebViewInstanceKey] = useState<number>(1);
   const [resetRequest, setResetRequest] = useState<{
     reason: 'signout' | 'recovery';
@@ -639,6 +647,27 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       }
       canReturnToOverviewRef.current =
         lastObservedOverviewInstanceRef.current === instanceUuid;
+    },
+    [],
+  );
+
+  const reconcilePendingThreadProject = useCallback(
+    (instanceUuid: string | null, cascadeId: string | null) => {
+      setPendingThreadProject((prev) => {
+        if (!prev) {
+          return null;
+        }
+        if (!instanceUuid || prev.instanceUuid !== instanceUuid) {
+          return null;
+        }
+        if (cascadeId) {
+          if (prev.cascadeId === null) {
+            return { ...prev, cascadeId };
+          }
+          return prev.cascadeId === cascadeId ? prev : null;
+        }
+        return isComposingNewThreadRef.current ? prev : null;
+      });
     },
     [],
   );
@@ -1219,6 +1248,9 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       setIsDrawerOpen(false);
       setIsInboxRefreshing(false);
       setInboxSnapshot(EMPTY_INBOX_SNAPSHOT);
+      setPendingThreadProject(null);
+      activeThreadProjectRef.current = null;
+      lastSyncedThreadProjectSigRef.current = null;
       setResetError(null);
       setResetRequest({ reason, attempt: 0 });
     },
@@ -1338,6 +1370,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         }
         activeInstanceUuidRef.current = route.instanceUuid;
         recordActiveRouteForBackNavigation(route.instanceUuid, route.cascadeId);
+        reconcilePendingThreadProject(route.instanceUuid, route.cascadeId);
         if (
           isAppForegroundRef.current &&
           !isDrawerOpenRef.current &&
@@ -1374,6 +1407,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
               renderProcessDeadRef.current = false;
               setStage('authenticated');
               webViewRef.current?.injectJavaScript(INBOX_BRIDGE_SCRIPT);
+              if (activeThreadProjectRef.current) {
+                webViewRef.current?.injectJavaScript(
+                  buildSyncThreadContextScript(activeThreadProjectRef.current),
+                );
+              }
               if (
                 becameAuthenticated &&
                 !route.cascadeId &&
@@ -1394,6 +1432,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       checkPost2faSessionAndAdvance,
       markThreadReadInWorkstationClock,
       recomputeSnapshotWithLocalState,
+      reconcilePendingThreadProject,
       recordActiveRouteForBackNavigation,
       recoverFromCookieMismatch,
       syncCookiesToVault,
@@ -1411,6 +1450,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     webViewRef.current?.injectJavaScript(KEYBOARD_ADAPTATION_SCRIPT);
     webViewRef.current?.injectJavaScript(PROJECT_OVERVIEW_SCROLL_SCRIPT);
     webViewRef.current?.injectJavaScript(INBOX_BRIDGE_SCRIPT);
+    if (activeThreadProjectRef.current) {
+      webViewRef.current?.injectJavaScript(
+        buildSyncThreadContextScript(activeThreadProjectRef.current),
+      );
+    }
     webViewRef.current?.injectJavaScript(
       buildKeepAliveWebLockScript(
         keepAliveMinutesRef.current > 0 && stageRef.current === 'authenticated',
@@ -1539,6 +1583,10 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         ? null
         : targetRoute.instanceUuid;
       canReturnToOverviewRef.current = false;
+      reconcilePendingThreadProject(
+        targetRoute.instanceUuid,
+        targetRoute.cascadeId,
+      );
       recomputeSnapshotWithLocalState({
         activeInstanceUuid: targetRoute.instanceUuid,
         activeCascadeId: targetRoute.cascadeId,
@@ -1548,7 +1596,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       setWebViewInstanceKey((prev) => prev + 1);
       void saveLastActiveUrl(validation.normalizedUrl);
     },
-    [recomputeSnapshotWithLocalState],
+    [recomputeSnapshotWithLocalState, reconcilePendingThreadProject],
   );
 
   const handleSignOut = useCallback(
@@ -1687,6 +1735,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       isDrawerOpenRef.current = false;
       isComposingNewThreadRef.current = false;
       setIsDrawerOpen(false);
+      setPendingThreadProject(null);
 
       markThreadReadInWorkstationClock(thread, 'unread_only');
       recomputeSnapshotWithLocalState({
@@ -1745,6 +1794,12 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       isDrawerOpenRef.current = false;
       isComposingNewThreadRef.current = true;
       setIsDrawerOpen(false);
+      setPendingThreadProject({
+        instanceUuid: project.instanceUuid,
+        cascadeId: null,
+        projectId: project.projectId,
+        projectName: project.name,
+      });
       recomputeSnapshotWithLocalState({
         activeInstanceUuid: project.instanceUuid,
         activeCascadeId: null,
@@ -2101,6 +2156,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             activeInstanceUuid,
             activeCascadeId,
           );
+          reconcilePendingThreadProject(activeInstanceUuid, activeCascadeId);
           if (lastSnapshotMessageRef.current) {
             lastSnapshotMessageRef.current = {
               ...lastSnapshotMessageRef.current,
@@ -2169,19 +2225,23 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             candidateValidation.normalizedUrl
               ? candidateValidation.normalizedUrl
               : pending.targetUrl;
+          const resultRoute = extractActiveRouteFromUrl(effectiveUrl);
+          const resolvedCascadeId = message.cascadeId || resultRoute.cascadeId;
+          reconcilePendingThreadProject(
+            resultRoute.instanceUuid,
+            resolvedCascadeId,
+          );
           if (!message.handled) {
             handleNavigateToUrl(effectiveUrl);
           } else {
             syncVerifiedActiveHostUrl(effectiveUrl);
-            const fastRoute = extractActiveRouteFromUrl(effectiveUrl);
-            const resolvedCascadeId = message.cascadeId || fastRoute.cascadeId;
-            activeInstanceUuidRef.current = fastRoute.instanceUuid;
+            activeInstanceUuidRef.current = resultRoute.instanceUuid;
             recordActiveRouteForBackNavigation(
-              fastRoute.instanceUuid,
+              resultRoute.instanceUuid,
               resolvedCascadeId,
             );
             recomputeSnapshotWithLocalState({
-              activeInstanceUuid: fastRoute.instanceUuid,
+              activeInstanceUuid: resultRoute.instanceUuid,
               activeCascadeId: resolvedCascadeId,
             });
           }
@@ -2249,10 +2309,56 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       handleOpenDrawer,
       markThreadReadInWorkstationClock,
       recomputeSnapshotWithLocalState,
+      reconcilePendingThreadProject,
       recordActiveRouteForBackNavigation,
       syncVerifiedActiveHostUrl,
     ],
   );
+
+  const activeThreadProject = useMemo(
+    () =>
+      stage === 'authenticated'
+        ? resolveActiveThreadProject(inboxSnapshot, {
+            activeUrl: activeHostUrl,
+            fallbackProject: pendingThreadProject,
+          })
+        : null,
+    [activeHostUrl, inboxSnapshot, pendingThreadProject, stage],
+  );
+  activeThreadProjectRef.current = activeThreadProject;
+
+  const activeThreadProjectSig = activeThreadProject
+    ? JSON.stringify(activeThreadProject)
+    : 'null';
+
+  useEffect(() => {
+    if (!isHydrated || isResettingSessionRef.current || resetRequest) {
+      lastSyncedThreadProjectSigRef.current = null;
+      return;
+    }
+    if (
+      lastSyncedThreadProjectSigRef.current === activeThreadProjectSig &&
+      activeThreadProjectSig === 'null'
+    ) {
+      return;
+    }
+    if (
+      lastSyncedThreadProjectSigRef.current === null &&
+      activeThreadProjectSig === 'null'
+    ) {
+      lastSyncedThreadProjectSigRef.current = 'null';
+      return;
+    }
+    lastSyncedThreadProjectSigRef.current = activeThreadProjectSig;
+    webViewRef.current?.injectJavaScript(
+      buildSyncThreadContextScript(activeThreadProjectRef.current),
+    );
+  }, [
+    activeThreadProjectSig,
+    isHydrated,
+    resetRequest,
+    webViewInstanceKey,
+  ]);
 
   const inboxCounts = useMemo(() => {
     let attention = 0;

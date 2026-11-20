@@ -3525,4 +3525,210 @@ describe('Session and navigation regressions', () => {
     });
     expect(controls().props.visible).toBe(true);
   });
+
+  it('syncs the active project context to the thread header across thread switches, + New project chats, overview returns, and header Projects taps', async () => {
+    mockCookieStore.set('https://antigravity.google.com', {
+      SID: {
+        name: 'SID',
+        value: 'thread-header-project-session',
+        domain: '.google.com',
+      },
+    });
+    await navigate(
+      'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-alpha',
+      false,
+    );
+
+    const getThreadContextInjections = () =>
+      mockWebViewInjectJavaScript.mock.calls
+        .map(([script]) => String(script))
+        .filter((s) => s.includes('setActiveThreadContext'))
+        .map((s) => {
+          const match = /var ctx = (.*);/.exec(s);
+          return match ? JSON.parse(match[1]) : undefined;
+        });
+
+    mockWebViewInjectJavaScript.mockClear();
+
+    // 1. Snapshot arrives -> syncs server project name ("Alpha Mobile") for active thread-alpha
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-alpha',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_SNAPSHOT',
+            fetchedAtMs: 1_762_320_000_000,
+            activeUrl:
+              'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-alpha',
+            activeInstanceUuid: 'workstation-1',
+            activeCascadeId: 'thread-alpha',
+            instances: [
+              {
+                uuid: 'workstation-1',
+                name: 'Studio Mac',
+                status: 1,
+                projects: [
+                  {
+                    id: 'proj-alpha',
+                    name: 'Alpha Mobile',
+                    projectResources: {
+                      resources: [
+                        {
+                          gitFolder: {
+                            folderUri: 'file:///Users/dev/alpha-repo',
+                          },
+                        },
+                      ],
+                    },
+                  },
+                  {
+                    id: 'proj-beta',
+                    name: 'Beta API',
+                    projectResources: {
+                      resources: [
+                        {
+                          gitFolder: {
+                            folderUri: 'file:///Users/dev/beta-api',
+                          },
+                        },
+                      ],
+                    },
+                  },
+                ],
+                trajectories: {
+                  'thread-alpha': {
+                    summary: 'Polish header UI',
+                    trajectoryMetadata: { projectId: 'proj-alpha' },
+                    workspaces: [
+                      {
+                        workspaceFolderAbsoluteUri:
+                          'file:///Users/dev/alpha-repo',
+                      },
+                    ],
+                  },
+                  'thread-beta': {
+                    summary: 'Optimize SQL query',
+                    trajectoryMetadata: { projectId: 'proj-beta' },
+                    workspaces: [
+                      {
+                        workspaceFolderAbsoluteUri:
+                          'file:///Users/dev/beta-api',
+                      },
+                    ],
+                  },
+                },
+              },
+            ],
+          }),
+        },
+      });
+    });
+
+    expect(getThreadContextInjections()).toContainEqual({
+      instanceUuid: 'workstation-1',
+      cascadeId: 'thread-alpha',
+      projectId: 'proj-alpha',
+      projectName: 'Alpha Mobile',
+      instanceName: 'Studio Mac',
+    });
+
+    // 2. Tapping the project label in the thread header opens our native drawer directly onto Projects
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-alpha',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_OPEN_DRAWER_REQUEST',
+            mode: 'projects',
+          }),
+        },
+      });
+    });
+    expect(controls().props.visible).toBe(true);
+    expect(controls().props.initialMode).toBe('projects');
+
+    // 3. Selecting thread-beta immediately updates the header project context to "Beta API"
+    mockWebViewInjectJavaScript.mockClear();
+    const betaThread = controls().props.snapshot.threads.find(
+      (t: any) => t.cascadeId === 'thread-beta',
+    )!;
+    await act(async () => {
+      controls().props.onSelectThread(betaThread);
+    });
+    expect(getThreadContextInjections()).toContainEqual({
+      instanceUuid: 'workstation-1',
+      cascadeId: 'thread-beta',
+      projectId: 'proj-beta',
+      projectName: 'Beta API',
+      instanceName: 'Studio Mac',
+    });
+
+    // 4. Starting a + New chat in Alpha Mobile preserves "Alpha Mobile" in header as soon as cascadeId is created
+    mockWebViewInjectJavaScript.mockClear();
+    await act(async () => {
+      controls().props.onStartProjectThread!({
+        id: 'workstation-1:project:proj-alpha',
+        projectId: 'proj-alpha',
+        name: 'Alpha Mobile',
+        workspaceName: 'alpha-repo',
+        workspaceUri: 'file:///Users/dev/alpha-repo',
+        instanceUuid: 'workstation-1',
+        instanceName: 'Studio Mac',
+        source: 'remote-control',
+        threads: [],
+        latestModifiedAtMs: 0,
+        attentionCount: 0,
+        urgentCount: 0,
+        runningCount: 0,
+        hasActiveThread: false,
+        newChatUrl: 'https://antigravity.google.com/r/workstation-1',
+      });
+    });
+    const startChatCall = mockWebViewInjectJavaScript.mock.calls
+      .map(([script]) => String(script))
+      .find((s) => s.includes('window.__agyInboxBridge.startProjectChat('));
+    expect(startChatCall).toBeDefined();
+    const startReqId = startChatCall!.match(/"requestId":"([^"]+)"/)![1];
+
+    mockWebViewInjectJavaScript.mockClear();
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_START_CHAT_RESULT',
+            requestId: startReqId,
+            handled: true,
+            cascadeId: 'thread-brand-new',
+            targetUrl:
+              'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-brand-new',
+          }),
+        },
+      });
+    });
+    expect(getThreadContextInjections()).toContainEqual({
+      instanceUuid: 'workstation-1',
+      cascadeId: 'thread-brand-new',
+      projectId: 'proj-alpha',
+      projectName: 'Alpha Mobile',
+      instanceName: 'Studio Mac',
+    });
+
+    // 5. Navigating away from a thread to workstation overview clears the thread project context (null)
+    mockWebViewInjectJavaScript.mockClear();
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_ACTIVE_ROUTE',
+            activeUrl: 'https://antigravity.google.com/r/workstation-1',
+            activeInstanceUuid: 'workstation-1',
+            activeCascadeId: null,
+          }),
+        },
+      });
+    });
+    expect(getThreadContextInjections()).toContain(null);
+  });
 });

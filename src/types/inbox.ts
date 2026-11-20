@@ -176,11 +176,21 @@ export interface RawBridgeUsagePayload {
   error?: string | null;
 }
 
+export interface ActiveThreadProjectContext {
+  instanceUuid: string;
+  cascadeId: string;
+  projectId: string | null;
+  projectName: string;
+  instanceName: string | null;
+}
+
 export interface InboxSnapshot {
   instances: InboxInstanceSummary[];
   threads: InboxThreadItem[];
   /** All projects/workspaces discovered from connected servers (including projects with no recent threads). */
   projects?: InboxServerProject[];
+  /** Maps `<instanceUuid>:<subagentCascadeOrTrajectoryId>` to its parent `cascadeId`. */
+  subagentParentByKey?: Record<string, string>;
   fetchedAtMs: number;
   activeInstanceUuid: string | null;
   activeCascadeId: string | null;

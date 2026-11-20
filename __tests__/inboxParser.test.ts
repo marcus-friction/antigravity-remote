@@ -5,6 +5,7 @@ import {
   buildMarkThreadReadScript,
   buildOpenHostSettingsScript,
   buildStartProjectChatScript,
+  buildSyncThreadContextScript,
 } from '../src/services/inboxBridge';
 import { InboxBridgeMessage } from '../src/types/inbox';
 import {
@@ -17,12 +18,14 @@ import {
   buildProjectGroups,
   describeWaitingSteps,
   extractActiveRouteFromUrl,
+  extractProjectIdFromUrl,
   extractWorkspaceName,
   extractWorkspaceUri,
   formatRelativeTime,
   parseInboxBridgeMessage,
   parseProtoTimestampMs,
   reconcileRunningThreadTransitions,
+  resolveActiveThreadProject,
 } from '../src/utils/inboxParser';
 
 describe('inboxParser', () => {
@@ -2421,5 +2424,373 @@ describe('inboxParser', () => {
     ]);
     expect(sync.notification!.expandedBody).toContain('🟠 NEEDS APPROVAL');
     expect(sync.notification!.expandedBody).toContain('🔵 FINISHED');
+  });
+
+  it('resolves the active thread project across server projects, workspaces, subagents, URL params, and pending new chats', () => {
+    const rawMessage = parseInboxBridgeMessage(
+      JSON.stringify({
+        type: 'AGY_INBOX_SNAPSHOT',
+        fetchedAtMs: 1_762_300_000_000,
+        activeUrl: 'https://antigravity.google.com/r/box-1?p=c%2Fc-proj-id',
+        activeInstanceUuid: 'box-1',
+        activeCascadeId: 'c-proj-id',
+        instances: [
+          {
+            uuid: 'box-1',
+            name: 'Dev Workstation',
+            status: 1,
+            projects: [
+              {
+                id: 'proj-alpha',
+                name: 'Alpha Platform',
+                projectResources: {
+                  resources: [
+                    { gitFolder: { folderUri: 'file:///home/dev/alpha-repo' } },
+                  ],
+                },
+                projectConversations: {
+                  conversations: [{ conversationId: 'c-by-conv' }],
+                },
+              },
+              {
+                id: 'proj-archived',
+                name: 'Legacy Archive',
+                archived: true,
+                projectResources: {
+                  resources: [{ folderUri: 'file:///home/dev/legacy' }],
+                },
+              },
+            ],
+            trajectories: {
+              'c-proj-id': {
+                summary: 'Thread matched by projectId',
+                trajectoryMetadata: { projectId: 'proj-alpha' },
+                workspaces: [
+                  { workspaceFolderAbsoluteUri: 'file:///home/dev/alpha-repo' },
+                ],
+              },
+              'c-by-conv': {
+                summary: 'Thread matched by conversationIds',
+              },
+              'c-by-uri': {
+                summary: 'Thread matched by workspaceUri',
+                workspaces: [
+                  { workspaceFolderAbsoluteUri: 'file:///home/dev/alpha-repo/' },
+                ],
+              },
+              'c-archived': {
+                summary: 'Thread in archived project',
+                trajectoryMetadata: { projectId: 'proj-archived' },
+              },
+              'c-ws-only': {
+                summary: 'Thread with workspace folder only',
+                workspaces: [
+                  { workspaceFolderAbsoluteUri: 'file:///home/dev/standalone-tool' },
+                ],
+              },
+              'c-unscoped': {
+                summary: 'Thread outside of project',
+                trajectoryMetadata: { projectId: 'outside-of-project' },
+              },
+              'c-subagent-1': {
+                summary: 'Child subagent',
+                killed: true,
+                trajectoryMetadata: {
+                  parentConversationId: 'c-proj-id',
+                },
+              },
+            },
+          },
+        ],
+        cloudTrajectories: {
+          'cloud-1': {
+            summary: 'Cloud task',
+          },
+        },
+      }),
+    );
+
+    expect(rawMessage?.type).toBe('AGY_INBOX_SNAPSHOT');
+    const snapshot = buildInboxSnapshot(
+      rawMessage as Extract<InboxBridgeMessage, { type: 'AGY_INBOX_SNAPSHOT' }>,
+    );
+
+    // 1. Server project by projectId uses server project name (not raw folder name)
+    expect(resolveActiveThreadProject(snapshot)).toEqual({
+      instanceUuid: 'box-1',
+      cascadeId: 'c-proj-id',
+      projectId: 'proj-alpha',
+      projectName: 'Alpha Platform',
+      instanceName: 'Dev Workstation',
+    });
+
+    // 2. Server project by conversationIds
+    expect(
+      resolveActiveThreadProject({
+        ...snapshot,
+        activeCascadeId: 'c-by-conv',
+      }),
+    ).toMatchObject({
+      projectId: 'proj-alpha',
+      projectName: 'Alpha Platform',
+    });
+
+    // 3. Server project by normalized workspaceUri
+    expect(
+      resolveActiveThreadProject({
+        ...snapshot,
+        activeCascadeId: 'c-by-uri',
+      }),
+    ).toMatchObject({
+      projectId: 'proj-alpha',
+      projectName: 'Alpha Platform',
+    });
+
+    // 4. Archived project fallback when thread explicitly belongs to it
+    expect(
+      resolveActiveThreadProject({
+        ...snapshot,
+        activeCascadeId: 'c-archived',
+      }),
+    ).toMatchObject({
+      projectId: 'proj-archived',
+      projectName: 'Legacy Archive',
+    });
+
+    // 5. Workspace-only fallback when no server project matches
+    expect(
+      resolveActiveThreadProject({
+        ...snapshot,
+        activeCascadeId: 'c-ws-only',
+      }),
+    ).toMatchObject({
+      projectId: null,
+      projectName: 'standalone-tool',
+    });
+
+    // 6. Unscoped thread falls back to workstation name
+    expect(
+      resolveActiveThreadProject({
+        ...snapshot,
+        activeCascadeId: 'c-unscoped',
+      }),
+    ).toMatchObject({
+      projectId: null,
+      projectName: 'Dev Workstation',
+    });
+
+    // 7. Cloud thread falls back to Cloud Agent
+    expect(
+      resolveActiveThreadProject({
+        ...snapshot,
+        activeInstanceUuid: '__cloud__',
+        activeCascadeId: 'cloud-1',
+      }),
+    ).toMatchObject({
+      projectId: null,
+      projectName: 'Cloud Agent',
+      instanceName: 'Cloud Agent',
+    });
+
+    // 8. Subagent child thread resolves parent thread's project even after completion/kill
+    expect(
+      resolveActiveThreadProject({
+        ...snapshot,
+        activeCascadeId: 'c-subagent-1',
+      }),
+    ).toEqual({
+      instanceUuid: 'box-1',
+      cascadeId: 'c-subagent-1',
+      projectId: 'proj-alpha',
+      projectName: 'Alpha Platform',
+      instanceName: 'Dev Workstation',
+    });
+
+    // 9. URL ?project=<id> fallback when brand-new thread isn't in snapshot yet
+    expect(
+      extractProjectIdFromUrl(
+        'https://antigravity.google.com/r/box-1?p=c%2Fc-brand-new%3Fproject%3Dproj-alpha',
+      ),
+    ).toBe('proj-alpha');
+    expect(
+      resolveActiveThreadProject(
+        {
+          ...snapshot,
+          activeCascadeId: 'c-brand-new',
+        },
+        {
+          activeUrl:
+            'https://antigravity.google.com/r/box-1?p=c%2Fc-brand-new%3Fproject%3Dproj-alpha',
+        },
+      ),
+    ).toMatchObject({
+      cascadeId: 'c-brand-new',
+      projectId: 'proj-alpha',
+      projectName: 'Alpha Platform',
+    });
+
+    // 10. Pending new-chat fallback before server snapshot includes thread
+    expect(
+      resolveActiveThreadProject(
+        {
+          ...snapshot,
+          activeCascadeId: 'c-new-pending',
+        },
+        {
+          fallbackProject: {
+            instanceUuid: 'box-1',
+            cascadeId: 'c-new-pending',
+            projectId: 'proj-alpha',
+            projectName: 'Alpha Platform',
+          },
+        },
+      ),
+    ).toMatchObject({
+      cascadeId: 'c-new-pending',
+      projectId: 'proj-alpha',
+      projectName: 'Alpha Platform',
+    });
+
+    // 11. Non-thread overview route returns null
+    expect(
+      resolveActiveThreadProject({
+        ...snapshot,
+        activeCascadeId: null,
+      }),
+    ).toBeNull();
+  });
+
+  it('forwards active thread project context from INBOX_BRIDGE_SCRIPT to verified workstation iframe and answers pull requests', () => {
+    const iframePosts: Array<{ msg: any; origin: string }> = [];
+    const messageListeners: Array<(evt: any) => void> = [];
+    const sameOriginScrollContexts: any[] = [];
+
+    const hubFrame = {
+      src: 'https://antigravity.static.usercontent.goog/web/2.33.0/?iframe=true',
+      getAttribute: (k: string) =>
+        k === 'src'
+          ? 'https://antigravity.static.usercontent.goog/web/2.33.0/?iframe=true'
+          : null,
+      contentWindow: {
+        postMessage: (msg: any, origin: string) => {
+          iframePosts.push({ msg, origin });
+        },
+      },
+      style: {
+        setProperty: () => {},
+        removeProperty: () => {},
+        getPropertyValue: () => '',
+        getPropertyPriority: () => '',
+      },
+      parentElement: null as any,
+    };
+
+    const windowObj: any = {
+      location: {
+        origin: 'https://antigravity.google.com',
+        hostname: 'antigravity.google.com',
+        pathname: '/r/box-1',
+        search: '?p=c%2Fthread-1',
+        href: 'https://antigravity.google.com/r/box-1?p=c%2Fthread-1',
+      },
+      navigator: { onLine: true },
+      history: { replaceState: () => {} },
+      addEventListener: (type: string, fn: (evt: any) => void) => {
+        if (type === 'message') {
+          messageListeners.push(fn);
+        }
+      },
+      ReactNativeWebView: { postMessage: () => {} },
+      __agyOverviewScrollBridge: {
+        setThreadContext: (ctx: any) => {
+          sameOriginScrollContexts.push(ctx);
+        },
+      },
+    };
+
+    const sandbox = vm.createContext({
+      window: windowObj,
+      document: {
+        cookie: '',
+        visibilityState: 'visible',
+        documentElement: null,
+        body: null,
+        querySelectorAll: (sel: string) => (sel === 'iframe' ? [hubFrame] : []),
+      },
+      navigator: windowObj.navigator,
+      URL,
+      URLSearchParams,
+      Promise,
+      setTimeout: () => 1,
+      clearTimeout: () => {},
+      setInterval: () => 1,
+      clearInterval: () => {},
+    });
+
+    vm.runInContext(INBOX_BRIDGE_SCRIPT, sandbox);
+    iframePosts.length = 0;
+    sameOriginScrollContexts.length = 0;
+
+    // Push context via buildSyncThreadContextScript
+    const syncScript = buildSyncThreadContextScript({
+      instanceUuid: 'box-1',
+      cascadeId: 'thread-1',
+      projectId: 'proj-alpha',
+      projectName: 'Alpha Platform',
+      instanceName: 'Dev Workstation',
+    });
+    vm.runInContext(syncScript, sandbox);
+
+    expect(iframePosts).toHaveLength(1);
+    expect(iframePosts[0]).toEqual({
+      origin: 'https://antigravity.static.usercontent.goog',
+      msg: {
+        type: 'AGY_REMOTE_THREAD_CONTEXT',
+        context: {
+          instanceUuid: 'box-1',
+          cascadeId: 'thread-1',
+          projectId: 'proj-alpha',
+          projectName: 'Alpha Platform',
+          instanceName: 'Dev Workstation',
+        },
+      },
+    });
+    expect(sameOriginScrollContexts).toHaveLength(1);
+    expect(sameOriginScrollContexts[0]).toMatchObject({
+      cascadeId: 'thread-1',
+      projectName: 'Alpha Platform',
+    });
+
+    // Iframe requesting thread context receives cached context; untrusted origin is ignored
+    iframePosts.length = 0;
+    for (const fn of messageListeners) {
+      fn({
+        origin: 'https://evil.example',
+        data: { type: 'AGY_REMOTE_REQUEST_THREAD_CONTEXT', cascadeId: 'thread-1' },
+      });
+    }
+    expect(iframePosts).toHaveLength(0);
+
+    for (const fn of messageListeners) {
+      fn({
+        origin: 'https://antigravity.static.usercontent.goog',
+        data: { type: 'AGY_REMOTE_REQUEST_THREAD_CONTEXT', cascadeId: 'thread-1' },
+      });
+    }
+    expect(iframePosts).toHaveLength(1);
+    expect(iframePosts[0].msg.context.projectName).toBe('Alpha Platform');
+
+    // Clearing context sends null
+    iframePosts.length = 0;
+    vm.runInContext(buildSyncThreadContextScript(null), sandbox);
+    expect(iframePosts).toEqual([
+      {
+        origin: 'https://antigravity.static.usercontent.goog',
+        msg: {
+          type: 'AGY_REMOTE_THREAD_CONTEXT',
+          context: null,
+        },
+      },
+    ]);
   });
 });

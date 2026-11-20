@@ -1090,4 +1090,420 @@ describe('Android & iOS WebView scroll-restoration wiring and Inbox drawer scrol
       targetOrigin: 'https://antigravity.google.com',
     });
   });
+
+  it('renders the active project name in the mobile thread header without reparenting React nodes, handles async mounts & route transitions, and opens Projects on tap', () => {
+    type MockNode = {
+      tagName: string;
+      nodeType: number;
+      attributes: Record<string, string>;
+      children: MockNode[];
+      parentElement: MockNode | null;
+      textContent: string;
+      setAttribute: (k: string, v: string) => void;
+      getAttribute: (k: string) => string | null;
+      removeAttribute: (k: string) => void;
+      appendChild: (child: MockNode) => MockNode;
+      removeChild: (child: MockNode) => MockNode;
+      querySelector: (sel: string) => MockNode | null;
+      querySelectorAll: (sel: string) => MockNode[];
+      closest: (sel: string) => MockNode | null;
+    };
+
+    const matchesSimpleSelector = (node: MockNode, sel: string): boolean => {
+      const parts = sel.split(',').map((s) => s.trim());
+      return parts.some((part) => {
+        const attrEq = /^\[([^=\]]+)="([^"]*)"\]$/.exec(part);
+        if (attrEq) {
+          return node.attributes[attrEq[1]] === attrEq[2];
+        }
+        const attrPresence = /^\[([^=\]]+)\]$/.exec(part);
+        if (attrPresence) {
+          return Object.prototype.hasOwnProperty.call(
+            node.attributes,
+            attrPresence[1],
+          );
+        }
+        const tagAttrEq = /^([a-z]+)\[([^=\]]+)="([^"]*)"\]$/i.exec(part);
+        if (tagAttrEq) {
+          return (
+            node.tagName.toLowerCase() === tagAttrEq[1].toLowerCase() &&
+            node.attributes[tagAttrEq[2]] === tagAttrEq[3]
+          );
+        }
+        return false;
+      });
+    };
+
+    const createNode = (
+      tagName: string,
+      attrs: Record<string, string> = {},
+      text = '',
+    ): MockNode => {
+      const node: MockNode = {
+        tagName: tagName.toUpperCase(),
+        nodeType: 1,
+        attributes: { ...attrs },
+        children: [],
+        parentElement: null,
+        textContent: text,
+        setAttribute(k, v) {
+          this.attributes[k] = String(v);
+        },
+        getAttribute(k) {
+          return Object.prototype.hasOwnProperty.call(this.attributes, k)
+            ? this.attributes[k]
+            : null;
+        },
+        removeAttribute(k) {
+          delete this.attributes[k];
+        },
+        appendChild(child) {
+          if (child.parentElement && child.parentElement !== this) {
+            child.parentElement.removeChild(child);
+          }
+          if (!this.children.includes(child)) {
+            this.children.push(child);
+          }
+          child.parentElement = this;
+          return child;
+        },
+        removeChild(child) {
+          const idx = this.children.indexOf(child);
+          if (idx !== -1) {
+            this.children.splice(idx, 1);
+            child.parentElement = null;
+          }
+          return child;
+        },
+        querySelector(sel) {
+          return this.querySelectorAll(sel)[0] ?? null;
+        },
+        querySelectorAll(sel) {
+          const out: MockNode[] = [];
+          const walk = (cur: MockNode) => {
+            for (const c of cur.children) {
+              if (matchesSimpleSelector(c, sel)) {
+                out.push(c);
+              }
+              walk(c);
+            }
+          };
+          walk(this);
+          return out;
+        },
+        closest(sel) {
+          let cur: MockNode | null = this;
+          while (cur) {
+            if (matchesSimpleSelector(cur, sel)) return cur;
+            cur = cur.parentElement;
+          }
+          return null;
+        },
+      };
+      return node;
+    };
+
+    const docEl = createNode('html');
+    const head = createNode('head');
+    const body = createNode('body');
+    docEl.appendChild(head);
+    docEl.appendChild(body);
+
+    const parentPosts: Array<{ msg: any; targetOrigin: string }> = [];
+    const windowMessageListeners: Array<(evt: any) => void> = [];
+    const docClickListeners: Array<(evt: any) => void> = [];
+    const mutationCallbacks: Array<() => void> = [];
+    let activeMutationObservers = 0;
+    const pendingTimers: Array<() => void> = [];
+
+    class MockMutationObserver {
+      private cb: () => void;
+      private active = false;
+      constructor(cb: () => void) {
+        this.cb = cb;
+      }
+      observe() {
+        if (!this.active) {
+          this.active = true;
+          activeMutationObservers++;
+          mutationCallbacks.push(this.cb);
+        }
+      }
+      disconnect() {
+        if (this.active) {
+          this.active = false;
+          activeMutationObservers--;
+        }
+      }
+    }
+
+    const parentWindow = {
+      postMessage: (msg: any, targetOrigin: string) => {
+        parentPosts.push({ msg, targetOrigin });
+      },
+    };
+
+    const windowObj: any = {
+      location: {
+        protocol: 'https:',
+        hostname: 'antigravity.static.usercontent.goog',
+        pathname: '/web/2.33.0/c/thread-1',
+        search: '?iframe=true',
+        href: 'https://antigravity.static.usercontent.goog/web/2.33.0/c/thread-1?iframe=true',
+      },
+      history: {
+        pushState: (_s: any, _t: string, url: string) => {
+          const parsed = new URL(url, 'https://antigravity.static.usercontent.goog');
+          windowObj.location.pathname = parsed.pathname;
+          windowObj.location.search = parsed.search;
+          windowObj.location.href = parsed.href;
+        },
+        replaceState: () => {},
+      },
+      parent: parentWindow,
+      MutationObserver: MockMutationObserver,
+      addEventListener: (type: string, fn: (evt: any) => void) => {
+        if (type === 'message') {
+          windowMessageListeners.push(fn);
+        }
+      },
+      removeEventListener: () => {},
+      sessionStorage: {
+        getItem: () => null,
+        setItem: () => {},
+      },
+    };
+
+    const documentObj: any = {
+      head,
+      documentElement: docEl,
+      body,
+      getElementById: (id: string) =>
+        head.children.find((n) => n.attributes.id === id) ?? null,
+      createElement: (tag: string) => createNode(tag),
+      createElementNS: (_ns: string, tag: string) => createNode(tag),
+      querySelector: (sel: string) => docEl.querySelector(sel),
+      querySelectorAll: (sel: string) => docEl.querySelectorAll(sel),
+      addEventListener: (type: string, fn: (evt: any) => void) => {
+        if (type === 'click') {
+          docClickListeners.push(fn);
+        }
+      },
+      removeEventListener: () => {},
+    };
+
+    const flushTimers = () => {
+      const queue = pendingTimers.splice(0, pendingTimers.length);
+      for (const fn of queue) fn();
+    };
+
+    const sandbox = vm.createContext({
+      window: windowObj,
+      document: documentObj,
+      URL,
+      URLSearchParams,
+      setTimeout: (fn: () => void) => {
+        pendingTimers.push(fn);
+        return pendingTimers.length;
+      },
+      clearTimeout: () => {},
+    });
+
+    vm.runInContext(PROJECT_OVERVIEW_SCROLL_SCRIPT, sandbox);
+
+    // 1. Cold boot on thread route immediately requests thread context from host
+    expect(parentPosts).toContainEqual({
+      msg: { type: 'AGY_REMOTE_REQUEST_THREAD_CONTEXT', cascadeId: 'thread-1' },
+      targetOrigin: 'https://antigravity.google.com',
+    });
+    expect(activeMutationObservers).toBe(1);
+
+    // 2. Untrusted message origin or wrong source is ignored
+    for (const fn of windowMessageListeners) {
+      fn({
+        origin: 'https://evil.example',
+        source: parentWindow,
+        data: {
+          type: 'AGY_REMOTE_THREAD_CONTEXT',
+          context: { cascadeId: 'thread-1', projectName: 'Spoofed' },
+        },
+      });
+      fn({
+        origin: 'https://antigravity.google.com',
+        source: {},
+        data: {
+          type: 'AGY_REMOTE_THREAD_CONTEXT',
+          context: { cascadeId: 'thread-1', projectName: 'Spoofed Source' },
+        },
+      });
+    }
+
+    // 3. Trusted context arrives BEFORE React mounts the header (verifies no lockup)
+    for (const fn of windowMessageListeners) {
+      fn({
+        origin: 'https://antigravity.google.com',
+        source: parentWindow,
+        data: {
+          type: 'AGY_REMOTE_THREAD_CONTEXT',
+          context: {
+            cascadeId: 'thread-1',
+            projectId: 'proj-alpha',
+            projectName: 'antigravity-remote',
+            instanceName: 'Dev Box',
+          },
+        },
+      });
+    }
+
+    // 4. React mounts p9c with ONLY mobile-back-to-home first (no title yet -> solo layout)
+    const headerBar = createNode('div', { 'data-main-content-header': 'true' });
+    const headerLeft = createNode('div');
+    const backBtn = createNode('button', {
+      'data-testid': 'mobile-back-to-home',
+      'aria-label': 'Back to home',
+    });
+    headerLeft.appendChild(backBtn);
+    headerBar.appendChild(headerLeft);
+    body.appendChild(headerBar);
+
+    for (const cb of mutationCallbacks) cb();
+    flushTimers();
+
+    expect(headerLeft.getAttribute('data-agy-project-header-layout')).toBe('solo');
+    const injectedBtn = headerLeft.querySelector(
+      '[data-agy-remote-project-header="true"]',
+    );
+    expect(injectedBtn).not.toBeNull();
+    expect(injectedBtn!.getAttribute('aria-label')).toBe(
+      'Project: antigravity-remote on Dev Box',
+    );
+    expect(
+      injectedBtn!.querySelector('[data-agy-remote-project-name="true"]')
+        ?.textContent,
+    ).toBe('antigravity-remote');
+    expect(
+      injectedBtn!.querySelector('[data-agy-remote-project-icon="true"]'),
+    ).not.toBeNull();
+
+    // 5. React later mounts I6c thread title sibling -> upgrades cleanly to stacked layout without reparenting
+    const titleWrap = createNode('div');
+    const titleSeg = createNode(
+      'span',
+      { 'data-testid': 'breadcrumb-segment' },
+      'Fix header layout',
+    );
+    titleWrap.appendChild(titleSeg);
+    headerLeft.appendChild(titleWrap);
+
+    for (const cb of mutationCallbacks) cb();
+    flushTimers();
+
+    expect(headerLeft.getAttribute('data-agy-project-header-layout')).toBe(
+      'stacked',
+    );
+    expect(backBtn.parentElement).toBe(headerLeft);
+    expect(titleWrap.parentElement).toBe(headerLeft);
+
+    // 6. Tapping the project label opens our native Projects drawer
+    parentPosts.length = 0;
+    let prevented = false;
+    let stopped = false;
+    for (const listener of docClickListeners) {
+      listener({
+        target: injectedBtn!.querySelector(
+          '[data-agy-remote-project-name="true"]',
+        ),
+        preventDefault: () => {
+          prevented = true;
+        },
+        stopPropagation: () => {
+          stopped = true;
+        },
+        stopImmediatePropagation: () => {},
+      });
+    }
+    expect(prevented).toBe(true);
+    expect(stopped).toBe(true);
+    expect(parentPosts).toContainEqual({
+      msg: { type: 'AGY_REMOTE_OPEN_DRAWER', mode: 'projects' },
+      targetOrigin: 'https://antigravity.google.com',
+    });
+
+    // 7. Switching to another thread clears stale project immediately and requests new context
+    parentPosts.length = 0;
+    windowObj.history.pushState(null, '', '/web/2.33.0/c/thread-2?iframe=true');
+    expect(
+      headerLeft.querySelector('[data-agy-remote-project-header="true"]'),
+    ).toBeNull();
+    expect(headerLeft.getAttribute('data-agy-project-header-layout')).toBeNull();
+    expect(parentPosts).toContainEqual({
+      msg: { type: 'AGY_REMOTE_REQUEST_THREAD_CONTEXT', cascadeId: 'thread-2' },
+      targetOrigin: 'https://antigravity.google.com',
+    });
+
+    // 8. Returning to overview disconnects MutationObserver cleanly
+    windowObj.history.pushState(null, '', '/web/2.33.0/?iframe=true');
+    expect(activeMutationObservers).toBe(0);
+
+    // 9. Desktop/tablet header skips duplicate when 2+ breadcrumbs exist, injects inline when only 1 exists
+    body.removeChild(headerBar);
+    const desktopHeader = createNode('div', {
+      'data-main-content-header': 'true',
+    });
+    const i6c = createNode('div');
+    const tvc = createNode('div');
+    const seg1Wrap = createNode('div');
+    const seg1 = createNode(
+      'span',
+      { 'data-testid': 'breadcrumb-segment' },
+      'Backend API',
+    );
+    const seg2Wrap = createNode('div');
+    const seg2 = createNode(
+      'span',
+      { 'data-testid': 'breadcrumb-segment' },
+      'Refactor router',
+    );
+    seg1Wrap.appendChild(seg1);
+    seg2Wrap.appendChild(seg2);
+    tvc.appendChild(seg1Wrap);
+    tvc.appendChild(seg2Wrap);
+    i6c.appendChild(tvc);
+    desktopHeader.appendChild(i6c);
+    body.appendChild(desktopHeader);
+
+    windowObj.history.pushState(null, '', '/web/2.33.0/c/thread-3?iframe=true');
+    for (const fn of windowMessageListeners) {
+      fn({
+        origin: 'https://antigravity.google.com',
+        source: parentWindow,
+        data: {
+          type: 'AGY_REMOTE_THREAD_CONTEXT',
+          context: {
+            cascadeId: 'thread-3',
+            projectName: 'Backend API',
+          },
+        },
+      });
+    }
+    // Already has 2 breadcrumb segments -> no duplicate injected
+    expect(
+      desktopHeader.querySelector('[data-agy-remote-project-header="true"]'),
+    ).toBeNull();
+
+    // Remove the workspace breadcrumb so only thread title remains -> inline fallback injects
+    tvc.removeChild(seg1Wrap);
+    windowObj.__agyOverviewScrollBridge.syncThreadProjectHeader();
+    const inlineBtn = desktopHeader.querySelector(
+      '[data-agy-remote-project-header="true"]',
+    );
+    expect(inlineBtn).not.toBeNull();
+    expect(inlineBtn!.getAttribute('data-agy-project-header-mode')).toBe(
+      'inline',
+    );
+    expect(
+      inlineBtn!.querySelector('[data-agy-remote-project-name="true"]')
+        ?.textContent,
+    ).toBe('Backend API');
+  });
 });
