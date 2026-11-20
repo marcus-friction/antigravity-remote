@@ -1,3 +1,5 @@
+import { ActiveThreadProjectContext } from '../types/inbox';
+
 /**
  * Trusted-Types-safe WebView bridge injected into `https://antigravity.google.com`.
  *
@@ -21,6 +23,9 @@ export const INBOX_BRIDGE_SCRIPT = `
       window.__agyInboxBridge.installHooks();
       if (typeof window.__agyInboxBridge.syncFullBleedWorkspace === 'function') {
         window.__agyInboxBridge.syncFullBleedWorkspace();
+      }
+      if (typeof window.__agyInboxBridge.syncActiveThreadContext === 'function') {
+        window.__agyInboxBridge.syncActiveThreadContext();
       }
       window.__agyInboxBridge.scheduleRefresh(150);
       return true;
@@ -78,6 +83,7 @@ export const INBOX_BRIDGE_SCRIPT = `
     var activeIframeCascadeId = null;
     var activeIframeInstanceUuid = null;
     var hasIframeRouteOverride = false;
+    var activeThreadContext = null;
     var pendingFastNav = null;
     var pendingStartNav = null;
     var FAST_NAV_CONFIRM_MS = 380;
@@ -1510,6 +1516,7 @@ export const INBOX_BRIDGE_SCRIPT = `
       if (promotedFrame && promotedFrame !== frame) {
         restoreHostChrome();
       }
+      var didPromoteNewFrame = promotedFrame !== frame;
 
       var cur = frame;
       var guard = 0;
@@ -1646,7 +1653,71 @@ export const INBOX_BRIDGE_SCRIPT = `
 
       isFullBleedActive = true;
       promotedFrame = frame;
+      if (didPromoteNewFrame && activeThreadContext) {
+        syncActiveThreadContext();
+      }
       return true;
+    }
+
+    function sanitizeThreadContext(raw) {
+      if (!raw || typeof raw !== 'object') return null;
+      var cid = typeof raw.cascadeId === 'string' ? raw.cascadeId.trim() : '';
+      var projName =
+        typeof raw.projectName === 'string' ? raw.projectName.trim() : '';
+      if (!cid || !SAFE_ID_RE.test(cid) || !projName) {
+        return null;
+      }
+      var instUuid =
+        typeof raw.instanceUuid === 'string' &&
+        SAFE_ID_RE.test(raw.instanceUuid.trim())
+          ? raw.instanceUuid.trim()
+          : null;
+      var projId =
+        typeof raw.projectId === 'string' && SAFE_ID_RE.test(raw.projectId.trim())
+          ? raw.projectId.trim()
+          : null;
+      var instName =
+        typeof raw.instanceName === 'string' && raw.instanceName.trim()
+          ? raw.instanceName.trim().slice(0, 72)
+          : null;
+      return {
+        instanceUuid: instUuid,
+        cascadeId: cid,
+        projectId: projId,
+        projectName: projName.slice(0, 72),
+        instanceName: instName
+      };
+    }
+
+    function syncActiveThreadContext() {
+      try {
+        if (
+          window.__agyOverviewScrollBridge &&
+          typeof window.__agyOverviewScrollBridge.setThreadContext === 'function'
+        ) {
+          window.__agyOverviewScrollBridge.setThreadContext(activeThreadContext);
+        }
+      } catch (_) {}
+      try {
+        var frame = findHubIframe(false);
+        if (frame && frame.contentWindow && frame.src) {
+          var frameOrigin = new URL(frame.src).origin;
+          if (frameOrigin === 'https://antigravity.static.usercontent.goog') {
+            frame.contentWindow.postMessage(
+              {
+                type: 'AGY_REMOTE_THREAD_CONTEXT',
+                context: activeThreadContext
+              },
+              frameOrigin
+            );
+          }
+        }
+      } catch (_) {}
+    }
+
+    function setActiveThreadContext(nextContext) {
+      activeThreadContext = sanitizeThreadContext(nextContext);
+      syncActiveThreadContext();
     }
 
     function scheduleFullBleedSync(delayMs) {
@@ -2676,6 +2747,11 @@ export const INBOX_BRIDGE_SCRIPT = `
           return;
         }
 
+        if (data.type === 'AGY_REMOTE_REQUEST_THREAD_CONTEXT') {
+          syncActiveThreadContext();
+          return;
+        }
+
         if (data.type === 'URL_CHANGED') {
           var rawChangedPath = typeof data.path === 'string' ? data.path : '';
           var changedCascadeId = extractCascadeIdFromIframePath(rawChangedPath, frameSrc);
@@ -2860,8 +2936,11 @@ export const INBOX_BRIDGE_SCRIPT = `
       syncFullBleedWorkspace: syncFullBleedWorkspace,
       restoreHostChrome: restoreHostChrome,
       openHostSettings: openHostSettings,
+      setActiveThreadContext: setActiveThreadContext,
+      syncActiveThreadContext: syncActiveThreadContext,
       stop: function() {
         isStopped = true;
+        activeThreadContext = null;
         clearPendingFastNav();
         clearPendingStartNav();
         if (refreshTimer) clearTimeout(refreshTimer);
@@ -3082,6 +3161,29 @@ export function buildListDirectoryScript(params: {
         entries: [],
         error: 'Workstation bridge is unavailable.'
       }));
+    }
+  } catch (_) {}
+  return true;
+})();
+`;
+}
+
+export function buildSyncThreadContextScript(
+  context: ActiveThreadProjectContext | null,
+): string {
+  const serialized = JSON.stringify(context ?? null);
+
+  return `
+(function() {
+  var ctx = ${serialized};
+  try {
+    if (window.__agyInboxBridge && typeof window.__agyInboxBridge.setActiveThreadContext === 'function') {
+      window.__agyInboxBridge.setActiveThreadContext(ctx);
+      return true;
+    }
+    if (window.__agyOverviewScrollBridge && typeof window.__agyOverviewScrollBridge.setThreadContext === 'function') {
+      window.__agyOverviewScrollBridge.setThreadContext(ctx);
+      return true;
     }
   } catch (_) {}
   return true;
