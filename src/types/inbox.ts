@@ -64,6 +64,8 @@ export interface InboxThreadItem {
   isActiveThread: boolean;
   isPinned: boolean;
   hasRunningSubagents: boolean;
+  /** Number of active non-daemon background tasks running on this thread (or its subagents). */
+  backgroundTaskCount?: number;
 }
 
 export interface InboxProjectGroup {
@@ -198,6 +200,24 @@ export interface InboxSnapshot {
   error: string | null;
 }
 
+export interface RawBridgeBackgroundTaskSnapshot {
+  taskId?: string;
+  task_id?: string;
+  toolName?: string;
+  tool_name?: string;
+  toolSummary?: string;
+  tool_summary?: string;
+  description?: string;
+  isDaemon?: boolean;
+  is_daemon?: boolean;
+}
+
+export interface RawBridgeBackgroundTaskPayload {
+  conversationId?: string;
+  conversation_id?: string;
+  task?: RawBridgeBackgroundTaskSnapshot | null;
+}
+
 export interface RawBridgeInstancePayload {
   uuid: string;
   name?: string;
@@ -206,6 +226,7 @@ export interface RawBridgeInstancePayload {
   updatedAtMs?: number;
   homeDirUri?: string | null;
   trajectories?: Record<string, unknown> | null;
+  backgroundTasks?: RawBridgeBackgroundTaskPayload[] | null;
   projects?: Record<string, unknown>[] | null;
   workspaceInfos?: Record<string, unknown>[] | null;
   error?: string;

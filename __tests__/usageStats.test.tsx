@@ -843,13 +843,14 @@ describe('Usage Stats Parser & Workstation Bridge', () => {
     await new Promise((resolve) => setImmediate(resolve));
     expect(rpcCalls).toHaveLength(0);
 
-    // When hidden WITH Keep-Alive (`__agyKeepAliveLockDesired = true`), trajectories poll while usage RPCs are skipped
+    // When hidden WITH Keep-Alive (`__agyKeepAliveLockDesired = true`), trajectories & live background tasks poll while usage/project RPCs are skipped
     sandboxWindow.__agyKeepAliveLockDesired = true;
     pollCallback!();
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
     expect(rpcCalls).toEqual([
       '/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories',
+      '/exa.language_server_pb.LanguageServerService/ListBackgroundTasks',
     ]);
   });
 });

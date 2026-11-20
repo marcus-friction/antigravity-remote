@@ -2793,4 +2793,745 @@ describe('inboxParser', () => {
       },
     ]);
   });
+
+  it('keeps threads working (and suppresses completion notifications) while non-daemon background tasks, subagents, nested grandchildren, tool children, or battle forks are still active', () => {
+    const knownRunning = new Set<string>();
+    const completedUnread: Record<string, number> = {};
+    const locallyRead: Record<string, number> = {};
+
+    // 1. Agent starts working with a non-daemon background task -> tracked as running
+    const step1 = reconcileRunningThreadTransitions({
+      message: {
+        type: 'AGY_INBOX_SNAPSHOT',
+        fetchedAtMs: 1_762_300_000_000,
+        activeUrl: 'https://antigravity.google.com/r/box-1',
+        activeInstanceUuid: 'box-1',
+        activeCascadeId: null,
+        instances: [
+          {
+            uuid: 'box-1',
+            name: 'Dev Workstation',
+            status: 1,
+            backgroundTasks: [
+              {
+                conversationId: 'bg-cmd-thread',
+                task: {
+                  taskId: 'task-1',
+                  toolName: 'run_command',
+                  toolSummary: 'Gradle release build',
+                  isDaemon: false,
+                },
+              },
+              {
+                conversationId: 'daemon-only-thread',
+                task: {
+                  taskId: 'task-daemon',
+                  toolName: 'run_command',
+                  toolSummary: 'Dev server startup',
+                  isDaemon: true,
+                },
+              },
+              {
+                conversationId: 'mixed-bg-thread',
+                task: {
+                  taskId: 'task-mixed-daemon',
+                  toolSummary: 'Vite dev server',
+                  isDaemon: true,
+                },
+              },
+              {
+                conversationId: 'mixed-bg-thread',
+                task: {
+                  taskId: 'task-mixed-test',
+                  toolSummary: 'Integration test suite',
+                  isDaemon: false,
+                },
+              },
+              {
+                conversationId: 'subagent-with-bg',
+                task: {
+                  taskId: 'task-child-1',
+                  toolSummary: 'Database migration',
+                  isDaemon: false,
+                },
+              },
+            ],
+            trajectories: {
+              trajectorySummaries: {
+                'bg-cmd-thread': {
+                  summary: 'Ship Android build',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  backgroundTaskCount: 1,
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:01:00Z',
+                },
+                'summary-count-only-thread': {
+                  summary: 'Run overnight benchmark',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  backgroundTaskCount: 2,
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:01:00Z',
+                },
+                'daemon-only-thread': {
+                  summary: 'Start local dev server',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  backgroundTaskCount: 1,
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:01:00Z',
+                },
+                'mixed-bg-thread': {
+                  summary: 'Verify live app with tests',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  backgroundTaskCount: 2,
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:01:00Z',
+                },
+                'false-subagent-flag-thread': {
+                  summary: 'Audit auth module',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:01:00Z',
+                },
+                'parent-of-subagent-bg': {
+                  summary: 'Run migrations via subagent',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:01:00Z',
+                },
+                'subagent-with-bg': {
+                  summary: 'Migration helper',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  backgroundTaskCount: 1,
+                  trajectoryMetadata: {
+                    parentConversationId: 'parent-of-subagent-bg',
+                  },
+                },
+                'nested-parent': {
+                  summary: 'Refactor monolith',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:01:00Z',
+                },
+                'nested-child': {
+                  summary: 'Mid-level worker',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  trajectoryMetadata: {
+                    parentConversationId: 'nested-parent',
+                  },
+                },
+                'nested-grandchild': {
+                  summary: 'Leaf worker',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  trajectoryMetadata: {
+                    parentConversationId: 'nested-child',
+                    rootConversationId: 'nested-parent',
+                  },
+                },
+                'tool-child-parent': {
+                  summary: 'Inspect staging UI',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:01:00Z',
+                },
+                'hidden-tool-child': {
+                  summary: 'Browser automation sub-trajectory',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:01:00Z',
+                  trajectoryMetadata: {
+                    sourceMetadata: {
+                      hideFromConversationList: true,
+                      tool: {
+                        conversationId: 'tool-child-parent',
+                      },
+                    },
+                  },
+                },
+                'battle-parent': {
+                  summary: 'Compare implementations',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  battleModeInfo: {
+                    childrenConversationIds: ['battle-fork-1'],
+                    endType: 'BATTLE_END_TYPE_UNSPECIFIED',
+                  },
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:01:00Z',
+                },
+                'battle-fork-1': {
+                  summary: 'Fork A',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  trajectoryMetadata: {
+                    isBattleModeFork: true,
+                  },
+                },
+                'canceled-run': {
+                  summary: 'Aborted migration',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:01:00Z',
+                },
+              },
+            },
+          },
+        ],
+      },
+      knownRunningThreadIds: knownRunning,
+      completedUnreadAtByThreadId: completedUnread,
+      locallyReadAtByThreadId: locallyRead,
+      isAppForeground: false,
+      isDrawerOpen: false,
+    });
+    // Hidden tool-spawned trajectories must never be emitted as top-level Inbox threads
+    expect(
+      step1.threads.find((t) => t.cascadeId === 'hidden-tool-child'),
+    ).toBeUndefined();
+    expect(step1.threads.every((t) => t.attentionKind === 'running')).toBe(true);
+
+    // 2. Agent turns finish (`status: IDLE`, `notFullyIdle: false`) while background work continues:
+    //    - Only `daemon-only-thread` (only an `isDaemon: true` server) should transition to `unread` (`FINISHED`)
+    //    - `canceled-run` (`USER_CANCELED`) should become `idle` ('Interrupted'), NOT `unread`
+    //    - Every thread with active non-daemon background work or active children MUST remain `running`
+    const step2 = reconcileRunningThreadTransitions({
+      message: {
+        type: 'AGY_INBOX_SNAPSHOT',
+        fetchedAtMs: 1_762_300_020_000,
+        activeUrl: 'https://antigravity.google.com/r/box-1',
+        activeInstanceUuid: 'box-1',
+        activeCascadeId: null,
+        instances: [
+          {
+            uuid: 'box-1',
+            name: 'Dev Workstation',
+            status: 1,
+            backgroundTasks: [
+              {
+                conversationId: 'bg-cmd-thread',
+                task: {
+                  taskId: 'task-1',
+                  toolName: 'run_command',
+                  toolSummary: 'Gradle release build',
+                  isDaemon: false,
+                },
+              },
+              {
+                conversationId: 'daemon-only-thread',
+                task: {
+                  taskId: 'task-daemon',
+                  toolName: 'run_command',
+                  toolSummary: 'Dev server startup',
+                  isDaemon: true,
+                },
+              },
+              {
+                conversationId: 'mixed-bg-thread',
+                task: {
+                  taskId: 'task-mixed-daemon',
+                  toolSummary: 'Vite dev server',
+                  isDaemon: true,
+                },
+              },
+              {
+                conversationId: 'mixed-bg-thread',
+                task: {
+                  taskId: 'task-mixed-test',
+                  toolSummary: 'Integration test suite',
+                  isDaemon: false,
+                },
+              },
+              {
+                conversationId: 'subagent-with-bg',
+                task: {
+                  taskId: 'task-child-1',
+                  toolSummary: 'Database migration',
+                  isDaemon: false,
+                },
+              },
+            ],
+            trajectories: {
+              trajectorySummaries: {
+                'bg-cmd-thread': {
+                  summary: 'Ship Android build',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  backgroundTaskCount: 0, // Even if summary count lags, ListBackgroundTasks catches it
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:02:00Z',
+                },
+                'summary-count-only-thread': {
+                  summary: 'Run overnight benchmark',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  backgroundTaskCount: 2, // Unaccounted by daemon tasks -> still running
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:02:00Z',
+                },
+                'daemon-only-thread': {
+                  summary: 'Start local dev server',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  backgroundTaskCount: 1, // Matched by isDaemon: true -> finished!
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:02:00Z',
+                },
+                'mixed-bg-thread': {
+                  summary: 'Verify live app with tests',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  backgroundTaskCount: 2, // 1 daemon + 1 non-daemon -> still running!
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:02:00Z',
+                },
+                'false-subagent-flag-thread': {
+                  summary: 'Audit auth module',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  hasRunningSubagents: false, // Must NOT short-circuit `hasActiveChildren: true` via `??`
+                  hasActiveChildren: true,
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:02:00Z',
+                },
+                'parent-of-subagent-bg': {
+                  summary: 'Run migrations via subagent',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  hasRunningSubagents: false, // Must NOT short-circuit bubbled running subagent
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:02:00Z',
+                },
+                'subagent-with-bg': {
+                  summary: 'Migration helper',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  backgroundTaskCount: 1,
+                  trajectoryMetadata: {
+                    parentConversationId: 'parent-of-subagent-bg',
+                  },
+                },
+                'nested-parent': {
+                  summary: 'Refactor monolith',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:02:00Z',
+                },
+                'nested-child': {
+                  summary: 'Mid-level worker',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  trajectoryMetadata: {
+                    parentConversationId: 'nested-parent',
+                  },
+                },
+                'nested-grandchild': {
+                  summary: 'Leaf worker',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  trajectoryMetadata: {
+                    parentConversationId: 'nested-child',
+                    rootConversationId: 'nested-parent',
+                  },
+                },
+                'tool-child-parent': {
+                  summary: 'Inspect staging UI',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:02:00Z',
+                },
+                'hidden-tool-child': {
+                  summary: 'Browser automation sub-trajectory',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:02:00Z',
+                  trajectoryMetadata: {
+                    sourceMetadata: {
+                      hideFromConversationList: true,
+                      tool: {
+                        conversationId: 'tool-child-parent',
+                      },
+                    },
+                  },
+                },
+                'battle-parent': {
+                  summary: 'Compare implementations',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  battleModeInfo: {
+                    childrenConversationIds: ['battle-fork-1'],
+                    endType: 'BATTLE_END_TYPE_UNSPECIFIED',
+                  },
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:02:00Z',
+                },
+                'battle-fork-1': {
+                  summary: 'Fork A',
+                  status: 'CASCADE_RUN_STATUS_RUNNING',
+                  notFullyIdle: true,
+                  trajectoryMetadata: {
+                    isBattleModeFork: true,
+                  },
+                },
+                'canceled-run': {
+                  summary: 'Aborted migration',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  latestExecutorTerminationReason:
+                    'EXECUTOR_TERMINATION_REASON_USER_CANCELED',
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:02:00Z',
+                },
+              },
+            },
+          },
+        ],
+      },
+      knownRunningThreadIds: knownRunning,
+      completedUnreadAtByThreadId: completedUnread,
+      locallyReadAtByThreadId: locallyRead,
+      isAppForeground: false,
+      isDrawerOpen: false,
+    });
+
+    const byId = (id: string) =>
+      step2.threads.find((t) => t.cascadeId === id)!;
+
+    expect(byId('bg-cmd-thread')).toMatchObject({
+      attentionKind: 'running',
+      needsAttention: false,
+      attentionReason: 'Background task: Gradle release build',
+      backgroundTaskCount: 1,
+    });
+    expect(byId('summary-count-only-thread')).toMatchObject({
+      attentionKind: 'running',
+      needsAttention: false,
+      attentionReason: '2 background tasks running…',
+      backgroundTaskCount: 2,
+    });
+    expect(byId('mixed-bg-thread')).toMatchObject({
+      attentionKind: 'running',
+      needsAttention: false,
+      attentionReason: 'Background task: Integration test suite',
+      backgroundTaskCount: 1,
+    });
+    expect(byId('false-subagent-flag-thread')).toMatchObject({
+      attentionKind: 'running',
+      needsAttention: false,
+      hasRunningSubagents: true,
+    });
+    expect(byId('parent-of-subagent-bg')).toMatchObject({
+      attentionKind: 'running',
+      needsAttention: false,
+      hasRunningSubagents: true,
+      backgroundTaskCount: 1,
+    });
+    expect(byId('nested-parent')).toMatchObject({
+      attentionKind: 'running',
+      needsAttention: false,
+      hasRunningSubagents: true,
+    });
+    expect(byId('tool-child-parent')).toMatchObject({
+      attentionKind: 'running',
+      needsAttention: false,
+      hasRunningSubagents: true,
+    });
+    expect(byId('battle-parent')).toMatchObject({
+      attentionKind: 'running',
+      needsAttention: false,
+      hasRunningSubagents: true,
+    });
+    expect(byId('daemon-only-thread')).toMatchObject({
+      attentionKind: 'unread',
+      needsAttention: true,
+      attentionReason: 'Agent finished — unread updates',
+      backgroundTaskCount: 0,
+    });
+    expect(byId('canceled-run')).toMatchObject({
+      attentionKind: 'idle',
+      needsAttention: false,
+      attentionReason: 'Interrupted',
+    });
+
+    // Only `daemon-only-thread` produces an OS notification; none of the background-working threads alert!
+    const notifSync = buildActionNotificationSyncState({
+      stage: 'authenticated',
+      mode: 'all_attention',
+      threads: step2.threads,
+      isAppForeground: false,
+      isDrawerOpen: false,
+      previousOpenThreadIds: new Set(),
+    });
+    expect(notifSync.notification).toMatchObject({
+      count: 1,
+      deepLinkUrl: 'antigravity-remote://r/box-1?p=c%2Fdaemon-only-thread',
+      shouldAlert: true,
+    });
+
+    // 3. Once the non-daemon background task on `bg-cmd-thread` completes and the agent finishes,
+    //    `bg-cmd-thread` cleanly transitions to `unread` (`FINISHED`) and fires its notification!
+    const step3 = reconcileRunningThreadTransitions({
+      message: {
+        type: 'AGY_INBOX_SNAPSHOT',
+        fetchedAtMs: 1_762_300_040_000,
+        activeUrl: 'https://antigravity.google.com/r/box-1',
+        activeInstanceUuid: 'box-1',
+        activeCascadeId: null,
+        instances: [
+          {
+            uuid: 'box-1',
+            name: 'Dev Workstation',
+            status: 1,
+            backgroundTasks: [],
+            trajectories: {
+              trajectorySummaries: {
+                'bg-cmd-thread': {
+                  summary: 'Ship Android build',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  backgroundTaskCount: 0,
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:03:00Z',
+                },
+                'hidden-tool-child': {
+                  summary: 'Browser automation sub-trajectory',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  notFullyIdle: false,
+                  lastUserInputTime: '2026-11-20T18:00:00Z',
+                  lastModifiedTime: '2026-11-20T18:03:00Z',
+                  trajectoryMetadata: {
+                    sourceMetadata: {
+                      hideFromConversationList: true,
+                      tool: {
+                        conversationId: 'tool-child-parent',
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        ],
+      },
+      knownRunningThreadIds: knownRunning,
+      completedUnreadAtByThreadId: completedUnread,
+      locallyReadAtByThreadId: locallyRead,
+      isAppForeground: false,
+      isDrawerOpen: false,
+    });
+    expect(step3.threads).toHaveLength(1);
+    expect(step3.threads[0]).toMatchObject({
+      cascadeId: 'bg-cmd-thread',
+      attentionKind: 'unread',
+      needsAttention: true,
+      attentionReason: 'Agent finished — unread updates',
+      backgroundTaskCount: 0,
+    });
+  });
+
+  it('queries ListBackgroundTasks in INBOX_BRIDGE_SCRIPT, compacts tasks, handles empty/unimplemented responses, and validates backgroundTasks in parseInboxBridgeMessage', async () => {
+    const postedToNative: any[] = [];
+    const bgRpcCalls: string[] = [];
+    let bgMode: 'populated' | 'empty' | 'unimplemented' = 'populated';
+
+    class MockListInstancesRequest {}
+    class MockProxyCommandRequest {
+      uuid = '';
+      rpcPath = '';
+      payload: Uint8Array<ArrayBufferLike> = new Uint8Array();
+      setTargetInstanceUuid(u: string) {
+        this.uuid = u;
+      }
+      setRpcPath(p: string) {
+        this.rpcPath = p;
+      }
+      setPayload(bytes: Uint8Array) {
+        this.payload = bytes;
+      }
+      putHeaders() {}
+    }
+    class MockApiServicePromiseClient {
+      listInstances() {
+        return Promise.resolve({
+          getInstancesList: () => [
+            {
+              getUuid: () => 'box-bg',
+              getStatus: () => 1,
+              getMetadata: () => ({
+                getName: () => 'Build Server',
+                getVersion: () => '2.33.0',
+              }),
+              getStatusLastUpdatedAt: () => ({ getSeconds: () => 1762300000 }),
+            },
+          ],
+        });
+      }
+      proxyCommand(req: MockProxyCommandRequest) {
+        let body: Record<string, unknown> = {};
+        if (req.rpcPath.endsWith('/GetAllCascadeTrajectories')) {
+          body = {
+            trajectorySummaries: {
+              'thread-build': {
+                summary: 'Compile release',
+                status: 'CASCADE_RUN_STATUS_IDLE',
+                notFullyIdle: false,
+                backgroundTaskCount: 1,
+                lastUserInputTime: '2026-11-20T18:00:00Z',
+                lastModifiedTime: '2026-11-20T18:01:00Z',
+              },
+            },
+          };
+        } else if (req.rpcPath.endsWith('/ListBackgroundTasks')) {
+          bgRpcCalls.push(req.uuid);
+          if (bgMode === 'populated') {
+            body = {
+              tasks: [
+                {
+                  conversationId: 'thread-build',
+                  task: {
+                    taskId: 'task-42',
+                    toolName: 'run_command',
+                    toolSummary: 'Gradle assembleRelease',
+                    isDaemon: false,
+                  },
+                },
+                {
+                  conversationId: 'bad id with spaces!',
+                  task: { taskId: 'ignored' },
+                },
+              ],
+            };
+          } else if (bgMode === 'empty') {
+            body = {};
+          } else {
+            body = {
+              code: 'unimplemented',
+              message: 'Method ListBackgroundTasks not implemented',
+            };
+          }
+        }
+        const encoded = new TextEncoder().encode(JSON.stringify(body));
+        return Promise.resolve({ getPayload_asU8: () => encoded });
+      }
+    }
+
+    const sandboxWindow: any = {
+      location: {
+        hostname: 'antigravity.google.com',
+        origin: 'https://antigravity.google.com',
+        pathname: '/r/box-bg',
+        search: '',
+        href: 'https://antigravity.google.com/r/box-bg',
+      },
+      history: { state: null, replaceState: () => {} },
+      navigator: { onLine: true },
+      document: {
+        cookie: 'SAPISID=test',
+        visibilityState: 'hidden',
+        querySelectorAll: () => [],
+      },
+      default_GoogleAntigravity: {
+        K: {
+          devtools_jetski_boq_api_proto: {
+            ApiServicePromiseClient: MockApiServicePromiseClient,
+            ListInstancesRequest: MockListInstancesRequest,
+            ProxyCommandRequest: MockProxyCommandRequest,
+          },
+        },
+        pj: {
+          auth_firstparty: {
+            getAuthHeaderValueForFirstParty: () => 'SAPISIDHASH 1_a',
+          },
+        },
+      },
+      ReactNativeWebView: {
+        postMessage: (raw: string) => postedToNative.push(raw),
+      },
+      addEventListener: () => {},
+      TextEncoder,
+      TextDecoder,
+      URL,
+      URLSearchParams,
+      setTimeout: () => 1,
+      clearTimeout: () => {},
+      setInterval: () => 1,
+      clearInterval: () => {},
+    };
+    sandboxWindow.window = sandboxWindow;
+
+    const context = vm.createContext(sandboxWindow);
+    vm.runInContext(INBOX_BRIDGE_SCRIPT, context);
+
+    // 1. Populated ListBackgroundTasks response (even while hidden)
+    await sandboxWindow.__agyInboxBridge.refresh(false);
+    expect(bgRpcCalls).toHaveLength(1);
+    const parsed1 = parseInboxBridgeMessage(postedToNative[0]);
+    expect(parsed1?.type).toBe('AGY_INBOX_SNAPSHOT');
+    if (parsed1?.type !== 'AGY_INBOX_SNAPSHOT') return;
+    expect(parsed1.instances[0].backgroundTasks).toEqual([
+      {
+        conversationId: 'thread-build',
+        task: {
+          taskId: 'task-42',
+          toolName: 'run_command',
+          toolSummary: 'Gradle assembleRelease',
+          isDaemon: false,
+        },
+      },
+    ]);
+    const snap1 = buildInboxSnapshot(parsed1);
+    expect(snap1.threads[0]).toMatchObject({
+      cascadeId: 'thread-build',
+      attentionKind: 'running',
+      needsAttention: false,
+      attentionReason: 'Background task: Gradle assembleRelease',
+      backgroundTaskCount: 1,
+    });
+
+    // 2. Empty proto3 `{}` response maps to `[]`
+    bgMode = 'empty';
+    postedToNative.length = 0;
+    await sandboxWindow.__agyInboxBridge.refresh(false);
+    const parsed2 = parseInboxBridgeMessage(postedToNative[0]);
+    expect(parsed2?.type).toBe('AGY_INBOX_SNAPSHOT');
+    if (parsed2?.type !== 'AGY_INBOX_SNAPSHOT') return;
+    expect(parsed2.instances[0].backgroundTasks).toEqual([]);
+
+    // 3. Unimplemented response maps to `null` and caches unsupported for that server version
+    bgMode = 'unimplemented';
+    postedToNative.length = 0;
+    await sandboxWindow.__agyInboxBridge.refresh(false);
+    expect(bgRpcCalls).toHaveLength(3);
+    const parsed3 = parseInboxBridgeMessage(postedToNative[0]);
+    expect(parsed3?.type).toBe('AGY_INBOX_SNAPSHOT');
+    if (parsed3?.type !== 'AGY_INBOX_SNAPSHOT') return;
+    expect(parsed3.instances[0].backgroundTasks).toBeNull();
+    // Still falls back safely to `summary.backgroundTaskCount: 1`!
+    const snap3 = buildInboxSnapshot(parsed3);
+    expect(snap3.threads[0]).toMatchObject({
+      cascadeId: 'thread-build',
+      attentionKind: 'running',
+      needsAttention: false,
+      backgroundTaskCount: 1,
+    });
+
+    // Subsequent poll on same version skips the unsupported RPC
+    postedToNative.length = 0;
+    await sandboxWindow.__agyInboxBridge.refresh(false);
+    expect(bgRpcCalls).toHaveLength(3);
+  });
 });

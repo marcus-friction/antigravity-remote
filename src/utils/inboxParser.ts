@@ -10,6 +10,7 @@ import {
   InboxServerProject,
   InboxSnapshot,
   InboxThreadItem,
+  RawBridgeBackgroundTaskPayload,
   RawBridgeInstancePayload,
   RawBridgeUsagePayload,
   UsageCreditBalance,
@@ -23,6 +24,7 @@ import { validateNavigationUrl } from './urlValidator';
 const MAX_INBOX_BRIDGE_PAYLOAD_LENGTH = 2 * 1024 * 1024;
 const MAX_INSTANCES_PER_SNAPSHOT = 64;
 const MAX_PROJECTS_PER_INSTANCE = 128;
+const MAX_BACKGROUND_TASKS_PER_INSTANCE = 256;
 const MAX_DIR_ENTRIES = 250;
 const MAX_USAGE_GROUPS = 16;
 const MAX_USAGE_BUCKETS_PER_GROUP = 16;
@@ -514,6 +516,42 @@ function isRunningCascadeStatus(rawStatus: unknown): boolean {
   return false;
 }
 
+function isIdleCascadeStatus(rawStatus: unknown): boolean {
+  if (rawStatus === 1) {
+    return true;
+  }
+  if (typeof rawStatus === 'string') {
+    return rawStatus.toUpperCase().includes('IDLE');
+  }
+  return false;
+}
+
+function isUserCanceledTerminationReason(rawReason: unknown): boolean {
+  if (rawReason === 2) {
+    return true;
+  }
+  if (typeof rawReason === 'string' && rawReason.trim()) {
+    const upper = rawReason.toUpperCase();
+    return upper.includes('USER_CANCELED') || upper.includes('USER_CANCELLED');
+  }
+  return false;
+}
+
+function parseNonNegativeInt(raw: unknown): number {
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed || !/^\d+$/.test(trimmed)) {
+      return 0;
+    }
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+  }
+  return 0;
+}
+
 function getTerminationFailureReason(rawReason: unknown): string | null {
   if (rawReason === 1) {
     return 'Stopped due to an execution error';
@@ -543,6 +581,9 @@ function getTerminationFailureReason(rawReason: unknown): string | null {
 }
 
 function isFilteredTrajectoryType(rawType: unknown): boolean {
+  if (rawType === 22 || rawType === 23) {
+    return true;
+  }
   if (typeof rawType !== 'string') {
     return false;
   }
@@ -550,6 +591,97 @@ function isFilteredTrajectoryType(rawType: unknown): boolean {
   return (
     upper.includes('SIDE_QUESTION') || upper.includes('COMMIT_MESSAGE')
   );
+}
+
+function getSourceMetadataRecord(
+  metadata: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  if (!metadata) {
+    return null;
+  }
+  if (isRecord(metadata.sourceMetadata)) {
+    return metadata.sourceMetadata;
+  }
+  if (isRecord(metadata.source_metadata)) {
+    return metadata.source_metadata;
+  }
+  return null;
+}
+
+function isHiddenFromConversationList(
+  metadata: Record<string, unknown> | null,
+): boolean {
+  const sourceMetadata = getSourceMetadataRecord(metadata);
+  if (!sourceMetadata) {
+    return false;
+  }
+  return Boolean(
+    sourceMetadata.hideFromConversationList ??
+      sourceMetadata.hide_from_conversation_list,
+  );
+}
+
+function extractDirectParentId(
+  metadata: Record<string, unknown> | null,
+): string | null {
+  if (!metadata) {
+    return null;
+  }
+  const rawParentId =
+    metadata.parentConversationId ?? metadata.parent_conversation_id;
+  if (typeof rawParentId === 'string' && SAFE_ID_PATTERN.test(rawParentId)) {
+    return rawParentId;
+  }
+  const sourceMetadata = getSourceMetadataRecord(metadata);
+  if (
+    sourceMetadata &&
+    Boolean(
+      sourceMetadata.hideFromConversationList ??
+        sourceMetadata.hide_from_conversation_list,
+    )
+  ) {
+    const toolMeta = isRecord(sourceMetadata.tool)
+      ? sourceMetadata.tool
+      : null;
+    const toolConvId = toolMeta
+      ? (toolMeta.conversationId ?? toolMeta.conversation_id)
+      : null;
+    if (typeof toolConvId === 'string' && SAFE_ID_PATTERN.test(toolConvId)) {
+      return toolConvId;
+    }
+  }
+  return null;
+}
+
+function isActiveBattleMode(
+  battleModeInfo: Record<string, unknown> | null,
+): boolean {
+  if (!battleModeInfo) {
+    return false;
+  }
+  const endType = battleModeInfo.endType ?? battleModeInfo.end_type;
+  if (endType === undefined || endType === null || endType === 0) {
+    return true;
+  }
+  if (typeof endType === 'string') {
+    const upper = endType.trim().toUpperCase();
+    return upper === '' || upper === '0' || upper.includes('UNSPECIFIED');
+  }
+  return false;
+}
+
+function hasRunningBattleChildStatus(
+  battleModeInfo: Record<string, unknown> | null,
+): boolean {
+  if (!battleModeInfo || !isActiveBattleMode(battleModeInfo)) {
+    return false;
+  }
+  const statuses = Array.isArray(battleModeInfo.childrenTrajectoryStatuses)
+    ? battleModeInfo.childrenTrajectoryStatuses
+    : Array.isArray(battleModeInfo.children_trajectory_statuses)
+      ? battleModeInfo.children_trajectory_statuses
+      : [];
+  return statuses.some((st) => isRunningCascadeStatus(st));
 }
 
 function unwrapTrajectoryMap(
@@ -629,10 +761,18 @@ function buildVerifiedTargetUrl(
   };
 }
 
+interface ConversationBackgroundTaskInfo {
+  nonDaemonCount: number;
+  daemonCount: number;
+  firstNonDaemonLabel: string | null;
+}
+
 interface BubbledChildInfo {
   waitingSteps: unknown[];
   subagentRole: string | null;
   hasRunningChild: boolean;
+  activeBackgroundTaskCount: number;
+  firstBackgroundTaskLabel: string | null;
   latestModifiedMs: number;
 }
 
@@ -641,6 +781,7 @@ function parseTrajectoriesForSource(params: {
   instanceUuid: string;
   instanceName: string;
   rawTrajectories: Record<string, unknown> | null | undefined;
+  rawBackgroundTasks?: readonly RawBridgeBackgroundTaskPayload[] | null;
   activeInstanceUuid: string | null;
   activeCascadeId: string | null;
   accountPrefix: string;
@@ -656,6 +797,7 @@ function parseTrajectoriesForSource(params: {
     instanceUuid,
     instanceName,
     rawTrajectories,
+    rawBackgroundTasks,
     activeInstanceUuid,
     activeCascadeId,
     accountPrefix,
@@ -673,9 +815,11 @@ function parseTrajectoriesForSource(params: {
     return [];
   }
 
-  // Index trajectoryId -> cascadeId so subagents referencing either ID resolve cleanly.
+  // Index trajectoryId -> cascadeId so subagents and background tasks referencing either ID resolve cleanly.
   const trajectoryIdToCascadeId = new Map<string, string>();
+  const entryCascadeIds = new Set<string>();
   for (const [cascadeId, raw] of entries) {
+    entryCascadeIds.add(cascadeId);
     trajectoryIdToCascadeId.set(cascadeId, cascadeId);
     const trajId = raw.trajectoryId ?? raw.trajectory_id;
     if (typeof trajId === 'string' && SAFE_ID_PATTERN.test(trajId)) {
@@ -683,7 +827,151 @@ function parseTrajectoriesForSource(params: {
     }
   }
 
-  // Pass 1: Bubble child subagent waiting prompts and running states up to their parent conversation.
+  // Index live background tasks from `ListBackgroundTasks` per conversation,
+  // separating non-daemon work (commands, timers, workflows) from long-running daemons.
+  const bgTasksByCascadeId = new Map<string, ConversationBackgroundTaskInfo>();
+  if (Array.isArray(rawBackgroundTasks)) {
+    for (const rawEntry of rawBackgroundTasks.slice(
+      0,
+      MAX_BACKGROUND_TASKS_PER_INSTANCE,
+    )) {
+      if (!isRecord(rawEntry)) {
+        continue;
+      }
+      const rawConvId = rawEntry.conversationId ?? rawEntry.conversation_id;
+      if (typeof rawConvId !== 'string' || !SAFE_ID_PATTERN.test(rawConvId)) {
+        continue;
+      }
+      const resolvedConvId =
+        trajectoryIdToCascadeId.get(rawConvId) ?? rawConvId;
+      const taskObj = isRecord(rawEntry.task) ? rawEntry.task : null;
+      const isDaemon = Boolean(
+        taskObj?.isDaemon ??
+          taskObj?.is_daemon ??
+          rawEntry.isDaemon ??
+          rawEntry.is_daemon,
+      );
+      const info = bgTasksByCascadeId.get(resolvedConvId) ?? {
+        nonDaemonCount: 0,
+        daemonCount: 0,
+        firstNonDaemonLabel: null,
+      };
+      if (isDaemon) {
+        info.daemonCount += 1;
+      } else {
+        info.nonDaemonCount += 1;
+        if (!info.firstNonDaemonLabel && taskObj) {
+          const rawLabel =
+            taskObj.toolSummary ??
+            taskObj.tool_summary ??
+            taskObj.description ??
+            taskObj.toolName ??
+            taskObj.tool_name;
+          if (typeof rawLabel === 'string' && rawLabel.trim()) {
+            info.firstNonDaemonLabel = truncateText(rawLabel.trim(), 72);
+          }
+        }
+      }
+      bgTasksByCascadeId.set(resolvedConvId, info);
+    }
+  }
+
+  // Build parent links across direct subagents, hidden tool-spawned trajectories, and active Battle Mode forks.
+  const directParentByCascadeId = new Map<string, string>();
+  const rootHintByCascadeId = new Map<string, string>();
+  const battleParentForLookupByCascadeId = new Map<string, string>();
+
+  for (const [cascadeId, raw] of entries) {
+    const metadata = isRecord(raw.trajectoryMetadata)
+      ? raw.trajectoryMetadata
+      : isRecord(raw.trajectory_metadata)
+        ? raw.trajectory_metadata
+        : null;
+    const rawDirectParent = extractDirectParentId(metadata);
+    if (rawDirectParent) {
+      const normalizedParent =
+        trajectoryIdToCascadeId.get(rawDirectParent) ?? rawDirectParent;
+      if (normalizedParent !== cascadeId) {
+        directParentByCascadeId.set(cascadeId, normalizedParent);
+      }
+    }
+    const rawRootId = metadata
+      ? (metadata.rootConversationId ?? metadata.root_conversation_id)
+      : null;
+    if (typeof rawRootId === 'string' && SAFE_ID_PATTERN.test(rawRootId)) {
+      const normalizedRoot = trajectoryIdToCascadeId.get(rawRootId) ?? rawRootId;
+      if (normalizedRoot !== cascadeId) {
+        rootHintByCascadeId.set(cascadeId, normalizedRoot);
+      }
+    }
+
+    const battleModeInfo = isRecord(raw.battleModeInfo)
+      ? raw.battleModeInfo
+      : isRecord(raw.battle_mode_info)
+        ? raw.battle_mode_info
+        : null;
+    if (battleModeInfo) {
+      const battleChildren = Array.isArray(battleModeInfo.childrenConversationIds)
+        ? battleModeInfo.childrenConversationIds
+        : Array.isArray(battleModeInfo.children_conversation_ids)
+          ? battleModeInfo.children_conversation_ids
+          : [];
+      const battleActive = isActiveBattleMode(battleModeInfo);
+      for (const rawChildId of battleChildren) {
+        if (typeof rawChildId !== 'string' || !SAFE_ID_PATTERN.test(rawChildId)) {
+          continue;
+        }
+        const normalizedChild =
+          trajectoryIdToCascadeId.get(rawChildId) ?? rawChildId;
+        if (normalizedChild === cascadeId) {
+          continue;
+        }
+        if (!battleParentForLookupByCascadeId.has(normalizedChild)) {
+          battleParentForLookupByCascadeId.set(normalizedChild, cascadeId);
+        }
+        if (battleActive && !directParentByCascadeId.has(normalizedChild)) {
+          directParentByCascadeId.set(normalizedChild, cascadeId);
+        }
+      }
+    }
+  }
+
+  const resolveTopLevelParent = (startCascadeId: string): string | null => {
+    const firstParent = directParentByCascadeId.get(startCascadeId);
+    if (!firstParent) {
+      return null;
+    }
+    const visited = new Set<string>([startCascadeId]);
+    let current = firstParent;
+    let fallbackRootHint = rootHintByCascadeId.get(startCascadeId) ?? null;
+
+    for (let depth = 0; depth < 8; depth++) {
+      if (visited.has(current)) {
+        break;
+      }
+      visited.add(current);
+      if (!fallbackRootHint) {
+        fallbackRootHint = rootHintByCascadeId.get(current) ?? null;
+      }
+      const nextParent = directParentByCascadeId.get(current);
+      if (!nextParent) {
+        if (
+          !entryCascadeIds.has(current) &&
+          fallbackRootHint &&
+          fallbackRootHint !== startCascadeId &&
+          entryCascadeIds.has(fallbackRootHint) &&
+          !directParentByCascadeId.has(fallbackRootHint)
+        ) {
+          return fallbackRootHint;
+        }
+        return current;
+      }
+      current = nextParent;
+    }
+    return current;
+  };
+
+  // Pass 1: Bubble child subagent / tool-child / active-battle-fork prompts, running states, and background tasks up to their top-level parent.
   const bubbledByParentCascadeId = new Map<string, BubbledChildInfo>();
   for (const [childCascadeId, raw] of entries) {
     const metadata = isRecord(raw.trajectoryMetadata)
@@ -691,21 +979,16 @@ function parseTrajectoriesForSource(params: {
       : isRecord(raw.trajectory_metadata)
         ? raw.trajectory_metadata
         : null;
-    const rawParentId = metadata
-      ? (metadata.parentConversationId ?? metadata.parent_conversation_id)
-      : null;
-    if (typeof rawParentId !== 'string' || !SAFE_ID_PATTERN.test(rawParentId)) {
-      continue;
-    }
-
-    const parentCascadeId =
-      trajectoryIdToCascadeId.get(rawParentId) ?? rawParentId;
+    const directParentId =
+      directParentByCascadeId.get(childCascadeId) ??
+      battleParentForLookupByCascadeId.get(childCascadeId) ??
+      null;
     if (
+      directParentId &&
       subagentParentByKey &&
       Object.keys(subagentParentByKey).length < MAX_SUBAGENT_PARENT_ENTRIES
     ) {
-      subagentParentByKey[`${instanceUuid}:${childCascadeId}`] =
-        parentCascadeId;
+      subagentParentByKey[`${instanceUuid}:${childCascadeId}`] = directParentId;
       const childTrajId = raw.trajectoryId ?? raw.trajectory_id;
       if (
         typeof childTrajId === 'string' &&
@@ -713,8 +996,13 @@ function parseTrajectoriesForSource(params: {
         SAFE_ID_PATTERN.test(childTrajId) &&
         Object.keys(subagentParentByKey).length < MAX_SUBAGENT_PARENT_ENTRIES
       ) {
-        subagentParentByKey[`${instanceUuid}:${childTrajId}`] = parentCascadeId;
+        subagentParentByKey[`${instanceUuid}:${childTrajId}`] = directParentId;
       }
+    }
+
+    const parentCascadeId = resolveTopLevelParent(childCascadeId);
+    if (!parentCascadeId) {
+      continue;
     }
 
     const killed = Boolean(raw.killed);
@@ -726,9 +1014,23 @@ function parseTrajectoriesForSource(params: {
       : Array.isArray(raw.waiting_steps)
         ? raw.waiting_steps
         : [];
+    const childSummaryBgCount = parseNonNegativeInt(
+      raw.backgroundTaskCount ?? raw.background_task_count,
+    );
+    const childBgInfo = bgTasksByCascadeId.get(childCascadeId);
+    const childActiveBgCount = Math.max(
+      childBgInfo?.nonDaemonCount ?? 0,
+      Math.max(0, childSummaryBgCount - (childBgInfo?.daemonCount ?? 0)),
+    );
     const childRunning =
-      Boolean(raw.notFullyIdle ?? raw.not_fully_idle) ||
-      isRunningCascadeStatus(raw.status);
+      Boolean(raw.notFullyIdle) ||
+      Boolean(raw.not_fully_idle) ||
+      isRunningCascadeStatus(raw.status) ||
+      Boolean(raw.hasRunningSubagents) ||
+      Boolean(raw.has_running_subagents) ||
+      Boolean(raw.hasActiveChildren) ||
+      Boolean(raw.has_active_children) ||
+      childActiveBgCount > 0;
     const childModifiedMs = parseProtoTimestampMs(
       raw.lastModifiedTime ?? raw.last_modified_time,
     );
@@ -756,6 +1058,8 @@ function parseTrajectoriesForSource(params: {
       waitingSteps: [],
       subagentRole: null,
       hasRunningChild: false,
+      activeBackgroundTaskCount: 0,
+      firstBackgroundTaskLabel: null,
       latestModifiedMs: 0,
     };
     if (waitingSteps.length > 0) {
@@ -766,6 +1070,12 @@ function parseTrajectoriesForSource(params: {
     }
     if (childRunning) {
       existing.hasRunningChild = true;
+    }
+    if (childActiveBgCount > 0) {
+      existing.activeBackgroundTaskCount += childActiveBgCount;
+      if (!existing.firstBackgroundTaskLabel && childBgInfo?.firstNonDaemonLabel) {
+        existing.firstBackgroundTaskLabel = childBgInfo.firstNonDaemonLabel;
+      }
     }
     if (childModifiedMs > existing.latestModifiedMs) {
       existing.latestModifiedMs = childModifiedMs;
@@ -794,10 +1104,16 @@ function parseTrajectoriesForSource(params: {
     ) {
       continue;
     }
+    if (isHiddenFromConversationList(metadata)) {
+      continue;
+    }
     const parentId = metadata
       ? (metadata.parentConversationId ?? metadata.parent_conversation_id)
       : null;
-    if (typeof parentId === 'string' && parentId.trim().length > 0) {
+    if (
+      (typeof parentId === 'string' && parentId.trim().length > 0) ||
+      directParentByCascadeId.has(cascadeId)
+    ) {
       continue;
     }
 
@@ -831,21 +1147,54 @@ function parseTrajectoriesForSource(params: {
       !killed && bubbled ? bubbled.waitingSteps : [];
     const effectiveWaitingSteps = [...ownWaitingSteps, ...bubbledWaitingSteps];
 
+    const battleModeInfo = isRecord(raw.battleModeInfo)
+      ? raw.battleModeInfo
+      : isRecord(raw.battle_mode_info)
+        ? raw.battle_mode_info
+        : null;
+    const hasRunningBattleChildren =
+      !killed && hasRunningBattleChildStatus(battleModeInfo);
+
+    const ownSummaryBgCount = killed
+      ? 0
+      : parseNonNegativeInt(
+          raw.backgroundTaskCount ?? raw.background_task_count,
+        );
+    const ownBgInfo = !killed ? bgTasksByCascadeId.get(cascadeId) : undefined;
+    const ownActiveBgCount = killed
+      ? 0
+      : Math.max(
+          ownBgInfo?.nonDaemonCount ?? 0,
+          Math.max(0, ownSummaryBgCount - (ownBgInfo?.daemonCount ?? 0)),
+        );
+    const bubbledActiveBgCount =
+      !killed && bubbled ? bubbled.activeBackgroundTaskCount : 0;
+    const activeBackgroundTaskCount = ownActiveBgCount + bubbledActiveBgCount;
+    const firstBackgroundTaskLabel =
+      ownBgInfo?.firstNonDaemonLabel ??
+      bubbled?.firstBackgroundTaskLabel ??
+      null;
+
     const hasRunningSubagents =
       !killed &&
-      Boolean(
-        raw.hasRunningSubagents ??
-          raw.has_running_subagents ??
-          raw.hasActiveChildren ??
-          raw.has_active_children ??
-          bubbled?.hasRunningChild,
-      );
+      (Boolean(raw.hasRunningSubagents) ||
+        Boolean(raw.has_running_subagents) ||
+        Boolean(raw.hasActiveChildren) ||
+        Boolean(raw.has_active_children) ||
+        Boolean(bubbled?.hasRunningChild) ||
+        hasRunningBattleChildren);
+
+    const isMainAgentActive = !killed && isRunningCascadeStatus(raw.status);
+    const isNotFullyIdle =
+      !killed && (Boolean(raw.notFullyIdle) || Boolean(raw.not_fully_idle));
+    const hasRunningBackgroundTasks = !killed && activeBackgroundTaskCount > 0;
 
     const isRunning =
       !killed &&
-      (Boolean(raw.notFullyIdle ?? raw.not_fully_idle) ||
+      (isMainAgentActive ||
+        isNotFullyIdle ||
         hasRunningSubagents ||
-        isRunningCascadeStatus(raw.status));
+        hasRunningBackgroundTasks);
 
     const lastModifiedAtMs = Math.max(
       parseProtoTimestampMs(raw.lastModifiedTime ?? raw.last_modified_time),
@@ -906,8 +1255,15 @@ function parseTrajectoriesForSource(params: {
     const hasUnreadFinishedTransition =
       completedUnreadAtMs > 0 &&
       (locallyReadAtMs === 0 || completedUnreadAtMs > locallyReadAtMs);
+    const rawTerminationReason =
+      raw.latestExecutorTerminationReason ??
+      raw.latest_executor_termination_reason;
+    const isUserCanceled =
+      isUserCanceledTerminationReason(rawTerminationReason);
+    const isInterrupted = Boolean(raw.interrupted) || isUserCanceled;
     const isUnread =
       !isLocallyCleared &&
+      (!isInterrupted || isMarkedUnreadRemotely) &&
       (isMarkedUnreadRemotely ||
         hasNewOutputSinceUser ||
         hasUnreadFinishedTransition);
@@ -923,10 +1279,7 @@ function parseTrajectoriesForSource(params: {
       activeCascadeId !== null &&
       (activeCascadeId === cascadeId || activeCascadeId === trajectoryId);
 
-    const terminationFailure = getTerminationFailureReason(
-      raw.latestExecutorTerminationReason ??
-        raw.latest_executor_termination_reason,
-    );
+    const terminationFailure = getTerminationFailureReason(rawTerminationReason);
     const hasUnresolvedError =
       !isRunning &&
       !killed &&
@@ -967,14 +1320,41 @@ function parseTrajectoriesForSource(params: {
     } else if (isRunning) {
       attentionKind = 'running';
       needsAttention = false;
-      attentionReason = hasRunningSubagents
-        ? 'Agent & subagents working…'
-        : 'Agent is working…';
+      if (isMainAgentActive && hasRunningSubagents) {
+        attentionReason = 'Agent & subagents working…';
+      } else if (isMainAgentActive && hasRunningBackgroundTasks) {
+        attentionReason =
+          activeBackgroundTaskCount === 1
+            ? 'Agent working • 1 background task'
+            : `Agent working • ${activeBackgroundTaskCount} background tasks`;
+      } else if (
+        !isMainAgentActive &&
+        hasRunningSubagents &&
+        hasRunningBackgroundTasks
+      ) {
+        attentionReason = 'Subagents & background tasks running…';
+      } else if (!isMainAgentActive && hasRunningSubagents) {
+        attentionReason = 'Subagents working…';
+      } else if (!isMainAgentActive && hasRunningBackgroundTasks) {
+        attentionReason =
+          activeBackgroundTaskCount === 1 && firstBackgroundTaskLabel
+            ? `Background task: ${truncateText(firstBackgroundTaskLabel, 64)}`
+            : activeBackgroundTaskCount === 1
+              ? '1 background task running…'
+              : `${activeBackgroundTaskCount} background tasks running…`;
+      } else if (
+        !isMainAgentActive &&
+        isNotFullyIdle &&
+        isIdleCascadeStatus(raw.status)
+      ) {
+        attentionReason = 'Background task running…';
+      } else {
+        attentionReason = 'Agent is working…';
+      }
     } else {
       attentionKind = 'idle';
       needsAttention = false;
-      attentionReason =
-        killed || Boolean(raw.interrupted) ? 'Interrupted' : 'Idle';
+      attentionReason = killed || isInterrupted ? 'Interrupted' : 'Idle';
     }
 
     const annotationTitle =
@@ -1023,6 +1403,7 @@ function parseTrajectoriesForSource(params: {
       isActiveThread,
       isPinned,
       hasRunningSubagents,
+      backgroundTaskCount: activeBackgroundTaskCount,
     });
   }
 
@@ -1068,6 +1449,7 @@ function parseTrajectoriesForSource(params: {
         activeCascadeId === parentCascadeId,
       isPinned: false,
       hasRunningSubagents: true,
+      backgroundTaskCount: bubbled.activeBackgroundTaskCount,
     });
   }
 
@@ -2048,6 +2430,7 @@ export function buildInboxSnapshot(
           instanceUuid: uuid,
           instanceName: name,
           rawTrajectories: rawInst.trajectories,
+          rawBackgroundTasks: rawInst.backgroundTasks,
           activeInstanceUuid,
           activeCascadeId,
           accountPrefix,
@@ -2892,6 +3275,13 @@ export function parseInboxBridgeMessage(
               .slice(0, MAX_PROJECTS_PER_INSTANCE)
               .filter((w): w is Record<string, unknown> => isRecord(w))
           : null;
+        const backgroundTasks = Array.isArray(item.backgroundTasks)
+          ? item.backgroundTasks
+              .slice(0, MAX_BACKGROUND_TASKS_PER_INSTANCE)
+              .filter(
+                (t): t is RawBridgeBackgroundTaskPayload => isRecord(t),
+              )
+          : null;
         instances.push({
           uuid: item.uuid,
           name: typeof item.name === 'string' ? item.name : undefined,
@@ -2905,6 +3295,7 @@ export function parseInboxBridgeMessage(
           homeDirUri:
             typeof item.homeDirUri === 'string' ? item.homeDirUri : null,
           trajectories: isRecord(item.trajectories) ? item.trajectories : null,
+          backgroundTasks,
           projects,
           workspaceInfos,
           error: typeof item.error === 'string' ? item.error : undefined,

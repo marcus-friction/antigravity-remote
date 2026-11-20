@@ -3731,4 +3731,144 @@ describe('Session and navigation regressions', () => {
     });
     expect(getThreadContextInjections()).toContain(null);
   });
+
+  it('does not post a completion notification when the agent turn is idle while a non-daemon background task is still running, and notifies only after background work finishes', async () => {
+    const RNPlatform = require('react-native').Platform;
+    RNPlatform.OS = 'android';
+    RNPlatform.Version = 34;
+
+    mockCookieStore.set('https://antigravity.google.com', {
+      SID: { name: 'SID', value: 'bg-task-session', domain: '.google.com' },
+    });
+    await navigate(
+      'https://antigravity.google.com/r/workstation-1?p=c%2Fbg-thread-1',
+      false,
+    );
+
+    const startIso = new Date(Date.now() - 120_000).toISOString();
+    const midIso = new Date(Date.now() - 60_000).toISOString();
+    const doneIso = new Date(Date.now() - 10_000).toISOString();
+
+    const sendSnapshot = async (params: {
+      status: string;
+      notFullyIdle: boolean;
+      summaryBgCount: number;
+      backgroundTasks: Array<{
+        conversationId: string;
+        task: { taskId: string; toolSummary: string; isDaemon: boolean };
+      }>;
+      modifiedIso: string;
+    }) => {
+      await act(async () => {
+        webView().props.onMessage({
+          nativeEvent: {
+            url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fbg-thread-1',
+            data: JSON.stringify({
+              type: 'AGY_INBOX_SNAPSHOT',
+              fetchedAtMs: Date.now(),
+              activeUrl:
+                'https://antigravity.google.com/r/workstation-1?p=c%2Fbg-thread-1',
+              activeInstanceUuid: 'workstation-1',
+              activeCascadeId: 'bg-thread-1',
+              instances: [
+                {
+                  uuid: 'workstation-1',
+                  name: 'Primary Box',
+                  status: 1,
+                  backgroundTasks: params.backgroundTasks,
+                  trajectories: {
+                    trajectorySummaries: {
+                      'bg-thread-1': {
+                        summary: 'Build and verify release',
+                        status: params.status,
+                        notFullyIdle: params.notFullyIdle,
+                        backgroundTaskCount: params.summaryBgCount,
+                        lastUserInputTime: startIso,
+                        lastModifiedTime: params.modifiedIso,
+                      },
+                    },
+                  },
+                },
+              ],
+            }),
+          },
+        });
+      });
+    };
+
+    // 1. Agent is actively running with a background task, then user switches apps
+    (syncNativeActionNotification as jest.Mock).mockClear();
+    await sendSnapshot({
+      status: 'CASCADE_RUN_STATUS_RUNNING',
+      notFullyIdle: true,
+      summaryBgCount: 1,
+      backgroundTasks: [
+        {
+          conversationId: 'bg-thread-1',
+          task: {
+            taskId: 'task-build',
+            toolSummary: 'Compile Android bundle',
+            isDaemon: false,
+          },
+        },
+      ],
+      modifiedIso: startIso,
+    });
+    await act(async () => {
+      for (const listener of mockAppStateListeners) {
+        listener('background');
+      }
+    });
+    expect(controls().props.runningCount).toBe(1);
+    expect(controls().props.attentionCount).toBe(0);
+    expect(syncNativeActionNotification).not.toHaveBeenCalled();
+
+    // 2. Agent finishes its turn (`CASCADE_RUN_STATUS_IDLE`, `notFullyIdle: false`) while the non-daemon task is STILL running ->
+    //    MUST stay in running state (`runningCount: 1`, `attentionCount: 0`) and MUST NOT fire a completion notification!
+    await sendSnapshot({
+      status: 'CASCADE_RUN_STATUS_IDLE',
+      notFullyIdle: false,
+      summaryBgCount: 1,
+      backgroundTasks: [
+        {
+          conversationId: 'bg-thread-1',
+          task: {
+            taskId: 'task-build',
+            toolSummary: 'Compile Android bundle',
+            isDaemon: false,
+          },
+        },
+      ],
+      modifiedIso: midIso,
+    });
+    expect(controls().props.runningCount).toBe(1);
+    expect(controls().props.attentionCount).toBe(0);
+    expect(syncNativeActionNotification).not.toHaveBeenCalled();
+    expect(controls().props.snapshot.threads[0]).toMatchObject({
+      cascadeId: 'bg-thread-1',
+      attentionKind: 'running',
+      attentionReason: 'Background task: Compile Android bundle',
+      backgroundTaskCount: 1,
+    });
+
+    // 3. Background task completes and agent finishes -> NOW enters blue FINISHED state and fires OS notification!
+    await sendSnapshot({
+      status: 'CASCADE_RUN_STATUS_IDLE',
+      notFullyIdle: false,
+      summaryBgCount: 0,
+      backgroundTasks: [],
+      modifiedIso: doneIso,
+    });
+    expect(controls().props.runningCount).toBe(0);
+    expect(controls().props.attentionCount).toBe(1);
+    expect(syncNativeActionNotification).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        count: 1,
+        title: '1 action open • Primary Box',
+        body: 'Build and verify release — Agent finished — unread updates',
+        deepLinkUrl: 'antigravity-remote://r/workstation-1?p=c%2Fbg-thread-1',
+        shouldAlert: true,
+      }),
+    );
+  });
 });

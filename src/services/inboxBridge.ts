@@ -9,8 +9,8 @@ import { ActiveThreadProjectContext } from '../types/inbox';
  *   `<script>` injection, `eval`, or `new Function` (satisfies `require-trusted-types-for 'script'`).
  * - Reuses the host page's first-party / enterprise gRPC-Web `ApiServicePromiseClient`
  *   to query `ListInstances` and `ProxyCommand` (`GetAllCascadeTrajectories`,
- *   `UpdateConversationAnnotations`, `RetrieveUserQuotaSummary`, `GetUserStatus`,
- *   and fallback `GetCommandModelConfigs`) across connected workstations.
+ *   `ListBackgroundTasks`, `UpdateConversationAnnotations`, `RetrieveUserQuotaSummary`,
+ *   `GetUserStatus`, and fallback `GetCommandModelConfigs`) across connected workstations.
  * - Never transmits data outside the local `window.ReactNativeWebView.postMessage` channel.
  */
 export const INBOX_BRIDGE_SCRIPT = `
@@ -32,6 +32,7 @@ export const INBOX_BRIDGE_SCRIPT = `
     }
 
     var GET_TRAJECTORIES_PATH = '/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories';
+    var LIST_BACKGROUND_TASKS_PATH = '/exa.language_server_pb.LanguageServerService/ListBackgroundTasks';
     var LIST_PROJECTS_PATH = '/exa.language_server_pb.LanguageServerService/ListProjects';
     var READ_PROJECTS_PATH = '/exa.language_server_pb.LanguageServerService/ReadProjects';
     var GET_WORKSPACE_INFOS_PATH = '/exa.language_server_pb.LanguageServerService/GetWorkspaceInfos';
@@ -57,6 +58,7 @@ export const INBOX_BRIDGE_SCRIPT = `
     var POLL_INTERVAL_MS = 20000;
     var USAGE_POLL_MIN_INTERVAL_MS = 45000;
     var INSTANCE_RPC_TIMEOUT_MS = 8000;
+    var BACKGROUND_TASKS_RPC_TIMEOUT_MS = 3500;
     var PROJECTS_RPC_TIMEOUT_MS = 5000;
     var START_CASCADE_TIMEOUT_MS = 5000;
     var USAGE_RPC_TIMEOUT_MS = 3500;
@@ -70,6 +72,8 @@ export const INBOX_BRIDGE_SCRIPT = `
     var cachedAuthFirstParty = null;
     var cachedApiKey = null;
     var lastTrajectoryCache = Object.create(null);
+    var lastBackgroundTasksCache = Object.create(null);
+    var unsupportedBackgroundTasksCache = Object.create(null);
     var lastProjectsCache = Object.create(null);
     var lastWorkspaceInfosCache = Object.create(null);
     var lastHomeDirCache = Object.create(null);
@@ -140,7 +144,8 @@ export const INBOX_BRIDGE_SCRIPT = `
           !res.project_ids &&
           !res.entries &&
           !res.folderUri &&
-          !res.folder_uri
+          !res.folder_uri &&
+          !res.tasks
       );
     }
 
@@ -982,6 +987,80 @@ export const INBOX_BRIDGE_SCRIPT = `
         });
     }
 
+    function fetchBackgroundTasksForInstance(ctx, uuid, version) {
+      var versionTag = version || '*';
+      if (unsupportedBackgroundTasksCache[uuid] === versionTag) {
+        return Promise.resolve({ ok: false, tasks: null });
+      }
+      return callProxyJson(
+        ctx,
+        uuid,
+        LIST_BACKGROUND_TASKS_PATH,
+        '{}',
+        BACKGROUND_TASKS_RPC_TIMEOUT_MS
+      )
+        .then(function(res) {
+          if (!res || typeof res !== 'object' || hasConnectRpcError(res)) {
+            if (
+              res &&
+              typeof res.code === 'string' &&
+              res.code.toLowerCase() === 'unimplemented'
+            ) {
+              unsupportedBackgroundTasksCache[uuid] = versionTag;
+            }
+            return { ok: false, tasks: null };
+          }
+          if (!Array.isArray(res.tasks) && Object.keys(res).length > 0) {
+            return { ok: false, tasks: null };
+          }
+          var rawTasks = Array.isArray(res.tasks) ? res.tasks : [];
+          var compact = [];
+          for (var i = 0; i < rawTasks.length && compact.length < 256; i++) {
+            var entry = rawTasks[i];
+            if (!entry || typeof entry !== 'object') continue;
+            var convId = entry.conversationId || entry.conversation_id || '';
+            if (typeof convId !== 'string' || !SAFE_ID_RE.test(convId)) continue;
+            var taskObj =
+              entry.task && typeof entry.task === 'object' ? entry.task : null;
+            var compactedTask = null;
+            if (taskObj) {
+              var rawTaskId = taskObj.taskId || taskObj.task_id;
+              var rawToolName = taskObj.toolName || taskObj.tool_name;
+              var rawToolSummary = taskObj.toolSummary || taskObj.tool_summary;
+              var rawDescription = taskObj.description;
+              compactedTask = {
+                taskId:
+                  typeof rawTaskId === 'string' && rawTaskId.trim()
+                    ? rawTaskId.trim().slice(0, 128)
+                    : undefined,
+                toolName:
+                  typeof rawToolName === 'string' && rawToolName.trim()
+                    ? rawToolName.trim().slice(0, 64)
+                    : undefined,
+                toolSummary:
+                  typeof rawToolSummary === 'string' && rawToolSummary.trim()
+                    ? rawToolSummary.trim().slice(0, 140)
+                    : undefined,
+                description:
+                  typeof rawDescription === 'string' && rawDescription.trim()
+                    ? rawDescription.trim().slice(0, 140)
+                    : undefined,
+                isDaemon: Boolean(taskObj.isDaemon || taskObj.is_daemon)
+              };
+            }
+            compact.push({
+              conversationId: convId,
+              task: compactedTask
+            });
+          }
+          lastBackgroundTasksCache[uuid] = compact;
+          return { ok: true, tasks: compact };
+        })
+        .catch(function() {
+          return { ok: false, tasks: null };
+        });
+    }
+
     function refresh(forceUsage) {
       syncFullBleedWorkspace();
       var wantForcedUsage = Boolean(forceUsage);
@@ -1051,6 +1130,8 @@ export const INBOX_BRIDGE_SCRIPT = `
 
                 if (!shouldQuery) {
                   delete lastTrajectoryCache[uuid];
+                  delete lastBackgroundTasksCache[uuid];
+                  delete unsupportedBackgroundTasksCache[uuid];
                   delete lastProjectsCache[uuid];
                   delete lastWorkspaceInfosCache[uuid];
                   delete lastHomeDirCache[uuid];
@@ -1063,6 +1144,7 @@ export const INBOX_BRIDGE_SCRIPT = `
                       updatedAtMs: updatedAtMs,
                       homeDirUri: null,
                       trajectories: null,
+                      backgroundTasks: null,
                       projects: null,
                       workspaceInfos: null
                     })
@@ -1102,6 +1184,9 @@ export const INBOX_BRIDGE_SCRIPT = `
                       error: err && err.message ? String(err.message) : 'Unreachable'
                     };
                   });
+                // Always fetch live running background tasks (even while backgrounded) so
+                // threads waiting on background commands/timers/workflows never notify early.
+                var bgTasksJob = fetchBackgroundTasksForInstance(ctx, uuid, version);
                 var isHiddenBackgroundPoll =
                   typeof document !== 'undefined' &&
                   document.visibilityState === 'hidden';
@@ -1116,10 +1201,17 @@ export const INBOX_BRIDGE_SCRIPT = `
                   : fetchWorkspaceInfosForInstance(ctx, uuid);
 
                 instanceJobs.push(
-                  Promise.all([trajJob, projectsJob, wsInfoJob]).then(function(triple) {
-                    var trajResult = triple[0];
-                    var projectsResult = triple[1];
-                    var wsResult = triple[2] || { workspaceInfos: null, homeDirUri: null };
+                  Promise.all([trajJob, bgTasksJob, projectsJob, wsInfoJob]).then(function(quad) {
+                    var trajResult = quad[0];
+                    var bgTasksResult = quad[1];
+                    var projectsResult = quad[2];
+                    var wsResult = quad[3] || { workspaceInfos: null, homeDirUri: null };
+                    var resolvedBgTasks =
+                      bgTasksResult && bgTasksResult.ok
+                        ? bgTasksResult.tasks
+                        : !trajResult.ok
+                          ? (lastBackgroundTasksCache[uuid] || null)
+                          : null;
                     var payload = {
                       uuid: uuid,
                       name: name || uuid,
@@ -1128,6 +1220,7 @@ export const INBOX_BRIDGE_SCRIPT = `
                       updatedAtMs: updatedAtMs,
                       homeDirUri: wsResult.homeDirUri || null,
                       trajectories: trajResult.trajectories,
+                      backgroundTasks: resolvedBgTasks,
                       projects: projectsResult,
                       workspaceInfos: wsResult.workspaceInfos
                     };
