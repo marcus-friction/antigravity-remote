@@ -1,3 +1,4 @@
-• Fix software keyboard layout so the workspace and Sidebar sit flush above the keyboard without double push-up or bottom bar overlap across Android edge-to-edge and Chromium M139+ WebView.
-• Reliably hide and restore the drawer pull-handle and bottom mode bar across animated, floating, and split-screen keyboard transitions.
-• Pin full-bleed /r/<machine> workstation frames to the unobscured visual viewport while typing.
+• Onyx Dark design matching Antigravity 2.33+, hiding the web sidebar so launch and Back land in a thread or Inbox.
+• Rich color-coded thread card notifications mirroring in-app status badges and actions.
+• Full Projects tab: list all server projects, nested thread cards, fixed + New thread launch, and Add Project in the sidebar.
+• Open the sidebar while the keyboard is displayed; Usage merges model thinking levels and hides Prompt/Flow credits.
