@@ -6,6 +6,7 @@ import {
   buildOpenHostSettingsScript,
   buildStartProjectChatScript,
 } from '../src/services/inboxBridge';
+import { InboxBridgeMessage } from '../src/types/inbox';
 import {
   buildActionNotificationSyncState,
   buildThreadNotificationDeepLink,
@@ -1772,12 +1773,34 @@ describe('inboxParser', () => {
       cascadeId: 'new-cascade-77',
     };
 
+    const windowMessageListeners: Array<(evt: any) => void> = [];
     const hubIframe = {
       tagName: 'IFRAME',
       src: 'https://antigravity.static.usercontent.goog/web/v1/?iframe=true',
       contentWindow: {
         postMessage: (msg: any, origin: string) => {
           iframeMessages.push({ payload: msg, origin });
+          if (msg && typeof msg.jspbPayload === 'string') {
+            try {
+              const arr = JSON.parse(msg.jspbPayload);
+              if (
+                Array.isArray(arr) &&
+                Array.isArray(arr[1]) &&
+                typeof arr[1][0] === 'string'
+              ) {
+                const respEvt = {
+                  origin: 'https://antigravity.static.usercontent.goog',
+                  source: hubIframe.contentWindow,
+                  data: {
+                    jspbPayload: JSON.stringify([null, null, null, [arr[1][0]]]),
+                  },
+                };
+                for (const fn of windowMessageListeners) {
+                  fn(respEvt);
+                }
+              }
+            } catch {}
+          }
         },
       },
       style: {
@@ -1871,7 +1894,11 @@ describe('inboxParser', () => {
           locationObj.href = parsed.toString();
         },
       },
-      addEventListener: () => {},
+      addEventListener: (name: string, fn: (evt: any) => void) => {
+        if (name === 'message') {
+          windowMessageListeners.push(fn);
+        }
+      },
       ReactNativeWebView: {
         postMessage: (raw: string) => {
           postedNativeMessages.push(JSON.parse(raw));
@@ -1908,12 +1935,13 @@ describe('inboxParser', () => {
     postedNativeMessages.length = 0;
     proxyCommandCalls.length = 0;
 
-    // 1. Successful StartCascade with workspaceUri creates thread & navigates iframe
+    // 1. Successful StartCascade with workspaceUri + projectId sends UUID cascadeId, source, projectEnvConfig & navigates iframe
     await windowObj.__agyInboxBridge.startProjectChat(
       'req-success',
       'box-1',
       'file:///home/dev/antigravity-remote',
       'https://antigravity.google.com/r/box-1',
+      'proj-remote-1',
     );
 
     const startCall = proxyCommandCalls.find((r) =>
@@ -1921,12 +1949,28 @@ describe('inboxParser', () => {
     );
     expect(startCall).toBeDefined();
     expect(startCall!.targetUuid).toBe('box-1');
-    expect(JSON.parse(startCall!.jsonBody)).toMatchObject({
-      workspaceUris: ['file:///home/dev/antigravity-remote'],
+    const parsedStartBody = JSON.parse(startCall!.jsonBody);
+    expect(parsedStartBody.cascadeId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
+    expect(parsedStartBody.source).toBe(
+      'CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT',
+    );
+    // StartCascadeRequest carries projectId exclusively inside projectEnvConfig
+    // (never as an unknown top-level field).
+    expect(parsedStartBody).not.toHaveProperty('projectId');
+    expect(parsedStartBody.projectEnvConfig).toEqual({
+      projectId: 'proj-remote-1',
+      defaultProjectEnvironment: {},
     });
     expect(iframeMessages).toEqual([
       {
-        payload: { jspbPayload: JSON.stringify([null, ['/c/new-cascade-77']]) },
+        payload: {
+          jspbPayload: JSON.stringify([
+            null,
+            ['/c/new-cascade-77?project=proj-remote-1'],
+          ]),
+        },
         origin: 'https://antigravity.static.usercontent.goog',
       },
       {
@@ -1943,7 +1987,7 @@ describe('inboxParser', () => {
         'https://antigravity.google.com/r/box-1?p=c%2Fnew-cascade-77',
     });
 
-    // 2. Fallback to new-chat overview when StartCascade fails
+    // 2. Fallback to project-scoped overview (`/?project=<id>`) when StartCascade fails
     iframeMessages.length = 0;
     postedNativeMessages.length = 0;
     nextStartCascadeResponse = null;
@@ -1953,11 +1997,14 @@ describe('inboxParser', () => {
       'box-1',
       null,
       'https://antigravity.google.com/r/box-1',
+      'proj-remote-1',
     );
 
     expect(iframeMessages).toEqual([
       {
-        payload: { jspbPayload: JSON.stringify([null, ['/']]) },
+        payload: {
+          jspbPayload: JSON.stringify([null, ['/?project=proj-remote-1']]),
+        },
         origin: 'https://antigravity.static.usercontent.goog',
       },
       {
@@ -1972,5 +2019,407 @@ describe('inboxParser', () => {
       cascadeId: null,
       targetUrl: 'https://antigravity.google.com/r/box-1',
     });
+  });
+
+  it('lists ALL non-archived server projects from ListProjects/ReadProjects even with zero recent activity', () => {
+    const rawMessage = parseInboxBridgeMessage(
+      JSON.stringify({
+        type: 'AGY_INBOX_SNAPSHOT',
+        fetchedAtMs: 1_762_300_000_000,
+        activeUrl: 'https://antigravity.google.com/r/box-1',
+        activeInstanceUuid: 'box-1',
+        activeCascadeId: null,
+        instances: [
+          {
+            uuid: 'box-1',
+            name: 'Dev Workstation',
+            status: 1,
+            homeDirUri: 'file:///home/marcus',
+            trajectories: {
+              'thread-1': {
+                summary: 'Fix auth redirect',
+                status: 1,
+                lastModifiedTime: '2026-11-05T10:00:00Z',
+                lastUserViewTime: '2026-11-05T10:01:00Z',
+                trajectoryMetadata: { projectId: 'proj-alpha' },
+              },
+            },
+            projects: [
+              {
+                id: 'proj-alpha',
+                name: 'Alpha App',
+                archived: false,
+                updatedAt: '2026-11-05T10:00:00Z',
+                projectResources: {
+                  resources: [
+                    { gitFolder: { folderUri: 'file:///home/marcus/alpha' } },
+                  ],
+                },
+                projectConversations: {
+                  conversations: [{ conversationId: 'thread-1' }],
+                },
+              },
+              {
+                id: 'proj-quiet',
+                name: 'Quiet Repo',
+                archived: false,
+                updatedAt: '2026-10-01T08:00:00Z',
+                projectResources: {
+                  resources: [{ folderUri: 'file:///home/marcus/quiet-repo' }],
+                },
+                projectConversations: { conversations: [] },
+              },
+              {
+                id: 'proj-archived',
+                name: 'Archived Old Repo',
+                archived: true,
+                projectResources: {
+                  resources: [{ folderUri: 'file:///home/marcus/archived' }],
+                },
+              },
+            ],
+            workspaceInfos: [
+              { workspaceUri: 'file:///home/marcus/tracked-only' },
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(rawMessage?.type).toBe('AGY_INBOX_SNAPSHOT');
+    const snapshot = buildInboxSnapshot(
+      rawMessage as Extract<InboxBridgeMessage, { type: 'AGY_INBOX_SNAPSHOT' }>,
+    );
+    const groups = buildProjectGroups(snapshot);
+
+    expect(groups.map((g) => g.name)).toEqual([
+      'Alpha App',
+      'Quiet Repo',
+      'tracked-only',
+    ]);
+    expect(groups[0]).toMatchObject({
+      projectId: 'proj-alpha',
+      workspaceUri: 'file:///home/marcus/alpha',
+    });
+    expect(groups[0].threads.map((t) => t.cascadeId)).toEqual(['thread-1']);
+    expect(groups[1]).toMatchObject({
+      projectId: 'proj-quiet',
+      workspaceUri: 'file:///home/marcus/quiet-repo',
+      threads: [],
+    });
+    expect(groups.find((g) => g.name === 'Archived Old Repo')).toBeUndefined();
+  });
+
+  it('executes listDirectory and createProject (existing + scratch) inside VM sandbox', async () => {
+    const postedNativeMessages: any[] = [];
+    const rpcCalls: Array<{ rpcPath: string; body: any }> = [];
+
+    class MockProxyCommandRequest {
+      rpcPath = '';
+      payload: Uint8Array = new Uint8Array();
+      setTargetInstanceUuid() {}
+      setRpcPath(path: string) {
+        this.rpcPath = path;
+      }
+      setPayload(bytes: Uint8Array) {
+        this.payload = bytes;
+      }
+      putHeaders() {}
+    }
+    class MockListInstancesRequest {}
+    class MockApiServicePromiseClient {
+      listInstances() {
+        return Promise.resolve({ getInstancesList: () => [] });
+      }
+      proxyCommand(req: MockProxyCommandRequest) {
+        const body = JSON.parse(new TextDecoder().decode(req.payload));
+        rpcCalls.push({ rpcPath: req.rpcPath, body });
+        if (req.rpcPath.includes('/GetDefaultProjectDir')) {
+          return Promise.resolve({
+            getPayload_asU8: () =>
+              new TextEncoder().encode(
+                JSON.stringify({
+                  defaultProjectDirUri: 'file:///home/marcus/projects',
+                }),
+              ),
+          });
+        }
+        if (req.rpcPath.includes('/ReadDir')) {
+          return Promise.resolve({
+            getPayload_asU8: () =>
+              new TextEncoder().encode(
+                JSON.stringify({
+                  entries: [
+                    {
+                      uri: 'file:///home/marcus/projects/zeta',
+                      fileType: 'FILE_TYPE_DIRECTORY',
+                    },
+                    {
+                      uri: 'file:///home/marcus/projects/README.md',
+                      fileType: 'FILE_TYPE_FILE',
+                    },
+                    {
+                      uri: 'file:///home/marcus/projects/alpha',
+                      fileType: 2,
+                    },
+                  ],
+                }),
+              ),
+          });
+        }
+        if (req.rpcPath.includes('/ResolveFolder')) {
+          return Promise.resolve({
+            getPayload_asU8: () =>
+              new TextEncoder().encode(
+                JSON.stringify({ resourceType: 2 }),
+              ),
+          });
+        }
+        if (req.rpcPath.includes('/GetWorkspaceInfos')) {
+          return Promise.resolve({
+            getPayload_asU8: () =>
+              new TextEncoder().encode(
+                JSON.stringify({
+                  homeDirUri: 'file:///home/marcus',
+                  workspaceInfos: [],
+                }),
+              ),
+          });
+        }
+        if (req.rpcPath.includes('/CreateScratchProjectFolder')) {
+          return Promise.resolve({
+            getPayload_asU8: () =>
+              new TextEncoder().encode(
+                JSON.stringify({
+                  folderUri: 'file:///home/marcus/projects/brand-new',
+                  isGitRepo: false,
+                }),
+              ),
+          });
+        }
+        if (req.rpcPath.includes('/CreateProject')) {
+          return Promise.resolve({
+            getPayload_asU8: () =>
+              new TextEncoder().encode(
+                JSON.stringify({
+                  project: {
+                    id: body.project?.id || 'created-proj-1',
+                    name: body.project?.name || 'Created',
+                  },
+                }),
+              ),
+          });
+        }
+        return Promise.resolve({
+          getPayload_asU8: () => new TextEncoder().encode('{}'),
+        });
+      }
+    }
+
+    const windowObj: any = {
+      location: {
+        origin: 'https://antigravity.google.com',
+        hostname: 'antigravity.google.com',
+        pathname: '/r/box-1',
+        search: '',
+        href: 'https://antigravity.google.com/r/box-1',
+      },
+      navigator: { onLine: true },
+      default_GoogleAntigravity: {
+        K: {
+          devtools_jetski_boq_api_proto: {
+            ApiServicePromiseClient: MockApiServicePromiseClient,
+            ProxyCommandRequest: MockProxyCommandRequest,
+            ListInstancesRequest: MockListInstancesRequest,
+          },
+        },
+      },
+      history: { replaceState: () => {} },
+      addEventListener: () => {},
+      ReactNativeWebView: {
+        postMessage: (raw: string) => {
+          postedNativeMessages.push(JSON.parse(raw));
+        },
+      },
+    };
+    const sandbox = vm.createContext({
+      window: windowObj,
+      document: {
+        cookie: 'SID=12345',
+        visibilityState: 'visible',
+        documentElement: null,
+        body: null,
+        querySelectorAll: () => [],
+      },
+      navigator: windowObj.navigator,
+      TextEncoder,
+      TextDecoder,
+      Uint8Array,
+      URL,
+      URLSearchParams,
+      Promise,
+      setTimeout: () => 1,
+      clearTimeout: () => {},
+      setInterval: () => 1,
+      clearInterval: () => {},
+    });
+
+    vm.runInContext(INBOX_BRIDGE_SCRIPT, sandbox);
+    postedNativeMessages.length = 0;
+
+    // 1. listDirectory defaults to GetDefaultProjectDir and filters/sorts directories
+    await windowObj.__agyInboxBridge.listDirectory('dir-1', 'box-1', null);
+    expect(postedNativeMessages).toContainEqual({
+      type: 'AGY_INBOX_LIST_DIR_RESULT',
+      requestId: 'dir-1',
+      ok: true,
+      currentUri: 'file:///home/marcus/projects',
+      parentUri: 'file:///home/marcus',
+      entries: [
+        { name: 'alpha', uri: 'file:///home/marcus/projects/alpha' },
+        { name: 'zeta', uri: 'file:///home/marcus/projects/zeta' },
+      ],
+      error: null,
+    });
+
+    // 2. createProject (existing folder with ~/ tilde path) expands homeDirUri, detects git via resourceType === 2
+    postedNativeMessages.length = 0;
+    rpcCalls.length = 0;
+    await windowObj.__agyInboxBridge.createProject(
+      'cp-1',
+      'box-1',
+      'existing',
+      'Alpha Project',
+      '~/projects/alpha',
+    );
+    const createExistingCall = rpcCalls.find((c) =>
+      c.rpcPath.includes('/CreateProject'),
+    );
+    expect(createExistingCall).toBeDefined();
+    expect(createExistingCall!.body.project).toMatchObject({
+      name: 'Alpha Project',
+      isWorkspaceOnly: false,
+      projectResources: {
+        resources: [
+          { gitFolder: { folderUri: 'file:///home/marcus/projects/alpha' } },
+        ],
+      },
+    });
+    expect(postedNativeMessages).toContainEqual(
+      expect.objectContaining({
+        type: 'AGY_INBOX_CREATE_PROJECT_RESULT',
+        requestId: 'cp-1',
+        ok: true,
+        projectName: 'Alpha Project',
+        workspaceUri: 'file:///home/marcus/projects/alpha',
+      }),
+    );
+
+    // 3. createProject (scratch folder) calls CreateScratchProjectFolder + CreateProject
+    postedNativeMessages.length = 0;
+    rpcCalls.length = 0;
+    await windowObj.__agyInboxBridge.createProject(
+      'cp-2',
+      'box-1',
+      'scratch',
+      'brand-new',
+      null,
+    );
+    expect(
+      rpcCalls.some((c) => c.rpcPath.includes('/CreateScratchProjectFolder')),
+    ).toBe(true);
+    expect(postedNativeMessages).toContainEqual(
+      expect.objectContaining({
+        type: 'AGY_INBOX_CREATE_PROJECT_RESULT',
+        requestId: 'cp-2',
+        ok: true,
+        projectName: 'brand-new',
+        workspaceUri: 'file:///home/marcus/projects/brand-new',
+      }),
+    );
+  });
+
+  it('builds structured color-coded notification card items with per-thread deep links', () => {
+    const sync = buildActionNotificationSyncState({
+      stage: 'authenticated',
+      mode: 'all_attention',
+      isAppForeground: false,
+      isDrawerOpen: false,
+      previousOpenThreadIds: new Set(),
+      threads: [
+        {
+          id: 'box-1:c-1',
+          cascadeId: 'c-1',
+          trajectoryId: 'c-1',
+          instanceUuid: 'box-1',
+          instanceName: 'Mac Studio',
+          title: 'Deploy database migration',
+          attentionKind: 'approval',
+          needsAttention: true,
+          attentionReason: 'Approve command: prisma migrate deploy',
+          stepCount: 8,
+          waitingStepCount: 1,
+          lastModifiedAtMs: 1_762_300_000_000,
+          lastUserViewAtMs: 1_762_299_000_000,
+          workspaceName: 'backend-api',
+          workspaceUri: 'file:///home/dev/backend-api',
+          childPath: '/c/c-1',
+          targetUrl: 'https://antigravity.google.com/r/box-1?p=c%2Fc-1',
+          isActiveThread: false,
+          isPinned: false,
+          hasRunningSubagents: false,
+          source: 'remote-control',
+        },
+        {
+          id: 'box-1:c-2',
+          cascadeId: 'c-2',
+          trajectoryId: 'c-2',
+          instanceUuid: 'box-1',
+          instanceName: 'Mac Studio',
+          title: 'Run unit tests',
+          attentionKind: 'unread',
+          needsAttention: true,
+          attentionReason: 'Finished — unread updates',
+          stepCount: 4,
+          waitingStepCount: 0,
+          lastModifiedAtMs: 1_762_299_500_000,
+          lastUserViewAtMs: 1_762_298_000_000,
+          workspaceName: 'frontend',
+          workspaceUri: 'file:///home/dev/frontend',
+          childPath: '/c/c-2',
+          targetUrl: 'https://antigravity.google.com/r/box-1?p=c%2Fc-2',
+          isActiveThread: false,
+          isPinned: false,
+          hasRunningSubagents: false,
+          source: 'remote-control',
+        },
+      ],
+    });
+
+    expect(sync.notification).not.toBeNull();
+    expect(sync.notification!.count).toBe(2);
+    expect(sync.notification!.deepLinkUrl).toBe('antigravity-remote://inbox');
+    expect(sync.notification!.items).toEqual([
+      {
+        id: 'box-1:c-1',
+        title: 'Deploy database migration',
+        attentionKind: 'approval',
+        statusLabel: 'NEEDS APPROVAL',
+        attentionReason: 'Approve command: prisma migrate deploy',
+        subtitle: 'Mac Studio • backend-api',
+        deepLinkUrl: 'antigravity-remote://r/box-1?p=c%2Fc-1',
+      },
+      {
+        id: 'box-1:c-2',
+        title: 'Run unit tests',
+        attentionKind: 'unread',
+        statusLabel: 'FINISHED',
+        attentionReason: 'Finished — unread updates',
+        subtitle: 'Mac Studio • frontend',
+        deepLinkUrl: 'antigravity-remote://r/box-1?p=c%2Fc-2',
+      },
+    ]);
+    expect(sync.notification!.expandedBody).toContain('🟠 NEEDS APPROVAL');
+    expect(sync.notification!.expandedBody).toContain('🔵 FINISHED');
   });
 });

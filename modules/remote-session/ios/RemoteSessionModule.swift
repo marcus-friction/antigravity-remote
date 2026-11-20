@@ -103,6 +103,270 @@ public class RemoteSessionModule: Module {
     }
   }
 
+  private struct ActionCardItem {
+    let title: String
+    let attentionKind: String
+    let statusLabel: String
+    let attentionReason: String
+    let subtitle: String
+  }
+
+  private func parseActionCardItems(_ itemsJson: String) -> [ActionCardItem] {
+    guard !itemsJson.isEmpty,
+          let data = itemsJson.data(using: .utf8),
+          let rawArray = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
+      return []
+    }
+    var items: [ActionCardItem] = []
+    for dict in rawArray.prefix(4) {
+      let title = (dict["title"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !title.isEmpty else { continue }
+      let kind = (dict["attentionKind"] as? String ?? "unread").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      let rawLabel = (dict["statusLabel"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+      let statusLabel: String
+      if !rawLabel.isEmpty {
+        statusLabel = rawLabel
+      } else {
+        switch kind {
+        case "approval": statusLabel = "NEEDS APPROVAL"
+        case "error": statusLabel = "NEEDS REVIEW"
+        case "unread": statusLabel = "FINISHED"
+        case "running": statusLabel = "WORKING"
+        default: statusLabel = "UPDATE"
+        }
+      }
+      let reason = (dict["attentionReason"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+      let subtitle = (dict["subtitle"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+      items.append(ActionCardItem(
+        title: title,
+        attentionKind: kind,
+        statusLabel: statusLabel,
+        attentionReason: reason,
+        subtitle: subtitle
+      ))
+    }
+    return items
+  }
+
+  private func cardPalette(for kind: String) -> (
+    cardBg: UIColor,
+    cardBorder: UIColor,
+    accent: UIColor,
+    badgeBg: UIColor,
+    badgeBorder: UIColor,
+    badgeText: UIColor,
+    reasonText: UIColor
+  ) {
+    switch kind {
+    case "approval":
+      return (
+        cardBg: UIColor(red: 0.106, green: 0.098, blue: 0.082, alpha: 1.0),
+        cardBorder: UIColor(red: 0.290, green: 0.220, blue: 0.094, alpha: 1.0),
+        accent: UIColor(red: 0.961, green: 0.620, blue: 0.043, alpha: 1.0),
+        badgeBg: UIColor(red: 0.961, green: 0.620, blue: 0.043, alpha: 0.17),
+        badgeBorder: UIColor(red: 0.961, green: 0.620, blue: 0.043, alpha: 0.42),
+        badgeText: UIColor(red: 0.992, green: 0.902, blue: 0.541, alpha: 1.0),
+        reasonText: UIColor(red: 0.992, green: 0.902, blue: 0.541, alpha: 1.0)
+      )
+    case "error":
+      return (
+        cardBg: UIColor(red: 0.110, green: 0.082, blue: 0.090, alpha: 1.0),
+        cardBorder: UIColor(red: 0.306, green: 0.149, blue: 0.169, alpha: 1.0),
+        accent: UIColor(red: 0.937, green: 0.267, blue: 0.267, alpha: 1.0),
+        badgeBg: UIColor(red: 0.937, green: 0.267, blue: 0.267, alpha: 0.17),
+        badgeBorder: UIColor(red: 0.937, green: 0.267, blue: 0.267, alpha: 0.42),
+        badgeText: UIColor(red: 0.996, green: 0.792, blue: 0.792, alpha: 1.0),
+        reasonText: UIColor(red: 0.988, green: 0.647, blue: 0.647, alpha: 1.0)
+      )
+    case "unread":
+      return (
+        cardBg: UIColor(red: 0.078, green: 0.098, blue: 0.149, alpha: 1.0),
+        cardBorder: UIColor(red: 0.141, green: 0.227, blue: 0.380, alpha: 1.0),
+        accent: UIColor(red: 0.196, green: 0.475, blue: 0.976, alpha: 1.0),
+        badgeBg: UIColor(red: 0.196, green: 0.475, blue: 0.976, alpha: 0.19),
+        badgeBorder: UIColor(red: 0.541, green: 0.706, blue: 0.973, alpha: 0.44),
+        badgeText: UIColor(red: 0.749, green: 0.859, blue: 0.996, alpha: 1.0),
+        reasonText: UIColor(red: 0.576, green: 0.773, blue: 0.992, alpha: 1.0)
+      )
+    default:
+      return (
+        cardBg: UIColor(red: 0.086, green: 0.086, blue: 0.106, alpha: 1.0),
+        cardBorder: UIColor(red: 0.165, green: 0.169, blue: 0.200, alpha: 1.0),
+        accent: UIColor(red: 0.392, green: 0.455, blue: 0.545, alpha: 1.0),
+        badgeBg: UIColor(white: 1.0, alpha: 0.08),
+        badgeBorder: UIColor(white: 1.0, alpha: 0.16),
+        badgeText: UIColor(red: 0.737, green: 0.741, blue: 0.776, alpha: 1.0),
+        reasonText: UIColor(red: 0.737, green: 0.741, blue: 0.776, alpha: 1.0)
+      )
+    }
+  }
+
+  private func renderCardsAttachment(items: [ActionCardItem], totalCount: Int) -> UNNotificationAttachment? {
+    let rendered = Array(items.prefix(3))
+    guard !rendered.isEmpty else { return nil }
+
+    let width: CGFloat = 340
+    let pad: CGFloat = 10
+    let cardHeight: CGFloat = 68
+    let cardGap: CGFloat = 7
+    let remaining = max(0, totalCount - rendered.count)
+    let footerHeight: CGFloat = remaining > 0 ? 22 : 0
+    let totalHeight = pad * 2
+      + CGFloat(rendered.count) * cardHeight
+      + CGFloat(max(0, rendered.count - 1)) * cardGap
+      + footerHeight
+
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 2.0
+    format.opaque = true
+    let renderer = UIGraphicsImageRenderer(size: CGSize(width: width, height: totalHeight), format: format)
+
+    let image = renderer.image { _ in
+      UIColor(red: 0.043, green: 0.043, blue: 0.055, alpha: 1.0).setFill()
+      UIRectFill(CGRect(x: 0, y: 0, width: width, height: totalHeight))
+
+      let truncatingParagraph = NSMutableParagraphStyle()
+      truncatingParagraph.lineBreakMode = .byTruncatingTail
+
+      let rightParagraph = NSMutableParagraphStyle()
+      rightParagraph.alignment = .right
+      rightParagraph.lineBreakMode = .byTruncatingTail
+
+      var y = pad
+      for item in rendered {
+        let palette = cardPalette(for: item.attentionKind)
+        let cardRect = CGRect(x: pad, y: y, width: width - pad * 2, height: cardHeight)
+        let cardPath = UIBezierPath(roundedRect: cardRect, cornerRadius: 10)
+        palette.cardBg.setFill()
+        cardPath.fill()
+        palette.cardBorder.setStroke()
+        cardPath.lineWidth = 1.0
+        cardPath.stroke()
+
+        let accentRect = CGRect(x: cardRect.minX + 6, y: cardRect.minY + 7, width: 3.5, height: cardHeight - 14)
+        palette.accent.setFill()
+        UIBezierPath(roundedRect: accentRect, cornerRadius: 2).fill()
+
+        let contentX = accentRect.maxX + 9
+        let contentWidth = cardRect.maxX - contentX - 10
+
+        let badgeAttrs: [NSAttributedString.Key: Any] = [
+          .font: UIFont.systemFont(ofSize: 9, weight: .bold),
+          .foregroundColor: palette.badgeText,
+        ]
+        let badgeSize = (item.statusLabel as NSString).size(withAttributes: badgeAttrs)
+        let badgeRect = CGRect(
+          x: contentX,
+          y: cardRect.minY + 8,
+          width: min(contentWidth * 0.56, badgeSize.width + 10),
+          height: 15
+        )
+        let badgePath = UIBezierPath(roundedRect: badgeRect, cornerRadius: 4)
+        palette.badgeBg.setFill()
+        badgePath.fill()
+        palette.badgeBorder.setStroke()
+        badgePath.lineWidth = 0.8
+        badgePath.stroke()
+        (item.statusLabel as NSString).draw(
+          in: CGRect(x: badgeRect.minX + 5, y: badgeRect.minY + 2, width: badgeRect.width - 10, height: 12),
+          withAttributes: badgeAttrs
+        )
+
+        if !item.subtitle.isEmpty {
+          let subX = badgeRect.maxX + 6
+          let subWidth = max(0, cardRect.maxX - subX - 10)
+          if subWidth > 20 {
+            let subAttrs: [NSAttributedString.Key: Any] = [
+              .font: UIFont.systemFont(ofSize: 9.5, weight: .medium),
+              .foregroundColor: UIColor(red: 0.529, green: 0.533, blue: 0.561, alpha: 1.0),
+              .paragraphStyle: rightParagraph,
+            ]
+            (item.subtitle as NSString).draw(
+              in: CGRect(x: subX, y: cardRect.minY + 9, width: subWidth, height: 13),
+              withAttributes: subAttrs
+            )
+          }
+        }
+
+        let titleAttrs: [NSAttributedString.Key: Any] = [
+          .font: UIFont.systemFont(ofSize: 12.5, weight: .semibold),
+          .foregroundColor: UIColor(red: 0.957, green: 0.961, blue: 0.969, alpha: 1.0),
+          .paragraphStyle: truncatingParagraph,
+        ]
+        (item.title as NSString).draw(
+          in: CGRect(x: contentX, y: cardRect.minY + 27, width: contentWidth, height: 16),
+          withAttributes: titleAttrs
+        )
+
+        let reasonAttrs: [NSAttributedString.Key: Any] = [
+          .font: UIFont.systemFont(ofSize: 11, weight: .medium),
+          .foregroundColor: palette.reasonText,
+          .paragraphStyle: truncatingParagraph,
+        ]
+        (item.attentionReason as NSString).draw(
+          in: CGRect(x: contentX, y: cardRect.minY + 46, width: contentWidth, height: 15),
+          withAttributes: reasonAttrs
+        )
+
+        y += cardHeight + cardGap
+      }
+
+      if remaining > 0 {
+        let footerParagraph = NSMutableParagraphStyle()
+        footerParagraph.alignment = .center
+        let footerAttrs: [NSAttributedString.Key: Any] = [
+          .font: UIFont.systemFont(ofSize: 10.5, weight: .semibold),
+          .foregroundColor: UIColor(red: 0.541, green: 0.706, blue: 0.973, alpha: 1.0),
+          .paragraphStyle: footerParagraph,
+        ]
+        ("+\(remaining) more in Inbox • Tap to open" as NSString).draw(
+          in: CGRect(x: pad, y: y + 2, width: width - pad * 2, height: 16),
+          withAttributes: footerAttrs
+        )
+      }
+    }
+
+    guard let pngData = image.pngData() else { return nil }
+    let fileUrl = FileManager.default.temporaryDirectory
+      .appendingPathComponent("agy_action_cards_\(UUID().uuidString).png")
+    do {
+      try pngData.write(to: fileUrl, options: .atomic)
+      return try UNNotificationAttachment(
+        identifier: "agy_action_cards",
+        url: fileUrl,
+        options: [UNNotificationAttachmentOptionsTypeHintKey: "public.png"]
+      )
+    } catch {
+      try? FileManager.default.removeItem(at: fileUrl)
+      return nil
+    }
+  }
+
+  private func buildNotificationSubtitle(items: [ActionCardItem], totalCount: Int) -> String {
+    if totalCount == 1, let first = items.first {
+      return first.subtitle.isEmpty ? first.statusLabel : "\(first.statusLabel) · \(first.subtitle)"
+    }
+    var approvals = 0
+    var errors = 0
+    var unread = 0
+    for item in items {
+      switch item.attentionKind {
+      case "approval": approvals += 1
+      case "error": errors += 1
+      default: unread += 1
+      }
+    }
+    var parts: [String] = []
+    if approvals > 0 { parts.append("\(approvals) approval\(approvals == 1 ? "" : "s")") }
+    if errors > 0 { parts.append("\(errors) review") }
+    if unread > 0 { parts.append("\(unread) finished") }
+    let remaining = max(0, totalCount - items.count)
+    if remaining > 0 {
+      parts.append("+\(remaining) more")
+    }
+    return parts.joined(separator: " · ")
+  }
+
   public func definition() -> ModuleDefinition {
     Name("RemoteSession")
 
@@ -147,7 +411,7 @@ public class RemoteSessionModule: Module {
     }.runOnQueue(.main)
 
     AsyncFunction("syncActionNotification") {
-      (title: String, body: String, expandedBody: String, count: Int, deepLinkUrl: String, shouldAlert: Bool) in
+      (title: String, body: String, expandedBody: String, count: Int, deepLinkUrl: String, shouldAlert: Bool, itemsJson: String) in
       let center = UNUserNotificationCenter.current()
       if center.delegate == nil {
         center.delegate = ActionNotificationDelegate.shared
@@ -163,10 +427,19 @@ public class RemoteSessionModule: Module {
         return
       }
 
+      let items = self.parseActionCardItems(itemsJson)
       let content = UNMutableNotificationContent()
       content.title = title
+      let subtitle = self.buildNotificationSubtitle(items: items, totalCount: count)
+      if !subtitle.isEmpty {
+        content.subtitle = subtitle
+      }
       content.body = expandedBody.isEmpty ? body : expandedBody
+      content.threadIdentifier = "agy_action_threads"
       content.badge = NSNumber(value: count)
+      if let attachment = self.renderCardsAttachment(items: items, totalCount: count) {
+        content.attachments = [attachment]
+      }
       if shouldAlert {
         content.sound = .default
         if #available(iOS 15.0, *) {

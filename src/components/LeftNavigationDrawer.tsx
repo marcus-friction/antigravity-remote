@@ -4,6 +4,7 @@ import {
   ActivityIndicator,
   Animated,
   AppState,
+  Keyboard,
   NativeScrollEvent,
   NativeSyntheticEvent,
   PanResponder,
@@ -27,7 +28,15 @@ import {
   SOURCE_REPO_URL,
 } from '../constants/config';
 import {
-  InboxAttentionKind,
+  ANTIGRAVITY_THEME,
+  getAttentionVisuals,
+  getQuotaVisuals,
+} from '../constants/theme';
+import {
+  CreateProjectRequestParams,
+  CreateProjectResult,
+  DirectoryEntry,
+  DirectoryListingResult,
   InboxFilterTab,
   InboxInstanceSummary,
   InboxProjectGroup,
@@ -57,7 +66,9 @@ export type DrawerMode = 'inbox' | 'projects' | 'usage' | 'settings';
  */
 export const HANDLE_LINE_WIDTH = 4;
 export const HANDLE_LINE_HEIGHT = 112;
+export const HANDLE_LINE_HEIGHT_KEYBOARD = 76;
 export const HANDLE_TOUCH_ZONE_HEIGHT = 216;
+export const HANDLE_TOUCH_ZONE_HEIGHT_KEYBOARD = 148;
 export const CLOSED_HANDLE_TOUCH_WIDTH = 44;
 export const CLOSED_HANDLE_TOUCH_LEFT = 20;
 export const CLOSED_HANDLE_BAR_INSET = 2; // Visual bar sits at 22dp from left edge
@@ -68,6 +79,8 @@ const HANDLE_ALIGNMENT_OFFSET =
   OPEN_HANDLE_RIGHT_INSET +
   HANDLE_LINE_WIDTH; // 36dp so bar starts at exact 22dp when pulling open
 const CLOSED_PARK_EXTRA_OFFSET = 16; // Extra off-screen margin so no subpixel border peeks at x=0
+
+const { colors } = ANTIGRAVITY_THEME;
 
 export interface LeftNavigationDrawerProps {
   visible: boolean;
@@ -92,6 +105,13 @@ export interface LeftNavigationDrawerProps {
   onRefreshInbox: (forceUsage?: boolean) => void;
   onSelectThread: (thread: InboxThreadItem) => void;
   onStartProjectThread?: (project: InboxProjectGroup) => void;
+  onListDirectory?: (
+    instanceUuid: string,
+    uri?: string | null,
+  ) => Promise<DirectoryListingResult>;
+  onCreateProject?: (
+    params: CreateProjectRequestParams,
+  ) => Promise<CreateProjectResult>;
   onMarkThreadRead: (thread: InboxThreadItem) => void;
   onMarkAllRead: () => void;
   onChangeKeepAliveMinutes?: (minutes: KeepAliveMinutes) => void;
@@ -102,97 +122,37 @@ export interface LeftNavigationDrawerProps {
   onSignOut: () => void;
 }
 
-function getBadgeVisuals(kind: InboxAttentionKind): {
-  label: string;
-  textColor: string;
-  bgColor: string;
-  borderColor: string;
-  accentColor: string;
-} {
-  switch (kind) {
-    case 'approval':
-      return {
-        label: 'NEEDS APPROVAL',
-        textColor: '#FDE68A',
-        bgColor: 'rgba(245, 158, 11, 0.18)',
-        borderColor: 'rgba(245, 158, 11, 0.45)',
-        accentColor: '#F59E0B',
-      };
-    case 'error':
-      return {
-        label: 'NEEDS REVIEW',
-        textColor: '#FECACA',
-        bgColor: 'rgba(239, 68, 68, 0.18)',
-        borderColor: 'rgba(239, 68, 68, 0.45)',
-        accentColor: '#EF4444',
-      };
-    case 'unread':
-      return {
-        label: 'FINISHED',
-        textColor: '#BFDBFE',
-        bgColor: 'rgba(59, 130, 246, 0.2)',
-        borderColor: 'rgba(96, 165, 250, 0.45)',
-        accentColor: '#3B82F6',
-      };
-    case 'running':
-      return {
-        label: 'WORKING',
-        textColor: '#A7F3D0',
-        bgColor: 'rgba(16, 185, 129, 0.16)',
-        borderColor: 'rgba(52, 211, 153, 0.4)',
-        accentColor: '#10B981',
-      };
-    case 'idle':
-    default:
-      return {
-        label: 'IDLE',
-        textColor: '#94A3B8',
-        bgColor: 'rgba(51, 65, 85, 0.45)',
-        borderColor: 'rgba(100, 116, 139, 0.35)',
-        accentColor: '#475569',
-      };
+function formatUriAsDisplayPath(rawUri: string): string {
+  const trimmed = rawUri.trim();
+  if (!trimmed) {
+    return '';
   }
+  const stripped = trimmed.replace(/^file:\/\//i, '');
+  let decoded = stripped;
+  try {
+    decoded = decodeURIComponent(stripped);
+  } catch {
+    decoded = stripped;
+  }
+  // Convert `/C:/Users/...` to `C:/Users/...` on Windows workstations
+  return decoded.replace(/^\/([a-zA-Z]:\/)/, '$1');
 }
 
-function getQuotaVisuals(
-  remainingFraction: number,
-  isExhausted: boolean,
-): {
-  barColor: string;
-  textColor: string;
-  badgeBgColor: string;
-  badgeBorderColor: string;
-} {
-  if (isExhausted || remainingFraction <= 0) {
-    return {
-      barColor: '#EF4444',
-      textColor: '#FECACA',
-      badgeBgColor: 'rgba(239, 68, 68, 0.2)',
-      badgeBorderColor: 'rgba(239, 68, 68, 0.45)',
-    };
+function deriveFolderBasename(rawPathOrUri: string): string {
+  const cleaned = rawPathOrUri
+    .trim()
+    .replace(/^file:\/\//i, '')
+    .replace(/[\\/]+$/, '');
+  if (!cleaned) {
+    return '';
   }
-  if (remainingFraction <= 0.2) {
-    return {
-      barColor: '#EF4444',
-      textColor: '#FCA5A5',
-      badgeBgColor: 'rgba(239, 68, 68, 0.15)',
-      badgeBorderColor: 'rgba(248, 113, 113, 0.4)',
-    };
+  const parts = cleaned.split(/[\\/]/).filter(Boolean);
+  const last = parts[parts.length - 1] ?? '';
+  try {
+    return decodeURIComponent(last);
+  } catch {
+    return last;
   }
-  if (remainingFraction <= 0.5) {
-    return {
-      barColor: '#F59E0B',
-      textColor: '#FDE68A',
-      badgeBgColor: 'rgba(245, 158, 11, 0.16)',
-      badgeBorderColor: 'rgba(245, 158, 11, 0.4)',
-    };
-  }
-  return {
-    barColor: '#10B981',
-    textColor: '#A7F3D0',
-    badgeBgColor: 'rgba(16, 185, 129, 0.15)',
-    badgeBorderColor: 'rgba(52, 211, 153, 0.35)',
-  };
 }
 
 function formatNumberWithCommas(value: number): string {
@@ -218,43 +178,43 @@ function getHandleVisualState(params: {
   const { stage, attentionCount, urgentAttentionCount, runningCount } = params;
   if (stage === 'authenticated' && urgentAttentionCount > 0) {
     return {
-      lineColor: '#F59E0B',
-      glowColor: '#F59E0B',
+      lineColor: colors.approval,
+      glowColor: colors.approval,
     };
   }
   if (stage === 'authenticated' && attentionCount > 0) {
     return {
-      lineColor: '#3B82F6',
-      glowColor: '#3B82F6',
+      lineColor: colors.primaryBright,
+      glowColor: colors.primaryBright,
     };
   }
   if (stage === 'authenticated' && runningCount > 0) {
     return {
-      lineColor: 'rgba(52, 211, 153, 0.72)',
+      lineColor: 'rgba(52, 211, 153, 0.78)',
       glowColor: null,
     };
   }
   if (stage === 'offline') {
     return {
-      lineColor: 'rgba(248, 113, 113, 0.78)',
+      lineColor: 'rgba(222, 85, 85, 0.82)',
       glowColor: null,
     };
   }
   if (stage === 'authenticating') {
     return {
-      lineColor: 'rgba(96, 165, 250, 0.65)',
+      lineColor: 'rgba(138, 180, 248, 0.72)',
       glowColor: null,
     };
   }
   return {
-    lineColor: 'rgba(148, 163, 184, 0.52)',
+    lineColor: 'rgba(188, 189, 198, 0.56)',
     glowColor: null,
   };
 }
 
 const ChevronIcon: React.FC<{ expanded: boolean; color?: string }> = ({
   expanded,
-  color = '#94A3B8',
+  color = colors.textMuted,
 }) => (
   <View style={styles.chevronBox}>
     <View
@@ -268,7 +228,7 @@ const ChevronIcon: React.FC<{ expanded: boolean; color?: string }> = ({
 );
 
 const SearchIcon: React.FC<{ color?: string; compact?: boolean }> = ({
-  color = '#94A3B8',
+  color = colors.textMuted,
   compact = false,
 }) => (
   <View
@@ -372,6 +332,8 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   onRefreshInbox,
   onSelectThread,
   onStartProjectThread,
+  onListDirectory,
+  onCreateProject,
   onMarkThreadRead,
   onMarkAllRead,
   onChangeKeepAliveMinutes,
@@ -415,6 +377,21 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   const [validationError, setValidationError] = useState<string | null>(null);
   const [confirmingSignOut, setConfirmingSignOut] = useState(false);
   const [isDraggingOpen, setIsDraggingOpen] = useState(false);
+  const [isAddProjectOpen, setIsAddProjectOpen] = useState(false);
+  const [addProjectMode, setAddProjectMode] = useState<'existing' | 'scratch'>(
+    'existing',
+  );
+  const [addProjectInstanceUuid, setAddProjectInstanceUuid] = useState('');
+  const [addProjectPath, setAddProjectPath] = useState('');
+  const [addProjectName, setAddProjectName] = useState('');
+  const [addProjectError, setAddProjectError] = useState<string | null>(null);
+  const [isSubmittingProject, setIsSubmittingProject] = useState(false);
+  const [isLoadingDir, setIsLoadingDir] = useState(false);
+  const [dirCurrentUri, setDirCurrentUri] = useState<string | null>(null);
+  const [dirCurrentPath, setDirCurrentPath] = useState('');
+  const [dirParentUri, setDirParentUri] = useState<string | null>(null);
+  const [dirEntries, setDirEntries] = useState<DirectoryEntry[]>([]);
+  const [dirError, setDirError] = useState<string | null>(null);
   const [localGuidanceDismissed, setLocalGuidanceDismissed] = useState<boolean>(
     Boolean(hasSeenGuidance || visible),
   );
@@ -429,6 +406,10 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   onDismissGuidanceRef.current = onDismissGuidance;
   const isMachineMenuOpenRef = useRef<boolean>(isMachineMenuOpen);
   isMachineMenuOpenRef.current = isMachineMenuOpen;
+  const isAddProjectOpenRef = useRef<boolean>(isAddProjectOpen);
+  isAddProjectOpenRef.current = isAddProjectOpen;
+  const dirRequestSeqRef = useRef<number>(0);
+  const createProjectSeqRef = useRef<number>(0);
   const handoffTextRef = useRef<string>(handoffText);
   handoffTextRef.current = handoffText;
   const isDraggingOpenRef = useRef<boolean>(isDraggingOpen);
@@ -610,6 +591,9 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     setSearchQuery('');
     setIsSearchExpanded(false);
     setIsMachineMenuOpen(false);
+    setIsAddProjectOpen(false);
+    setAddProjectError(null);
+    setDirError(null);
     setValidationError(null);
     setConfirmingSignOut(false);
     setIsHandoffExpanded((prev) =>
@@ -625,6 +609,12 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
       if (isMachineMenuOpenRef.current) {
         isMachineMenuOpenRef.current = false;
         setIsMachineMenuOpen(false);
+        return true;
+      }
+      if (isAddProjectOpenRef.current) {
+        isAddProjectOpenRef.current = false;
+        setIsAddProjectOpen(false);
+        setAddProjectError(null);
         return true;
       }
       return false;
@@ -737,6 +727,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   }, [onClose, resetTransientInputs]);
 
   const handleTapOpen = useCallback(() => {
+    Keyboard.dismiss?.();
     dismissGuidancePermanently();
     setActiveMode(defaultModeRef.current);
     const startOffset = -drawerWidthRef.current + HANDLE_ALIGNMENT_OFFSET;
@@ -765,6 +756,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
       onPanResponderTerminationRequest: () => false,
       onPanResponderGrant: () => {
         if (visibleRef.current) return;
+        Keyboard.dismiss?.();
         isDraggingOpenRef.current = true;
         translateX.stopAnimation?.();
         setActiveMode(defaultModeRef.current);
@@ -1131,7 +1123,219 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     [onClose, onNavigateToUrl, onStartProjectThread, resetTransientInputs],
   );
 
+  const loadDirectoryForInstance = useCallback(
+    async (instanceUuid: string, targetUri?: string | null) => {
+      if (!onListDirectory || !instanceUuid) {
+        return;
+      }
+      const seq = ++dirRequestSeqRef.current;
+      setIsLoadingDir(true);
+      setDirError(null);
+      try {
+        const result = await onListDirectory(instanceUuid, targetUri ?? null);
+        if (dirRequestSeqRef.current !== seq) {
+          return;
+        }
+        setIsLoadingDir(false);
+        if (!result.ok) {
+          setDirError(result.error || 'Could not browse remote folders.');
+          return;
+        }
+        setDirCurrentUri(result.currentUri || null);
+        const displayPath = formatUriAsDisplayPath(result.currentUri || '');
+        setDirCurrentPath(displayPath);
+        setDirParentUri(result.parentUri ?? null);
+        setDirEntries(result.entries);
+        if (displayPath) {
+          setAddProjectPath(displayPath);
+        }
+      } catch {
+        if (dirRequestSeqRef.current === seq) {
+          setIsLoadingDir(false);
+          setDirError('Could not browse remote folders.');
+        }
+      }
+    },
+    [onListDirectory],
+  );
+
+  const handleOpenAddProject = useCallback(() => {
+    setIsMachineMenuOpen(false);
+    const preferredInstance =
+      (activeInstance && activeInstance.status === 'connected'
+        ? activeInstance
+        : null) ??
+      connectedInstances[0] ??
+      null;
+    const nextUuid = preferredInstance?.uuid ?? '';
+    setAddProjectInstanceUuid(nextUuid);
+    setAddProjectMode('existing');
+    setAddProjectPath('');
+    setAddProjectName('');
+    setAddProjectError(null);
+    setDirCurrentUri(null);
+    setDirCurrentPath('');
+    setDirParentUri(null);
+    setDirEntries([]);
+    setDirError(null);
+    setIsAddProjectOpen(true);
+    if (nextUuid && onListDirectory) {
+      void loadDirectoryForInstance(nextUuid, null);
+    }
+  }, [
+    activeInstance,
+    connectedInstances,
+    loadDirectoryForInstance,
+    onListDirectory,
+  ]);
+
+  const handleCloseAddProject = useCallback(() => {
+    dirRequestSeqRef.current++;
+    createProjectSeqRef.current++;
+    setIsAddProjectOpen(false);
+    setAddProjectError(null);
+    setDirError(null);
+    setIsLoadingDir(false);
+    setIsSubmittingProject(false);
+  }, []);
+
+  const handleSelectAddProjectInstance = useCallback(
+    (instanceUuid: string) => {
+      setAddProjectInstanceUuid(instanceUuid);
+      setAddProjectPath('');
+      setAddProjectError(null);
+      setDirCurrentUri(null);
+      setDirCurrentPath('');
+      setDirParentUri(null);
+      setDirEntries([]);
+      setDirError(null);
+      if (addProjectMode === 'existing' && onListDirectory) {
+        void loadDirectoryForInstance(instanceUuid, null);
+      }
+    },
+    [addProjectMode, loadDirectoryForInstance, onListDirectory],
+  );
+
+  const handleSubmitAddProject = useCallback(async () => {
+    if (!onCreateProject || isSubmittingProject) {
+      return;
+    }
+    const isSelectedStillConnected =
+      Boolean(addProjectInstanceUuid) &&
+      connectedInstances.some((inst) => inst.uuid === addProjectInstanceUuid);
+    const targetUuid =
+      (isSelectedStillConnected ? addProjectInstanceUuid : '') ||
+      (activeInstance && activeInstance.status === 'connected'
+        ? activeInstance.uuid
+        : connectedInstances[0]?.uuid) ||
+      '';
+    if (!targetUuid) {
+      setAddProjectError('No connected workstation available.');
+      return;
+    }
+
+    if (addProjectMode === 'existing') {
+      const effectivePath = addProjectPath.trim() || (dirCurrentUri ?? '');
+      if (!effectivePath) {
+        setAddProjectError('Select a remote folder or enter a folder path.');
+        return;
+      }
+      const effectiveName =
+        addProjectName.trim() || deriveFolderBasename(effectivePath);
+      if (!effectiveName) {
+        setAddProjectError('Enter a project name.');
+        return;
+      }
+      const submitSeq = ++createProjectSeqRef.current;
+      setIsSubmittingProject(true);
+      setAddProjectError(null);
+      try {
+        const result = await onCreateProject({
+          instanceUuid: targetUuid,
+          mode: 'existing',
+          name: effectiveName,
+          folderPathOrUri: effectivePath,
+        });
+        if (createProjectSeqRef.current !== submitSeq) {
+          return;
+        }
+        setIsSubmittingProject(false);
+        if (!result.ok) {
+          setAddProjectError(
+            result.error || 'Could not add this folder as a project.',
+          );
+          return;
+        }
+        handleCloseAddProject();
+        setAddProjectPath('');
+        setAddProjectName('');
+        onRefreshInbox(false);
+      } catch {
+        if (createProjectSeqRef.current === submitSeq) {
+          setIsSubmittingProject(false);
+          setAddProjectError('Could not add this folder as a project.');
+        }
+      }
+      return;
+    }
+
+    const scratchName = addProjectName.trim();
+    if (!scratchName) {
+      setAddProjectError('Enter a name for the new project folder.');
+      return;
+    }
+    const submitSeq = ++createProjectSeqRef.current;
+    setIsSubmittingProject(true);
+    setAddProjectError(null);
+    try {
+      const result = await onCreateProject({
+        instanceUuid: targetUuid,
+        mode: 'scratch',
+        name: scratchName,
+      });
+      if (createProjectSeqRef.current !== submitSeq) {
+        return;
+      }
+      setIsSubmittingProject(false);
+      if (!result.ok) {
+        setAddProjectError(result.error || 'Could not create new project.');
+        return;
+      }
+      handleCloseAddProject();
+      setAddProjectPath('');
+      setAddProjectName('');
+      onRefreshInbox(false);
+    } catch {
+      if (createProjectSeqRef.current === submitSeq) {
+        setIsSubmittingProject(false);
+        setAddProjectError('Could not create new project.');
+      }
+    }
+  }, [
+    activeInstance,
+    addProjectInstanceUuid,
+    addProjectMode,
+    addProjectName,
+    addProjectPath,
+    connectedInstances,
+    dirCurrentUri,
+    handleCloseAddProject,
+    isSubmittingProject,
+    onCreateProject,
+    onRefreshInbox,
+  ]);
+
   const usage = snapshot.usage ?? null;
+  const visibleUsageCredits = useMemo(
+    () =>
+      (usage?.credits ?? []).filter(
+        (credit) =>
+          credit.id !== 'prompt-credits' &&
+          credit.id !== 'flow-credits' &&
+          !/\b(prompt|flow)\s*credits?\b/i.test(credit.label),
+      ),
+    [usage?.credits],
+  );
 
   const snapshotUpdatedLabel = useMemo(
     () =>
@@ -1248,6 +1452,8 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     setHandoffText('');
     setIsHandoffExpanded(false);
     setIsMachineMenuOpen(false);
+    setIsAddProjectOpen(false);
+    setAddProjectError(null);
     setIsSearchExpanded(false);
     setValidationError(null);
     setSearchQuery('');
@@ -1305,8 +1511,168 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   });
 
   const isDrawerInteractiveOrDragging = visible || isDraggingOpen;
-  const isClosedHandleHidden =
-    visible || isDraggingOpen || Boolean(isKeyboardVisible);
+  // Keep the pull-open handle accessible even while the software keyboard is showing!
+  const isClosedHandleHidden = visible || isDraggingOpen;
+  const closedHandleTouchHeight = isKeyboardVisible
+    ? HANDLE_TOUCH_ZONE_HEIGHT_KEYBOARD
+    : HANDLE_TOUCH_ZONE_HEIGHT;
+  const closedHandleLineHeight = isKeyboardVisible
+    ? HANDLE_LINE_HEIGHT_KEYBOARD
+    : HANDLE_LINE_HEIGHT;
+  const closedHandleDynamicStyle =
+    keyboardBottomPadding > 0
+      ? {
+          top: Math.max(
+            48,
+            Math.round((safeWindowHeight - keyboardBottomPadding) / 2),
+          ),
+          height: closedHandleTouchHeight,
+          marginTop: -(closedHandleTouchHeight / 2),
+        }
+      : isKeyboardVisible
+        ? {
+            height: closedHandleTouchHeight,
+            marginTop: -(closedHandleTouchHeight / 2),
+          }
+        : null;
+
+  const renderThreadCard = (
+    thread: InboxThreadItem,
+    variant: 'inbox' | 'project',
+  ): React.JSX.Element => {
+    const visuals = getAttentionVisuals(thread.attentionKind);
+    const relativeTime = formatRelativeTime(thread.lastModifiedAtMs);
+    const canMarkRead =
+      thread.attentionKind === 'unread' || thread.attentionKind === 'error';
+    const isCurrentThread =
+      thread.isActiveThread ||
+      (snapshot.activeInstanceUuid === thread.instanceUuid &&
+        snapshot.activeCascadeId !== null &&
+        (snapshot.activeCascadeId === thread.cascadeId ||
+          snapshot.activeCascadeId === thread.trajectoryId)) ||
+      Boolean(activeUrl && activeUrl === thread.targetUrl);
+    const isProjectVariant = variant === 'project';
+    const showReason =
+      thread.needsAttention ||
+      thread.attentionKind === 'running' ||
+      (isProjectVariant && Boolean(thread.attentionReason));
+
+    return (
+      <TouchableOpacity
+        key={thread.id}
+        style={[
+          isProjectVariant ? styles.projectThreadCard : styles.threadCard,
+          { borderLeftColor: visuals.accentColor },
+          isCurrentThread
+            ? isProjectVariant
+              ? styles.projectThreadCardActive
+              : styles.threadCardActive
+            : null,
+        ]}
+        activeOpacity={0.82}
+        onPress={() => {
+          resetTransientInputs();
+          isDraggingOpenRef.current = false;
+          setIsDraggingOpen(false);
+          onSelectThread(thread);
+        }}
+        accessibilityRole="button"
+        accessibilityLabel={
+          isProjectVariant
+            ? `Open project thread ${thread.title}`
+            : `Open thread ${thread.title}`
+        }
+      >
+        <View style={styles.cardTopRow}>
+          <View style={styles.badgesRow}>
+            <View
+              style={[
+                styles.kindBadge,
+                {
+                  backgroundColor: visuals.bgColor,
+                  borderColor: visuals.borderColor,
+                },
+              ]}
+            >
+              <Text
+                style={[styles.kindBadgeText, { color: visuals.textColor }]}
+              >
+                {visuals.label}
+              </Text>
+            </View>
+
+            {isCurrentThread ? (
+              <View style={styles.currentBadge}>
+                <Text style={styles.currentBadgeText}>OPEN</Text>
+              </View>
+            ) : null}
+          </View>
+
+          {relativeTime ? (
+            <Text style={styles.timestampText}>{relativeTime}</Text>
+          ) : null}
+        </View>
+
+        <Text style={styles.threadTitle} numberOfLines={2}>
+          {thread.title}
+        </Text>
+
+        {showReason ? (
+          <Text
+            style={[
+              styles.reasonText,
+              thread.attentionKind === 'approval'
+                ? styles.reasonTextApproval
+                : thread.attentionKind === 'error'
+                  ? styles.reasonTextError
+                  : thread.attentionKind === 'unread'
+                    ? styles.reasonTextUnread
+                    : thread.attentionKind === 'idle'
+                      ? styles.reasonTextIdle
+                      : null,
+            ]}
+            numberOfLines={2}
+          >
+            {thread.attentionReason}
+          </Text>
+        ) : null}
+
+        {!isProjectVariant || canMarkRead ? (
+          <View
+            style={[
+              styles.cardFooterRow,
+              isProjectVariant ? styles.projectCardFooterRow : null,
+            ]}
+          >
+            {!isProjectVariant ? (
+              <Text style={styles.metaText} numberOfLines={1}>
+                {thread.workspaceName
+                  ? `${thread.instanceName} • ${thread.workspaceName}`
+                  : thread.instanceName}
+              </Text>
+            ) : (
+              <View style={styles.projectFooterSpacer} />
+            )}
+
+            {canMarkRead ? (
+              <TouchableOpacity
+                style={styles.markReadChip}
+                onPress={() => onMarkThreadRead(thread)}
+                accessibilityRole="button"
+                accessibilityLabel={
+                  isProjectVariant
+                    ? `Mark project thread ${thread.title} as read`
+                    : `Mark ${thread.title} as read`
+                }
+              >
+                <Text style={styles.markReadChipText}>Mark read</Text>
+              </TouchableOpacity>
+            ) : null}
+          </View>
+        ) : null}
+      </TouchableOpacity>
+    );
+  };
 
   const backdropOpacity = useMemo(
     () =>
@@ -1407,7 +1773,9 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                 </Text>
                 <ChevronIcon
                   expanded={isMachineMenuOpen}
-                  color={isMachineMenuOpen ? '#93C5FD' : '#94A3B8'}
+                  color={
+                    isMachineMenuOpen ? colors.primaryText : colors.textMuted
+                  }
                 />
               </TouchableOpacity>
 
@@ -1434,7 +1802,11 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                       accessibilityLabel="Toggle thread search"
                     >
                       <SearchIcon
-                        color={isSearchVisible ? '#93C5FD' : '#94A3B8'}
+                        color={
+                          isSearchVisible
+                            ? colors.primaryText
+                            : colors.textMuted
+                        }
                       />
                     </TouchableOpacity>
 
@@ -1452,7 +1824,10 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                       }
                     >
                       {isRefreshing ? (
-                        <ActivityIndicator size="small" color="#93C5FD" />
+                        <ActivityIndicator
+                          size="small"
+                          color={colors.primaryText}
+                        />
                       ) : (
                         <Text style={styles.headerSyncGlyph}>↻</Text>
                       )}
@@ -1476,7 +1851,10 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                       accessibilityLabel="Refresh Usage Stats"
                     >
                       {isRefreshing ? (
-                        <ActivityIndicator size="small" color="#93C5FD" />
+                        <ActivityIndicator
+                          size="small"
+                          color={colors.primaryText}
+                        />
                       ) : (
                         <Text style={styles.headerSyncGlyph}>↻</Text>
                       )}
@@ -1571,14 +1949,14 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
 
                 {isSearchVisible ? (
                   <View style={styles.searchBarRow}>
-                    <SearchIcon color="#64748B" compact />
+                    <SearchIcon color={colors.textMuted} compact />
                     <TextInput
                       ref={searchInputRef}
                       style={styles.searchInput}
                       value={searchQuery}
                       onChangeText={setSearchQuery}
                       placeholder="Filter threads…"
-                      placeholderTextColor="#64748B"
+                      placeholderTextColor={colors.textPlaceholder}
                       autoCapitalize="none"
                       autoCorrect={false}
                       autoFocus={visible && isSearchExpanded}
@@ -1620,118 +1998,9 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                   onContentSizeChange={handleInboxContentSizeChange}
                 >
                   {filteredThreads.length > 0 ? (
-                    filteredThreads.map((thread) => {
-                      const visuals = getBadgeVisuals(thread.attentionKind);
-                      const relativeTime = formatRelativeTime(
-                        thread.lastModifiedAtMs,
-                      );
-                      const canMarkRead =
-                        thread.attentionKind === 'unread' ||
-                        thread.attentionKind === 'error';
-
-                      return (
-                        <TouchableOpacity
-                          key={thread.id}
-                          style={[
-                            styles.threadCard,
-                            { borderLeftColor: visuals.accentColor },
-                            thread.isActiveThread
-                              ? styles.threadCardActive
-                              : null,
-                          ]}
-                          activeOpacity={0.82}
-                          onPress={() => {
-                            resetTransientInputs();
-                            isDraggingOpenRef.current = false;
-                            setIsDraggingOpen(false);
-                            onSelectThread(thread);
-                          }}
-                          accessibilityRole="button"
-                          accessibilityLabel={`Open thread ${thread.title}`}
-                        >
-                          <View style={styles.cardTopRow}>
-                            <View style={styles.badgesRow}>
-                              <View
-                                style={[
-                                  styles.kindBadge,
-                                  {
-                                    backgroundColor: visuals.bgColor,
-                                    borderColor: visuals.borderColor,
-                                  },
-                                ]}
-                              >
-                                <Text
-                                  style={[
-                                    styles.kindBadgeText,
-                                    { color: visuals.textColor },
-                                  ]}
-                                >
-                                  {visuals.label}
-                                </Text>
-                              </View>
-
-                              {thread.isActiveThread ? (
-                                <View style={styles.currentBadge}>
-                                  <Text style={styles.currentBadgeText}>
-                                    OPEN
-                                  </Text>
-                                </View>
-                              ) : null}
-                            </View>
-
-                            {relativeTime ? (
-                              <Text style={styles.timestampText}>
-                                {relativeTime}
-                              </Text>
-                            ) : null}
-                          </View>
-
-                          <Text style={styles.threadTitle} numberOfLines={2}>
-                            {thread.title}
-                          </Text>
-
-                          {thread.needsAttention ||
-                          thread.attentionKind === 'running' ? (
-                            <Text
-                              style={[
-                                styles.reasonText,
-                                thread.attentionKind === 'approval'
-                                  ? styles.reasonTextApproval
-                                  : thread.attentionKind === 'error'
-                                    ? styles.reasonTextError
-                                    : thread.attentionKind === 'unread'
-                                      ? styles.reasonTextUnread
-                                      : null,
-                              ]}
-                              numberOfLines={2}
-                            >
-                              {thread.attentionReason}
-                            </Text>
-                          ) : null}
-
-                          <View style={styles.cardFooterRow}>
-                            <Text style={styles.metaText} numberOfLines={1}>
-                              {thread.workspaceName
-                                ? `${thread.instanceName} • ${thread.workspaceName}`
-                                : thread.instanceName}
-                            </Text>
-
-                            {canMarkRead ? (
-                              <TouchableOpacity
-                                style={styles.markReadChip}
-                                onPress={() => onMarkThreadRead(thread)}
-                                accessibilityRole="button"
-                                accessibilityLabel={`Mark ${thread.title} as read`}
-                              >
-                                <Text style={styles.markReadChipText}>
-                                  Mark read
-                                </Text>
-                              </TouchableOpacity>
-                            ) : null}
-                          </View>
-                        </TouchableOpacity>
-                      );
-                    })
+                    filteredThreads.map((thread) =>
+                      renderThreadCard(thread, 'inbox'),
+                    )
                   ) : (
                     <View style={styles.emptyState}>
                       {stage !== 'authenticated' ? (
@@ -1873,19 +2142,45 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                         </Text>
                       </TouchableOpacity>
                     ) : null}
+                    {stage === 'authenticated' &&
+                    connectedInstances.length > 0 &&
+                    onCreateProject ? (
+                      <TouchableOpacity
+                        style={[
+                          styles.addProjectHeaderBtn,
+                          isAddProjectOpen
+                            ? styles.addProjectHeaderBtnActive
+                            : null,
+                        ]}
+                        onPress={() => {
+                          if (isAddProjectOpen) {
+                            handleCloseAddProject();
+                          } else {
+                            handleOpenAddProject();
+                          }
+                        }}
+                        accessibilityRole="button"
+                        accessibilityState={{ expanded: isAddProjectOpen }}
+                        accessibilityLabel="Add new project"
+                      >
+                        <Text style={styles.addProjectHeaderBtnText}>
+                          {isAddProjectOpen ? 'Cancel' : '+ Project'}
+                        </Text>
+                      </TouchableOpacity>
+                    ) : null}
                   </View>
                 </View>
 
                 {isSearchVisible ? (
                   <View style={styles.searchBarRow}>
-                    <SearchIcon color="#64748B" compact />
+                    <SearchIcon color={colors.textMuted} compact />
                     <TextInput
                       ref={searchInputRef}
                       style={styles.searchInput}
                       value={searchQuery}
                       onChangeText={setSearchQuery}
                       placeholder="Filter projects or threads…"
-                      placeholderTextColor="#64748B"
+                      placeholderTextColor={colors.textPlaceholder}
                       autoCapitalize="none"
                       autoCorrect={false}
                       autoFocus={visible && isSearchExpanded}
@@ -1921,6 +2216,368 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                   keyboardShouldPersistTaps="handled"
                   showsVerticalScrollIndicator={false}
                 >
+                  {isAddProjectOpen && onCreateProject ? (
+                    <View
+                      testID="add-project-panel"
+                      style={styles.addProjectCard}
+                    >
+                      <View style={styles.addProjectHeaderRow}>
+                        <Text style={styles.addProjectTitle}>Add Project</Text>
+                        <TouchableOpacity
+                          style={styles.searchClearBtn}
+                          onPress={handleCloseAddProject}
+                          accessibilityRole="button"
+                          accessibilityLabel="Close add project panel"
+                        >
+                          <Text style={styles.searchClearText}>✕</Text>
+                        </TouchableOpacity>
+                      </View>
+
+                      {connectedInstances.length > 1 ? (
+                        <View style={styles.addProjectWorkstationRow}>
+                          {connectedInstances.map((inst) => {
+                            const selected =
+                              (addProjectInstanceUuid ||
+                                connectedInstances[0]?.uuid) === inst.uuid;
+                            return (
+                              <TouchableOpacity
+                                key={inst.uuid}
+                                style={[
+                                  styles.addProjectWorkstationChip,
+                                  selected
+                                    ? styles.addProjectWorkstationChipSelected
+                                    : null,
+                                ]}
+                                onPress={() =>
+                                  handleSelectAddProjectInstance(inst.uuid)
+                                }
+                                accessibilityRole="button"
+                                accessibilityState={{ selected }}
+                                accessibilityLabel={`Target workstation ${inst.name}`}
+                              >
+                                <Text
+                                  style={[
+                                    styles.addProjectWorkstationChipText,
+                                    selected
+                                      ? styles.addProjectWorkstationChipTextSelected
+                                      : null,
+                                  ]}
+                                  numberOfLines={1}
+                                >
+                                  {inst.name}
+                                </Text>
+                              </TouchableOpacity>
+                            );
+                          })}
+                        </View>
+                      ) : null}
+
+                      <View style={styles.addProjectModeWell}>
+                        <TouchableOpacity
+                          style={[
+                            styles.addProjectModeKey,
+                            addProjectMode === 'existing'
+                              ? styles.addProjectModeKeyActive
+                              : null,
+                          ]}
+                          onPress={() => {
+                            setAddProjectMode('existing');
+                            setAddProjectError(null);
+                            const targetUuid =
+                              addProjectInstanceUuid ||
+                              connectedInstances[0]?.uuid ||
+                              '';
+                            if (
+                              targetUuid &&
+                              onListDirectory &&
+                              dirEntries.length === 0 &&
+                              !isLoadingDir
+                            ) {
+                              void loadDirectoryForInstance(targetUuid, null);
+                            }
+                          }}
+                          accessibilityRole="button"
+                          accessibilityState={{
+                            selected: addProjectMode === 'existing',
+                          }}
+                          accessibilityLabel="Add existing folder"
+                        >
+                          <Text
+                            style={[
+                              styles.addProjectModeKeyText,
+                              addProjectMode === 'existing'
+                                ? styles.addProjectModeKeyTextActive
+                                : null,
+                            ]}
+                          >
+                            Existing Folder
+                          </Text>
+                        </TouchableOpacity>
+
+                        <TouchableOpacity
+                          style={[
+                            styles.addProjectModeKey,
+                            addProjectMode === 'scratch'
+                              ? styles.addProjectModeKeyActive
+                              : null,
+                          ]}
+                          onPress={() => {
+                            setAddProjectMode('scratch');
+                            setAddProjectError(null);
+                          }}
+                          accessibilityRole="button"
+                          accessibilityState={{
+                            selected: addProjectMode === 'scratch',
+                          }}
+                          accessibilityLabel="Create new folder"
+                        >
+                          <Text
+                            style={[
+                              styles.addProjectModeKeyText,
+                              addProjectMode === 'scratch'
+                                ? styles.addProjectModeKeyTextActive
+                                : null,
+                            ]}
+                          >
+                            New Folder
+                          </Text>
+                        </TouchableOpacity>
+                      </View>
+
+                      {addProjectMode === 'existing' ? (
+                        <>
+                          {onListDirectory ? (
+                            <View style={styles.dirBrowserBox}>
+                              <View style={styles.dirBrowserToolbar}>
+                                {dirParentUri ? (
+                                  <TouchableOpacity
+                                    style={styles.dirUpBtn}
+                                    onPress={() => {
+                                      const targetUuid =
+                                        addProjectInstanceUuid ||
+                                        connectedInstances[0]?.uuid ||
+                                        '';
+                                      if (targetUuid) {
+                                        void loadDirectoryForInstance(
+                                          targetUuid,
+                                          dirParentUri,
+                                        );
+                                      }
+                                    }}
+                                    accessibilityRole="button"
+                                    accessibilityLabel="Parent folder"
+                                  >
+                                    <Text style={styles.dirUpBtnText}>
+                                      ↑ Up
+                                    </Text>
+                                  </TouchableOpacity>
+                                ) : null}
+                                <Text
+                                  style={styles.dirCurrentPathText}
+                                  numberOfLines={1}
+                                >
+                                  {dirCurrentPath || 'Remote directories'}
+                                </Text>
+                                <TouchableOpacity
+                                  style={styles.dirRefreshBtn}
+                                  onPress={() => {
+                                    const targetUuid =
+                                      addProjectInstanceUuid ||
+                                      connectedInstances[0]?.uuid ||
+                                      '';
+                                    if (targetUuid) {
+                                      void loadDirectoryForInstance(
+                                        targetUuid,
+                                        dirCurrentUri,
+                                      );
+                                    }
+                                  }}
+                                  accessibilityRole="button"
+                                  accessibilityLabel="Refresh folder listing"
+                                >
+                                  <Text style={styles.dirRefreshGlyph}>↻</Text>
+                                </TouchableOpacity>
+                              </View>
+
+                              {isLoadingDir ? (
+                                <View style={styles.dirStatusRow}>
+                                  <ActivityIndicator
+                                    size="small"
+                                    color={colors.primaryText}
+                                  />
+                                  <Text style={styles.dirStatusText}>
+                                    Browsing workstation folders…
+                                  </Text>
+                                </View>
+                              ) : dirError ? (
+                                <Text style={styles.dirErrorText}>
+                                  {dirError} Enter a folder path below.
+                                </Text>
+                              ) : dirEntries.length > 0 ? (
+                                <ScrollView
+                                  style={styles.dirListScroll}
+                                  nestedScrollEnabled={true}
+                                  keyboardShouldPersistTaps="handled"
+                                  showsVerticalScrollIndicator={false}
+                                >
+                                  {dirEntries.map((entry) => (
+                                    <TouchableOpacity
+                                      key={entry.uri}
+                                      style={styles.dirEntryRow}
+                                      onPress={() => {
+                                        const targetUuid =
+                                          addProjectInstanceUuid ||
+                                          connectedInstances[0]?.uuid ||
+                                          '';
+                                        setAddProjectPath(
+                                          formatUriAsDisplayPath(entry.uri),
+                                        );
+                                        if (targetUuid) {
+                                          void loadDirectoryForInstance(
+                                            targetUuid,
+                                            entry.uri,
+                                          );
+                                        }
+                                      }}
+                                      accessibilityRole="button"
+                                      accessibilityLabel={`Open folder ${entry.name}`}
+                                    >
+                                      <Text style={styles.dirEntryIcon}>▸</Text>
+                                      <Text
+                                        style={styles.dirEntryName}
+                                        numberOfLines={1}
+                                      >
+                                        {entry.name}
+                                      </Text>
+                                    </TouchableOpacity>
+                                  ))}
+                                </ScrollView>
+                              ) : (
+                                <Text style={styles.dirStatusText}>
+                                  No subfolders here — add this folder or enter
+                                  a path below.
+                                </Text>
+                              )}
+                            </View>
+                          ) : null}
+
+                          <Text style={styles.addProjectFieldLabel}>
+                            Folder path
+                          </Text>
+                          <TextInput
+                            style={styles.addProjectInput}
+                            value={addProjectPath}
+                            onChangeText={(text) => {
+                              setAddProjectPath(text);
+                              if (addProjectError) setAddProjectError(null);
+                            }}
+                            placeholder="/path/to/project"
+                            placeholderTextColor={colors.textPlaceholder}
+                            autoCapitalize="none"
+                            autoCorrect={false}
+                            accessibilityLabel="Project folder path"
+                          />
+
+                          <Text style={styles.addProjectFieldLabel}>
+                            Display name (optional)
+                          </Text>
+                          <TextInput
+                            style={styles.addProjectInput}
+                            value={addProjectName}
+                            onChangeText={(text) => {
+                              setAddProjectName(text);
+                              if (addProjectError) setAddProjectError(null);
+                            }}
+                            placeholder={
+                              deriveFolderBasename(addProjectPath) ||
+                              'Auto-detected from folder'
+                            }
+                            placeholderTextColor={colors.textPlaceholder}
+                            autoCapitalize="none"
+                            autoCorrect={false}
+                            accessibilityLabel="Project name"
+                          />
+                        </>
+                      ) : (
+                        <>
+                          <Text style={styles.addProjectFieldLabel}>
+                            New project name
+                          </Text>
+                          <TextInput
+                            style={styles.addProjectInput}
+                            value={addProjectName}
+                            onChangeText={(text) => {
+                              setAddProjectName(text);
+                              if (addProjectError) setAddProjectError(null);
+                            }}
+                            placeholder="my-new-project"
+                            placeholderTextColor={colors.textPlaceholder}
+                            autoCapitalize="none"
+                            autoCorrect={false}
+                            returnKeyType="done"
+                            onSubmitEditing={() => {
+                              void handleSubmitAddProject();
+                            }}
+                            accessibilityLabel="New project name"
+                          />
+                          <Text style={styles.addProjectHelperText}>
+                            Creates a new folder in the workstation&apos;s
+                            default projects directory.
+                          </Text>
+                        </>
+                      )}
+
+                      {addProjectError ? (
+                        <Text style={styles.errorText}>{addProjectError}</Text>
+                      ) : null}
+
+                      <View style={styles.addProjectFooterRow}>
+                        <TouchableOpacity
+                          style={styles.addProjectCancelBtn}
+                          onPress={handleCloseAddProject}
+                          disabled={isSubmittingProject}
+                          accessibilityRole="button"
+                          accessibilityLabel="Cancel adding project"
+                        >
+                          <Text style={styles.addProjectCancelText}>
+                            Cancel
+                          </Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={[
+                            styles.addProjectSubmitBtn,
+                            isSubmittingProject
+                              ? styles.addProjectSubmitBtnDisabled
+                              : null,
+                          ]}
+                          onPress={() => {
+                            void handleSubmitAddProject();
+                          }}
+                          disabled={isSubmittingProject}
+                          accessibilityRole="button"
+                          accessibilityLabel={
+                            addProjectMode === 'existing'
+                              ? 'Confirm add project'
+                              : 'Confirm create project'
+                          }
+                        >
+                          {isSubmittingProject ? (
+                            <ActivityIndicator
+                              size="small"
+                              color={colors.white}
+                            />
+                          ) : (
+                            <Text style={styles.addProjectSubmitText}>
+                              {addProjectMode === 'existing'
+                                ? 'Add Project'
+                                : 'Create Project'}
+                            </Text>
+                          )}
+                        </TouchableOpacity>
+                      </View>
+                    </View>
+                  ) : null}
+
                   {filteredProjectGroups.length > 0 ? (
                     filteredProjectGroups.map((group) => {
                       const isCollapsed =
@@ -1949,7 +2606,9 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                               <ChevronIcon
                                 expanded={isExpanded}
                                 color={
-                                  group.hasActiveThread ? '#93C5FD' : '#94A3B8'
+                                  group.hasActiveThread
+                                    ? colors.primaryText
+                                    : colors.textMuted
                                 }
                               />
                               <View style={styles.projectHeaderMeta}>
@@ -2008,155 +2667,11 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                           </View>
 
                           {isExpanded ? (
-                            <View style={styles.projectThreadsContainer}>
+                            <View style={styles.projectThreadsTray}>
                               {group.threads.length > 0 ? (
-                                group.threads.map((thread, idx) => {
-                                  const badge = getBadgeVisuals(
-                                    thread.attentionKind,
-                                  );
-                                  const canMarkRead =
-                                    thread.attentionKind === 'unread' ||
-                                    thread.attentionKind === 'error';
-                                  const isCurrentThread =
-                                    thread.isActiveThread ||
-                                    (snapshot.activeInstanceUuid ===
-                                      thread.instanceUuid &&
-                                      snapshot.activeCascadeId !== null &&
-                                      (snapshot.activeCascadeId ===
-                                        thread.cascadeId ||
-                                        snapshot.activeCascadeId ===
-                                          thread.trajectoryId)) ||
-                                    Boolean(
-                                      activeUrl &&
-                                        activeUrl === thread.targetUrl,
-                                    );
-                                  return (
-                                    <TouchableOpacity
-                                      key={thread.id}
-                                      style={[
-                                        styles.projectThreadRow,
-                                        idx > 0
-                                          ? styles.projectThreadRowDivider
-                                          : null,
-                                        isCurrentThread
-                                          ? styles.projectThreadRowActive
-                                          : null,
-                                      ]}
-                                      activeOpacity={0.82}
-                                      onPress={() => {
-                                        resetTransientInputs();
-                                        isDraggingOpenRef.current = false;
-                                        setIsDraggingOpen(false);
-                                        onSelectThread(thread);
-                                      }}
-                                      accessibilityRole="button"
-                                      accessibilityLabel={`Open project thread ${thread.title}`}
-                                    >
-                                      <View style={styles.projectThreadTopRow}>
-                                        <View
-                                          style={styles.projectThreadTitleGroup}
-                                        >
-                                          <View
-                                            style={[
-                                              styles.projectThreadDot,
-                                              {
-                                                backgroundColor:
-                                                  badge.accentColor,
-                                              },
-                                            ]}
-                                          />
-                                          <Text
-                                            style={[
-                                              styles.projectThreadTitle,
-                                              isCurrentThread
-                                                ? styles.projectThreadTitleActive
-                                                : null,
-                                            ]}
-                                            numberOfLines={1}
-                                          >
-                                            {thread.title}
-                                          </Text>
-                                        </View>
-                                        <View
-                                          style={styles.projectThreadRightGroup}
-                                        >
-                                          {thread.attentionKind !== 'idle' ? (
-                                            <View
-                                              style={[
-                                                styles.kindBadge,
-                                                {
-                                                  backgroundColor:
-                                                    badge.bgColor,
-                                                  borderColor:
-                                                    badge.borderColor,
-                                                },
-                                              ]}
-                                            >
-                                              <Text
-                                                style={[
-                                                  styles.kindBadgeText,
-                                                  { color: badge.textColor },
-                                                ]}
-                                              >
-                                                {badge.label}
-                                              </Text>
-                                            </View>
-                                          ) : null}
-                                          {isCurrentThread ? (
-                                            <View style={styles.currentBadge}>
-                                              <Text
-                                                style={styles.currentBadgeText}
-                                              >
-                                                OPEN
-                                              </Text>
-                                            </View>
-                                          ) : null}
-                                          <Text style={styles.timestampText}>
-                                            {formatRelativeTime(
-                                              thread.lastModifiedAtMs,
-                                            )}
-                                          </Text>
-                                        </View>
-                                      </View>
-                                      <View
-                                        style={styles.projectThreadBottomRow}
-                                      >
-                                        <Text
-                                          style={[
-                                            styles.projectThreadReason,
-                                            thread.attentionKind === 'approval'
-                                              ? styles.reasonTextApproval
-                                              : thread.attentionKind === 'error'
-                                                ? styles.reasonTextError
-                                                : thread.attentionKind ===
-                                                    'unread'
-                                                  ? styles.reasonTextUnread
-                                                  : null,
-                                          ]}
-                                          numberOfLines={1}
-                                        >
-                                          {thread.attentionReason}
-                                        </Text>
-                                        {canMarkRead ? (
-                                          <TouchableOpacity
-                                            style={styles.markReadChip}
-                                            onPress={() =>
-                                              onMarkThreadRead(thread)
-                                            }
-                                            accessibilityRole="button"
-                                            accessibilityLabel={`Mark project thread ${thread.title} as read`}
-                                          >
-                                            <Text
-                                              style={styles.markReadChipText}
-                                            >
-                                              Mark read
-                                            </Text>
-                                          </TouchableOpacity>
-                                        ) : null}
-                                      </View>
-                                    </TouchableOpacity>
-                                  );
-                                })
+                                group.threads.map((thread) =>
+                                  renderThreadCard(thread, 'project'),
+                                )
                               ) : (
                                 <View style={styles.projectEmptyThreadsRow}>
                                   <Text style={styles.projectEmptyThreadsText}>
@@ -2194,12 +2709,15 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                         </>
                       ) : isRefreshing && snapshot.fetchedAtMs === 0 ? (
                         <>
-                          <ActivityIndicator size="small" color="#60A5FA" />
+                          <ActivityIndicator
+                            size="small"
+                            color={colors.primaryText}
+                          />
                           <Text style={styles.emptyTitle}>
                             Checking connected workstations…
                           </Text>
                           <Text style={styles.emptySubtitle}>
-                            Grouping active Antigravity projects across your
+                            Loading all Antigravity projects across your
                             machines.
                           </Text>
                         </>
@@ -2243,9 +2761,21 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                             No projects found
                           </Text>
                           <Text style={styles.emptySubtitle}>
-                            Start a conversation on a connected workstation to
-                            browse its projects here.
+                            Add a project folder on your connected workstation
+                            to start browsing and launching conversations here.
                           </Text>
+                          {onCreateProject ? (
+                            <TouchableOpacity
+                              style={styles.emptyActionBtn}
+                              onPress={handleOpenAddProject}
+                              accessibilityRole="button"
+                              accessibilityLabel="Add first project"
+                            >
+                              <Text style={styles.emptyActionBtnText}>
+                                + Add Project
+                              </Text>
+                            </TouchableOpacity>
+                          ) : null}
                         </>
                       )}
                     </View>
@@ -2319,7 +2849,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                       {usage &&
                       (usage.planName ||
                         usage.accountEmail ||
-                        usage.credits.length > 0) ? (
+                        visibleUsageCredits.length > 0) ? (
                         <View style={styles.usageCard}>
                           {usage.planName || usage.accountEmail ? (
                             <View style={styles.usagePlanRow}>
@@ -2344,7 +2874,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                             </View>
                           ) : null}
 
-                          {usage.credits.map((credit, idx) => (
+                          {visibleUsageCredits.map((credit, idx) => (
                             <View
                               key={credit.id}
                               style={[
@@ -2887,7 +3417,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                             }
                           }}
                           placeholder="antigravity.google.com/r/devbox-..."
-                          placeholderTextColor="#64748B"
+                          placeholderTextColor={colors.textPlaceholder}
                           autoCapitalize="none"
                           autoCorrect={false}
                           autoFocus={visible}
@@ -3195,12 +3725,16 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                       style={[
                         styles.modeStatusDot,
                         styles.modeStatusDotOverlay,
-                        { backgroundColor: '#10B981' },
+                        { backgroundColor: colors.runningSolid },
                       ]}
                     />
                   ) : null}
                   <InboxNavIcon
-                    color={activeMode === 'inbox' ? '#60A5FA' : '#64748B'}
+                    color={
+                      activeMode === 'inbox'
+                        ? colors.primaryText
+                        : colors.textMuted
+                    }
                   />
                   <Text
                     numberOfLines={1}
@@ -3244,7 +3778,11 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                   accessibilityLabel="Drawer mode Projects"
                 >
                   <ProjectsNavIcon
-                    color={activeMode === 'projects' ? '#60A5FA' : '#64748B'}
+                    color={
+                      activeMode === 'projects'
+                        ? colors.primaryText
+                        : colors.textMuted
+                    }
                   />
                   <Text
                     numberOfLines={1}
@@ -3282,7 +3820,11 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                     />
                   ) : null}
                   <UsageNavIcon
-                    color={activeMode === 'usage' ? '#60A5FA' : '#64748B'}
+                    color={
+                      activeMode === 'usage'
+                        ? colors.primaryText
+                        : colors.textMuted
+                    }
                   />
                   <Text
                     numberOfLines={1}
@@ -3308,7 +3850,11 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                   accessibilityLabel="Drawer mode Settings"
                 >
                   <SettingsNavIcon
-                    color={activeMode === 'settings' ? '#60A5FA' : '#64748B'}
+                    color={
+                      activeMode === 'settings'
+                        ? colors.primaryText
+                        : colors.textMuted
+                    }
                   />
                   <Text
                     numberOfLines={1}
@@ -3355,18 +3901,17 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
         testID="closed-drawer-handle-zone"
         style={[
           styles.closedHandleZone,
+          closedHandleDynamicStyle,
           isClosedHandleHidden ? styles.closedHandleZoneHidden : null,
         ]}
         hitSlop={{ top: 24, bottom: 24, left: 16, right: 24 }}
-        pointerEvents={
-          (visible && !isDraggingOpen) || isKeyboardVisible ? 'none' : 'auto'
-        }
+        pointerEvents={visible && !isDraggingOpen ? 'none' : 'auto'}
         importantForAccessibility={
           isClosedHandleHidden ? 'no-hide-descendants' : 'auto'
         }
         {...closedHandlePanResponder.panHandlers}
       >
-        {(!visible || isDraggingOpen) && !isKeyboardVisible ? (
+        {!visible || isDraggingOpen ? (
           <TouchableOpacity
             style={styles.closedHandleButton}
             activeOpacity={0.8}
@@ -3385,7 +3930,10 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
               <View
                 style={[
                   styles.handleLine,
-                  { backgroundColor: handleVisuals.lineColor },
+                  {
+                    height: closedHandleLineHeight,
+                    backgroundColor: handleVisuals.lineColor,
+                  },
                   handleVisuals.glowColor
                     ? {
                         shadowColor: handleVisuals.glowColor,
@@ -3451,20 +3999,20 @@ const styles = StyleSheet.create({
     marginLeft: 3,
     borderTopWidth: 1.5,
     borderRightWidth: 1.5,
-    opacity: 0.75,
+    opacity: 0.78,
     transform: [{ rotate: '45deg' }],
   },
   closedHandleHintPill: {
     marginLeft: 5,
-    paddingHorizontal: 6,
+    paddingHorizontal: 6.5,
     paddingVertical: 2.5,
     borderRadius: 999,
-    backgroundColor: 'rgba(15, 23, 42, 0.86)',
+    backgroundColor: 'rgba(17, 17, 20, 0.92)',
     borderWidth: 1,
-    borderColor: 'rgba(96, 165, 250, 0.38)',
+    borderColor: colors.primaryBorder,
   },
   closedHandleHintText: {
-    color: '#BFDBFE',
+    color: colors.primaryText,
     fontSize: 9.5,
     fontWeight: '700',
     letterSpacing: 0.3,
@@ -3480,25 +4028,25 @@ const styles = StyleSheet.create({
   },
   backdrop: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(2, 6, 23, 0.68)',
+    backgroundColor: colors.scrim,
   },
   drawerPanel: {
     position: 'absolute',
     left: 0,
     top: 0,
     bottom: 0,
-    backgroundColor: '#0F172A',
+    backgroundColor: colors.sidebar,
     borderRightWidth: 1,
-    borderRightColor: '#1E293B',
-    paddingLeft: 16,
-    paddingRight: 26,
+    borderRightColor: colors.border,
+    paddingLeft: 15,
+    paddingRight: 25,
   },
   drawerPanelElevated: {
     shadowColor: '#000',
     shadowOffset: { width: 8, height: 0 },
-    shadowOpacity: 0.5,
-    shadowRadius: 20,
-    elevation: 16,
+    shadowOpacity: 0.58,
+    shadowRadius: 22,
+    elevation: 18,
   },
   openHandleZone: {
     position: 'absolute',
@@ -3525,25 +4073,25 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 8,
     maxWidth: '72%',
-    paddingVertical: 6,
+    paddingVertical: 6.5,
     paddingHorizontal: 11,
-    borderRadius: 9,
-    backgroundColor: '#1E293B',
+    borderRadius: 10,
+    backgroundColor: colors.surface,
     borderWidth: 1,
-    borderColor: '#334155',
+    borderColor: colors.border,
   },
   machineSelectorPillOpen: {
-    borderColor: '#60A5FA',
-    backgroundColor: '#172554',
+    borderColor: colors.primaryBorder,
+    backgroundColor: colors.primaryCardBg,
   },
   machineSelectorDot: {
-    width: 8,
-    height: 8,
+    width: 7.5,
+    height: 7.5,
     borderRadius: 999,
   },
   machineSelectorLabel: {
     flexShrink: 1,
-    color: '#F1F5F9',
+    color: colors.textPrimary,
     fontSize: 13,
     fontWeight: '600',
   },
@@ -3581,22 +4129,22 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   headerIconBtnActive: {
-    backgroundColor: 'rgba(59, 130, 246, 0.18)',
+    backgroundColor: colors.primarySoft,
   },
   headerSyncGlyph: {
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 16,
     fontWeight: '600',
     lineHeight: 18,
   },
   headerFreshnessText: {
-    color: '#64748B',
+    color: colors.textMuted,
     fontSize: 11,
     fontWeight: '500',
     marginRight: 2,
   },
   headerModeLabel: {
-    color: '#64748B',
+    color: colors.textMuted,
     fontSize: 11.5,
     fontWeight: '600',
     paddingRight: 4,
@@ -3650,7 +4198,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     borderBottomWidth: 1,
-    borderBottomColor: '#1E293B',
+    borderBottomColor: colors.borderSubtle,
     marginBottom: 9,
     gap: 6,
   },
@@ -3671,15 +4219,15 @@ const styles = StyleSheet.create({
     borderBottomColor: 'transparent',
   },
   filterTabBtnSelected: {
-    borderBottomColor: '#3B82F6',
+    borderBottomColor: colors.primaryBright,
   },
   filterTabText: {
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 12.5,
     fontWeight: '600',
   },
   filterTabTextSelected: {
-    color: '#F8FAFC',
+    color: colors.textPrimary,
     fontWeight: '700',
   },
   tabCountBadge: {
@@ -3687,26 +4235,26 @@ const styles = StyleSheet.create({
     paddingHorizontal: 5,
     paddingVertical: 1,
     borderRadius: 999,
-    backgroundColor: '#1E293B',
+    backgroundColor: colors.surfaceRaised,
     alignItems: 'center',
   },
   tabCountBadgeSelected: {
-    backgroundColor: 'rgba(59, 130, 246, 0.22)',
+    backgroundColor: colors.primarySoft,
   },
   tabCountText: {
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 10.5,
     fontWeight: '700',
   },
   tabCountTextSelected: {
-    color: '#93C5FD',
+    color: colors.primaryText,
   },
   readAllInlineBtn: {
     paddingVertical: 5,
     paddingLeft: 6,
   },
   readAllInlineText: {
-    color: '#60A5FA',
+    color: colors.primaryText,
     fontSize: 11.5,
     fontWeight: '600',
   },
@@ -3714,16 +4262,16 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
-    backgroundColor: '#020617',
+    backgroundColor: colors.well,
     borderWidth: 1,
-    borderColor: '#334155',
+    borderColor: colors.border,
     borderRadius: 9,
     paddingHorizontal: 10,
     marginBottom: 9,
   },
   searchInput: {
     flex: 1,
-    color: '#F8FAFC',
+    color: colors.textPrimary,
     paddingVertical: 7,
     fontSize: 12.5,
   },
@@ -3732,7 +4280,7 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
   },
   searchClearText: {
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 12,
     fontWeight: '700',
   },
@@ -3742,7 +4290,7 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     bottom: 54,
-    backgroundColor: 'rgba(2, 6, 23, 0.56)',
+    backgroundColor: 'rgba(0, 0, 0, 0.56)',
     zIndex: 28,
   },
   machineMenuScrimKeyboard: {
@@ -3751,22 +4299,22 @@ const styles = StyleSheet.create({
   machineMenuCard: {
     position: 'absolute',
     top: 50,
-    left: 16,
-    right: 26,
-    backgroundColor: '#0B1120',
+    left: 15,
+    right: 25,
+    backgroundColor: colors.popover,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: '#334155',
+    borderColor: colors.borderStrong,
     padding: 6,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 10 },
-    shadowOpacity: 0.55,
-    shadowRadius: 18,
+    shadowOpacity: 0.58,
+    shadowRadius: 20,
     elevation: 14,
     zIndex: 32,
   },
   machineMenuSectionLabel: {
-    color: '#64748B',
+    color: colors.textMuted,
     fontSize: 10,
     fontWeight: '700',
     letterSpacing: 0.6,
@@ -3783,39 +4331,39 @@ const styles = StyleSheet.create({
     borderRadius: 8,
   },
   machineMenuItemActive: {
-    backgroundColor: 'rgba(59, 130, 246, 0.14)',
+    backgroundColor: colors.primarySoft,
   },
   machineMenuItemMeta: {
     flex: 1,
   },
   machineMenuItemTitle: {
-    color: '#E2E8F0',
+    color: colors.textSecondary,
     fontSize: 12.5,
     fontWeight: '600',
   },
   machineMenuItemTitleActive: {
-    color: '#F8FAFC',
+    color: colors.textPrimary,
     fontWeight: '700',
   },
   machineMenuItemSub: {
-    color: '#64748B',
+    color: colors.textMuted,
     fontSize: 10.5,
     marginTop: 1,
   },
   machineMenuCheck: {
-    color: '#60A5FA',
+    color: colors.primaryText,
     fontSize: 12.5,
     fontWeight: '700',
   },
   machineMenuEmptyText: {
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 11.5,
     paddingHorizontal: 9,
     paddingVertical: 7,
   },
   machineMenuDivider: {
     height: 1,
-    backgroundColor: '#1E293B',
+    backgroundColor: colors.borderSubtle,
     marginVertical: 4,
   },
   machineMenuActionRow: {
@@ -3829,28 +4377,28 @@ const styles = StyleSheet.create({
   machineMenuActionIcon: {
     width: 16,
     textAlign: 'center',
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 13,
     fontWeight: '600',
   },
   machineMenuActionText: {
     flex: 1,
-    color: '#CBD5E1',
+    color: colors.textSecondary,
     fontSize: 12.5,
     fontWeight: '500',
   },
   bottomModeBar: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginLeft: -16,
-    marginRight: -26,
+    marginLeft: -15,
+    marginRight: -25,
     paddingLeft: 8,
     paddingRight: 18,
     paddingTop: 6,
     paddingBottom: 8,
-    backgroundColor: '#0B1120',
+    backgroundColor: colors.well,
     borderTopWidth: 1,
-    borderTopColor: '#1E293B',
+    borderTopColor: colors.borderSubtle,
   },
   bottomModeBtn: {
     flex: 1,
@@ -3926,7 +4474,7 @@ const styles = StyleSheet.create({
     height: 5,
     borderRadius: 999,
     borderWidth: 1.5,
-    backgroundColor: '#0B1120',
+    backgroundColor: colors.well,
   },
   settingsSliderKnobLeft: {
     left: 2,
@@ -3935,12 +4483,12 @@ const styles = StyleSheet.create({
     right: 2,
   },
   modeSwitchText: {
-    color: '#64748B',
+    color: colors.textMuted,
     fontSize: 10.5,
     fontWeight: '600',
   },
   modeSwitchTextActive: {
-    color: '#60A5FA',
+    color: colors.primaryText,
     fontWeight: '700',
   },
   modeStatusDot: {
@@ -3966,13 +4514,13 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   modeCountBadgeUnread: {
-    backgroundColor: '#2563EB',
+    backgroundColor: colors.primary,
   },
   modeCountBadgeUrgent: {
     backgroundColor: '#D97706',
   },
   modeCountBadgeText: {
-    color: '#FFFFFF',
+    color: colors.white,
     fontSize: 9.5,
     fontWeight: '800',
   },
@@ -3980,8 +4528,8 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   errorBanner: {
-    backgroundColor: 'rgba(127, 29, 29, 0.28)',
-    borderColor: 'rgba(248, 113, 113, 0.35)',
+    backgroundColor: colors.errorBannerBg,
+    borderColor: colors.errorBannerBorder,
     borderWidth: 1,
     borderRadius: 9,
     paddingHorizontal: 10,
@@ -3989,28 +4537,41 @@ const styles = StyleSheet.create({
     marginBottom: 9,
   },
   errorBannerText: {
-    color: '#FCA5A5',
+    color: colors.errorText,
     fontSize: 11.5,
   },
   flexScroll: {
     flex: 1,
   },
   listContent: {
-    paddingBottom: 8,
+    paddingBottom: 10,
     gap: 8,
   },
   threadCard: {
-    backgroundColor: '#1E293B',
+    backgroundColor: colors.surface,
     borderRadius: 11,
     paddingHorizontal: 11,
     paddingVertical: 10,
     borderWidth: 1,
-    borderColor: '#334155',
-    borderLeftWidth: 4,
+    borderColor: colors.border,
+    borderLeftWidth: 3.5,
   },
   threadCardActive: {
-    borderColor: '#60A5FA',
-    backgroundColor: '#172554',
+    borderColor: colors.primaryBorder,
+    backgroundColor: colors.primaryCardBg,
+  },
+  projectThreadCard: {
+    backgroundColor: colors.surfaceRaised,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderLeftWidth: 3.5,
+  },
+  projectThreadCardActive: {
+    borderColor: colors.primaryBorder,
+    backgroundColor: colors.primaryCardBg,
   },
   cardTopRow: {
     flexDirection: 'row',
@@ -4040,41 +4601,46 @@ const styles = StyleSheet.create({
     paddingHorizontal: 5,
     paddingVertical: 2,
     borderRadius: 5,
-    backgroundColor: 'rgba(96, 165, 250, 0.2)',
+    backgroundColor: colors.primarySoft,
+    borderWidth: 1,
+    borderColor: colors.primaryBorder,
   },
   currentBadgeText: {
-    color: '#93C5FD',
+    color: colors.primaryText,
     fontSize: 9.5,
     fontWeight: '700',
     letterSpacing: 0.4,
   },
   timestampText: {
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 10.5,
     fontWeight: '500',
   },
   threadTitle: {
-    color: '#F8FAFC',
+    color: colors.textPrimary,
     fontSize: 13,
     fontWeight: '600',
     lineHeight: 18,
   },
   reasonText: {
-    color: '#CBD5E1',
+    color: colors.textSecondary,
     fontSize: 11.5,
     marginTop: 3,
     lineHeight: 16,
   },
   reasonTextApproval: {
-    color: '#FDE68A',
+    color: colors.approvalText,
     fontWeight: '500',
   },
   reasonTextError: {
-    color: '#FCA5A5',
+    color: colors.errorText,
   },
   reasonTextUnread: {
-    color: '#93C5FD',
+    color: colors.primaryText,
     fontWeight: '500',
+  },
+  reasonTextIdle: {
+    color: colors.textMuted,
   },
   cardFooterRow: {
     flexDirection: 'row',
@@ -4083,21 +4649,27 @@ const styles = StyleSheet.create({
     marginTop: 7,
     gap: 6,
   },
+  projectCardFooterRow: {
+    marginTop: 6,
+  },
+  projectFooterSpacer: {
+    flex: 1,
+  },
   metaText: {
     flex: 1,
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 10.5,
   },
   markReadChip: {
-    paddingHorizontal: 7,
+    paddingHorizontal: 7.5,
     paddingVertical: 3.5,
     borderRadius: 6,
-    backgroundColor: '#0F172A',
+    backgroundColor: colors.well,
     borderWidth: 1,
-    borderColor: '#334155',
+    borderColor: colors.borderStrong,
   },
   markReadChipText: {
-    color: '#93C5FD',
+    color: colors.primaryText,
     fontSize: 10.5,
     fontWeight: '600',
   },
@@ -4106,10 +4678,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     borderBottomWidth: 1,
-    borderBottomColor: '#1E293B',
+    borderBottomColor: colors.borderSubtle,
     paddingBottom: 7,
     marginBottom: 9,
-    gap: 8,
+    gap: 6,
   },
   projectsSummaryActionsRow: {
     flexDirection: 'row',
@@ -4118,26 +4690,259 @@ const styles = StyleSheet.create({
   },
   projectsSummaryText: {
     flex: 1,
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 11.5,
     fontWeight: '600',
   },
-  projectCard: {
-    backgroundColor: '#1E293B',
-    borderRadius: 11,
+  addProjectHeaderBtn: {
+    paddingHorizontal: 8.5,
+    paddingVertical: 4,
+    borderRadius: 7,
+    backgroundColor: colors.primarySoft,
     borderWidth: 1,
-    borderColor: '#334155',
+    borderColor: colors.primaryBorder,
+  },
+  addProjectHeaderBtnActive: {
+    backgroundColor: colors.control,
+    borderColor: colors.borderStrong,
+  },
+  addProjectHeaderBtnText: {
+    color: colors.primaryText,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  addProjectCard: {
+    backgroundColor: colors.surface,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: colors.primaryBorder,
+    padding: 11,
+    gap: 8,
+  },
+  addProjectHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  addProjectTitle: {
+    color: colors.textPrimary,
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  addProjectWorkstationRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  addProjectWorkstationChip: {
+    paddingHorizontal: 9,
+    paddingVertical: 4.5,
+    borderRadius: 999,
+    backgroundColor: colors.well,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  addProjectWorkstationChipSelected: {
+    backgroundColor: colors.primarySoft,
+    borderColor: colors.primaryBorder,
+  },
+  addProjectWorkstationChipText: {
+    color: colors.textMuted,
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  addProjectWorkstationChipTextSelected: {
+    color: colors.primaryText,
+    fontWeight: '700',
+  },
+  addProjectModeWell: {
+    flexDirection: 'row',
+    backgroundColor: colors.well,
+    borderRadius: 9,
+    padding: 3,
+    borderWidth: 1,
+    borderColor: colors.borderSubtle,
+    gap: 4,
+  },
+  addProjectModeKey: {
+    flex: 1,
+    paddingVertical: 6,
+    borderRadius: 7,
+    alignItems: 'center',
+  },
+  addProjectModeKeyActive: {
+    backgroundColor: colors.control,
+  },
+  addProjectModeKeyText: {
+    color: colors.textMuted,
+    fontSize: 11.5,
+    fontWeight: '600',
+  },
+  addProjectModeKeyTextActive: {
+    color: colors.textPrimary,
+    fontWeight: '700',
+  },
+  dirBrowserBox: {
+    backgroundColor: colors.well,
+    borderRadius: 9,
+    borderWidth: 1,
+    borderColor: colors.border,
+    overflow: 'hidden',
+  },
+  dirBrowserToolbar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.borderSubtle,
+    backgroundColor: colors.surfaceRaised,
+  },
+  dirUpBtn: {
+    paddingHorizontal: 6,
+    paddingVertical: 2.5,
+    borderRadius: 5,
+    backgroundColor: colors.control,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  dirUpBtnText: {
+    color: colors.primaryText,
+    fontSize: 10.5,
+    fontWeight: '700',
+  },
+  dirCurrentPathText: {
+    flex: 1,
+    color: colors.textSecondary,
+    fontSize: 10.5,
+    fontWeight: '500',
+  },
+  dirRefreshBtn: {
+    paddingHorizontal: 5,
+    paddingVertical: 2,
+  },
+  dirRefreshGlyph: {
+    color: colors.textMuted,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  dirListScroll: {
+    maxHeight: 142,
+  },
+  dirEntryRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    paddingHorizontal: 9,
+    paddingVertical: 7,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.borderSubtle,
+  },
+  dirEntryIcon: {
+    color: colors.primaryText,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  dirEntryName: {
+    flex: 1,
+    color: colors.textPrimary,
+    fontSize: 12,
+    fontWeight: '500',
+  },
+  dirStatusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    paddingVertical: 12,
+    paddingHorizontal: 10,
+  },
+  dirStatusText: {
+    color: colors.textMuted,
+    fontSize: 11,
+    paddingHorizontal: 9,
+    paddingVertical: 9,
+  },
+  dirErrorText: {
+    color: colors.approvalText,
+    fontSize: 11,
+    paddingHorizontal: 9,
+    paddingVertical: 8,
+  },
+  addProjectFieldLabel: {
+    color: colors.textSecondary,
+    fontSize: 11,
+    fontWeight: '600',
+    marginBottom: -4,
+  },
+  addProjectInput: {
+    backgroundColor: colors.well,
+    color: colors.textPrimary,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7.5,
+    fontSize: 12,
+  },
+  addProjectHelperText: {
+    color: colors.textMuted,
+    fontSize: 11,
+    lineHeight: 15,
+  },
+  addProjectFooterRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: 8,
+    marginTop: 2,
+  },
+  addProjectCancelBtn: {
+    paddingHorizontal: 12,
+    paddingVertical: 7.5,
+    borderRadius: 8,
+    backgroundColor: colors.control,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  addProjectCancelText: {
+    color: colors.textSecondary,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  addProjectSubmitBtn: {
+    paddingHorizontal: 14,
+    paddingVertical: 7.5,
+    borderRadius: 8,
+    backgroundColor: colors.primary,
+    minWidth: 96,
+    alignItems: 'center',
+  },
+  addProjectSubmitBtnDisabled: {
+    opacity: 0.65,
+  },
+  addProjectSubmitText: {
+    color: colors.white,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  projectCard: {
+    backgroundColor: colors.surface,
+    borderRadius: 13,
+    borderWidth: 1,
+    borderColor: colors.border,
     overflow: 'hidden',
   },
   projectCardActive: {
-    borderColor: 'rgba(96, 165, 250, 0.55)',
+    borderColor: colors.primaryBorder,
   },
   projectHeaderRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     paddingHorizontal: 10,
-    paddingVertical: 9,
+    paddingVertical: 9.5,
     gap: 8,
   },
   projectHeaderToggle: {
@@ -4156,7 +4961,7 @@ const styles = StyleSheet.create({
   },
   projectTitleText: {
     flexShrink: 1,
-    color: '#F8FAFC',
+    color: colors.textPrimary,
     fontSize: 13,
     fontWeight: '700',
   },
@@ -4169,13 +4974,13 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   projectStatusBadgeUnread: {
-    backgroundColor: '#2563EB',
+    backgroundColor: colors.primary,
   },
   projectStatusBadgeUrgent: {
     backgroundColor: '#D97706',
   },
   projectStatusBadgeText: {
-    color: '#FFFFFF',
+    color: colors.white,
     fontSize: 9.5,
     fontWeight: '800',
   },
@@ -4183,10 +4988,10 @@ const styles = StyleSheet.create({
     width: 7,
     height: 7,
     borderRadius: 999,
-    backgroundColor: '#10B981',
+    backgroundColor: colors.runningSolid,
   },
   projectSubtitleText: {
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 10.5,
     marginTop: 2,
   },
@@ -4194,82 +4999,28 @@ const styles = StyleSheet.create({
     paddingHorizontal: 9,
     paddingVertical: 5,
     borderRadius: 7,
-    backgroundColor: 'rgba(37, 99, 235, 0.18)',
+    backgroundColor: colors.primarySoft,
     borderWidth: 1,
-    borderColor: 'rgba(96, 165, 250, 0.4)',
+    borderColor: colors.primaryBorder,
   },
   projectNewChatBtnText: {
-    color: '#93C5FD',
+    color: colors.primaryText,
     fontSize: 11,
     fontWeight: '700',
   },
-  projectThreadsContainer: {
+  projectThreadsTray: {
     borderTopWidth: 1,
-    borderTopColor: 'rgba(51, 65, 85, 0.75)',
-    backgroundColor: 'rgba(15, 23, 42, 0.5)',
-  },
-  projectThreadRow: {
-    paddingHorizontal: 11,
-    paddingVertical: 8.5,
-  },
-  projectThreadRowDivider: {
-    borderTopWidth: 1,
-    borderTopColor: 'rgba(51, 65, 85, 0.55)',
-  },
-  projectThreadRowActive: {
-    backgroundColor: 'rgba(37, 99, 235, 0.16)',
-  },
-  projectThreadTopRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 6,
-  },
-  projectThreadTitleGroup: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
+    borderTopColor: colors.borderSubtle,
+    backgroundColor: colors.well,
+    padding: 8,
     gap: 7,
   },
-  projectThreadDot: {
-    width: 6.5,
-    height: 6.5,
-    borderRadius: 999,
-  },
-  projectThreadTitle: {
-    flex: 1,
-    color: '#E2E8F0',
-    fontSize: 12.5,
-    fontWeight: '600',
-  },
-  projectThreadTitleActive: {
-    color: '#F8FAFC',
-    fontWeight: '700',
-  },
-  projectThreadRightGroup: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 5,
-  },
-  projectThreadBottomRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 8,
-    marginTop: 2.5,
-    marginLeft: 13.5,
-  },
-  projectThreadReason: {
-    flex: 1,
-    color: '#94A3B8',
-    fontSize: 11,
-  },
   projectEmptyThreadsRow: {
-    paddingHorizontal: 12,
-    paddingVertical: 10,
+    paddingHorizontal: 6,
+    paddingVertical: 6,
   },
   projectEmptyThreadsText: {
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 11,
     lineHeight: 16,
   },
@@ -4280,7 +5031,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
   },
   emptyTitle: {
-    color: '#F1F5F9',
+    color: colors.textPrimary,
     fontSize: 14,
     fontWeight: '700',
     marginTop: 8,
@@ -4288,7 +5039,7 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   emptySubtitle: {
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 12,
     lineHeight: 17,
     textAlign: 'center',
@@ -4298,12 +5049,12 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingVertical: 8,
     borderRadius: 9,
-    backgroundColor: '#1E293B',
+    backgroundColor: colors.surface,
     borderWidth: 1,
-    borderColor: '#3B82F6',
+    borderColor: colors.primaryBorder,
   },
   emptyActionBtnText: {
-    color: '#93C5FD',
+    color: colors.primaryText,
     fontSize: 12,
     fontWeight: '600',
   },
@@ -4315,19 +5066,19 @@ const styles = StyleSheet.create({
     gap: 7,
   },
   usageSectionTitle: {
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 10.5,
     fontWeight: '700',
     letterSpacing: 0.7,
     paddingHorizontal: 2,
   },
   usageCard: {
-    backgroundColor: '#1E293B',
-    borderRadius: 11,
+    backgroundColor: colors.surface,
+    borderRadius: 12,
     paddingHorizontal: 12,
     paddingVertical: 11,
     borderWidth: 1,
-    borderColor: '#334155',
+    borderColor: colors.border,
     gap: 8,
   },
   usagePlanRow: {
@@ -4340,19 +5091,19 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 3,
     borderRadius: 6,
-    backgroundColor: 'rgba(59, 130, 246, 0.2)',
+    backgroundColor: colors.primarySoft,
     borderWidth: 1,
-    borderColor: 'rgba(96, 165, 250, 0.45)',
+    borderColor: colors.primaryBorder,
     flexShrink: 1,
   },
   usageTierPillText: {
-    color: '#BFDBFE',
+    color: colors.primaryText,
     fontSize: 11,
     fontWeight: '700',
   },
   usageAccountEmail: {
     flex: 1,
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 11,
     textAlign: 'right',
   },
@@ -4365,21 +5116,21 @@ const styles = StyleSheet.create({
   usageCreditRowBorder: {
     paddingTop: 8,
     borderTopWidth: 1,
-    borderTopColor: 'rgba(51, 65, 85, 0.7)',
+    borderTopColor: colors.borderSubtle,
   },
   usageCreditLabel: {
     flex: 1,
-    color: '#CBD5E1',
+    color: colors.textSecondary,
     fontSize: 12,
     fontWeight: '500',
   },
   usageCreditValue: {
-    color: '#F8FAFC',
+    color: colors.textPrimary,
     fontSize: 13,
     fontWeight: '700',
   },
   usageGroupTitle: {
-    color: '#F8FAFC',
+    color: colors.textPrimary,
     fontSize: 12.5,
     fontWeight: '700',
     marginBottom: 2,
@@ -4390,7 +5141,7 @@ const styles = StyleSheet.create({
   usageQuotaItemDivider: {
     paddingTop: 9,
     borderTopWidth: 1,
-    borderTopColor: 'rgba(51, 65, 85, 0.7)',
+    borderTopColor: colors.borderSubtle,
   },
   usageQuotaHeaderRow: {
     flexDirection: 'row',
@@ -4406,7 +5157,7 @@ const styles = StyleSheet.create({
   },
   usageQuotaLabel: {
     flexShrink: 1,
-    color: '#E2E8F0',
+    color: colors.textPrimary,
     fontSize: 12,
     fontWeight: '600',
   },
@@ -4414,10 +5165,10 @@ const styles = StyleSheet.create({
     paddingHorizontal: 5,
     paddingVertical: 1.5,
     borderRadius: 4,
-    backgroundColor: 'rgba(96, 165, 250, 0.18)',
+    backgroundColor: colors.primarySoft,
   },
   usageDefaultTagText: {
-    color: '#93C5FD',
+    color: colors.primaryText,
     fontSize: 9,
     fontWeight: '700',
     letterSpacing: 0.3,
@@ -4435,7 +5186,7 @@ const styles = StyleSheet.create({
   usageProgressTrack: {
     height: 6,
     borderRadius: 999,
-    backgroundColor: '#0B1120',
+    backgroundColor: colors.well,
     overflow: 'hidden',
   },
   usageProgressFill: {
@@ -4443,19 +5194,19 @@ const styles = StyleSheet.create({
     borderRadius: 999,
   },
   usageResetText: {
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 10.5,
   },
   usageInfoBanner: {
-    backgroundColor: 'rgba(30, 41, 59, 0.75)',
-    borderColor: '#334155',
+    backgroundColor: colors.surface,
+    borderColor: colors.border,
     borderWidth: 1,
-    borderRadius: 9,
+    borderRadius: 10,
     paddingHorizontal: 11,
     paddingVertical: 9,
   },
   usageInfoBannerText: {
-    color: '#CBD5E1',
+    color: colors.textSecondary,
     fontSize: 11.5,
     lineHeight: 16,
   },
@@ -4465,40 +5216,40 @@ const styles = StyleSheet.create({
   },
   usageMetricTile: {
     flex: 1,
-    backgroundColor: '#1E293B',
+    backgroundColor: colors.surface,
     borderRadius: 10,
     paddingVertical: 9,
     paddingHorizontal: 6,
     borderWidth: 1,
-    borderColor: '#334155',
+    borderColor: colors.border,
     alignItems: 'center',
     justifyContent: 'center',
   },
   usageMetricValue: {
-    color: '#F8FAFC',
+    color: colors.textPrimary,
     fontSize: 15,
     fontWeight: '700',
   },
   usageMetricValueActive: {
-    color: '#34D399',
+    color: colors.running,
   },
   usageMetricLabel: {
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 10.5,
     fontWeight: '500',
     marginTop: 2,
     textAlign: 'center',
   },
   usageBudgetAlertBtn: {
-    backgroundColor: 'rgba(239, 68, 68, 0.16)',
-    borderColor: 'rgba(248, 113, 113, 0.45)',
+    backgroundColor: colors.errorSoft,
+    borderColor: colors.errorBorder,
     borderWidth: 1,
     borderRadius: 9,
     paddingHorizontal: 11,
     paddingVertical: 8,
   },
   usageBudgetAlertText: {
-    color: '#FECACA',
+    color: colors.errorText,
     fontSize: 11.5,
     fontWeight: '600',
     lineHeight: 16,
@@ -4510,7 +5261,7 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   keepAliveDescription: {
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 11.5,
     lineHeight: 16,
     marginBottom: 8,
@@ -4526,42 +5277,42 @@ const styles = StyleSheet.create({
     paddingVertical: 7,
     paddingHorizontal: 4,
     borderRadius: 8,
-    backgroundColor: '#1E293B',
+    backgroundColor: colors.surface,
     borderWidth: 1,
-    borderColor: '#334155',
+    borderColor: colors.border,
     alignItems: 'center',
   },
   keepAliveChipSelected: {
-    backgroundColor: '#1D4ED8',
-    borderColor: '#60A5FA',
+    backgroundColor: colors.primary,
+    borderColor: colors.primaryBorder,
   },
   keepAliveChipText: {
-    color: '#CBD5E1',
+    color: colors.textSecondary,
     fontSize: 11.5,
     fontWeight: '600',
   },
   keepAliveChipTextSelected: {
-    color: '#FFFFFF',
+    color: colors.white,
     fontWeight: '700',
   },
   keepAliveHint: {
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 11,
     lineHeight: 15,
   },
   sectionDivider: {
     height: 1,
-    backgroundColor: '#1E293B',
+    backgroundColor: colors.borderSubtle,
     marginVertical: 14,
   },
   sectionLabel: {
-    color: '#F1F5F9',
+    color: colors.textPrimary,
     fontSize: 13,
     fontWeight: '600',
     marginBottom: 3,
   },
   sectionHint: {
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 11.5,
     marginBottom: 8,
   },
@@ -4572,30 +5323,30 @@ const styles = StyleSheet.create({
   },
   handoffInput: {
     flex: 1,
-    backgroundColor: '#020617',
-    color: '#F8FAFC',
+    backgroundColor: colors.well,
+    color: colors.textPrimary,
     borderWidth: 1,
-    borderColor: '#334155',
+    borderColor: colors.border,
     borderRadius: 9,
     paddingHorizontal: 10,
     paddingVertical: 9,
     fontSize: 12.5,
   },
   connectButton: {
-    backgroundColor: '#2563EB',
+    backgroundColor: colors.primary,
     paddingHorizontal: 15,
     paddingVertical: 10,
     borderRadius: 9,
   },
   connectButtonText: {
-    color: '#FFFFFF',
+    color: colors.white,
     fontSize: 13,
     fontWeight: '700',
   },
   errorText: {
-    color: '#F87171',
+    color: colors.errorText,
     fontSize: 11.5,
-    marginTop: 7,
+    marginTop: 4,
   },
   actionsGroup: {
     marginTop: 6,
@@ -4604,46 +5355,46 @@ const styles = StyleSheet.create({
   settingActionRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#1E293B',
+    backgroundColor: colors.surface,
     paddingVertical: 11,
     paddingHorizontal: 12,
     borderRadius: 9,
     borderWidth: 1,
-    borderColor: '#334155',
+    borderColor: colors.border,
     gap: 9,
   },
   settingActionRowExpanded: {
     borderBottomLeftRadius: 0,
     borderBottomRightRadius: 0,
-    borderColor: '#475569',
+    borderColor: colors.borderStrong,
   },
   settingActionIcon: {
-    color: '#93C5FD',
+    color: colors.primaryText,
     fontSize: 13.5,
     width: 18,
     textAlign: 'center',
   },
   settingActionText: {
     flex: 1,
-    color: '#E2E8F0',
+    color: colors.textPrimary,
     fontSize: 13,
     fontWeight: '600',
   },
   settingActionChevron: {
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 14,
     fontWeight: '700',
   },
   handoffExpandedCard: {
     marginTop: -8,
-    backgroundColor: '#0B1120',
+    backgroundColor: colors.well,
     paddingHorizontal: 11,
     paddingVertical: 10,
     borderBottomLeftRadius: 9,
     borderBottomRightRadius: 9,
     borderWidth: 1,
     borderTopWidth: 0,
-    borderColor: '#475569',
+    borderColor: colors.borderStrong,
   },
   sessionBottomSection: {
     marginTop: 'auto',
@@ -4662,7 +5413,7 @@ const styles = StyleSheet.create({
     borderRadius: 999,
   },
   accountStatusText: {
-    color: '#94A3B8',
+    color: colors.textMuted,
     fontSize: 11.5,
     fontWeight: '500',
   },
@@ -4671,23 +5422,23 @@ const styles = StyleSheet.create({
     borderRadius: 9,
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: 'rgba(248, 113, 113, 0.35)',
-    backgroundColor: 'rgba(127, 29, 29, 0.2)',
+    borderColor: colors.errorBorder,
+    backgroundColor: colors.errorSoft,
   },
   signOutButtonText: {
-    color: '#FCA5A5',
+    color: colors.errorText,
     fontSize: 13,
     fontWeight: '600',
   },
   confirmBox: {
     padding: 11,
     borderRadius: 10,
-    backgroundColor: '#2A1215',
+    backgroundColor: colors.errorBannerBg,
     borderWidth: 1,
-    borderColor: '#7F1D1D',
+    borderColor: colors.errorBannerBorder,
   },
   confirmTitle: {
-    color: '#FECACA',
+    color: colors.errorText,
     fontSize: 12,
     fontWeight: '500',
     marginBottom: 9,
@@ -4701,11 +5452,11 @@ const styles = StyleSheet.create({
     flex: 0.85,
     paddingVertical: 8,
     borderRadius: 8,
-    backgroundColor: '#1E293B',
+    backgroundColor: colors.control,
     alignItems: 'center',
   },
   cancelConfirmText: {
-    color: '#E2E8F0',
+    color: colors.textPrimary,
     fontSize: 12.5,
     fontWeight: '600',
   },
@@ -4717,7 +5468,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   confirmDangerText: {
-    color: '#FFFFFF',
+    color: colors.white,
     fontSize: 12.5,
     fontWeight: '700',
   },
@@ -4725,7 +5476,7 @@ const styles = StyleSheet.create({
     marginTop: 14,
     paddingTop: 11,
     borderTopWidth: 1,
-    borderTopColor: '#1E293B',
+    borderTopColor: colors.borderSubtle,
     alignItems: 'center',
   },
   footerLinksRow: {
@@ -4736,16 +5487,16 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   footerLinkText: {
-    color: '#93C5FD',
+    color: colors.primaryText,
     fontSize: 11.5,
     fontWeight: '600',
   },
   footerSeparator: {
-    color: '#475569',
+    color: colors.textPlaceholder,
     fontSize: 11.5,
   },
   footerDisclaimerText: {
-    color: '#64748B',
+    color: colors.textMuted,
     fontSize: 10.5,
     lineHeight: 14,
     textAlign: 'center',

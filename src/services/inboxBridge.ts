@@ -27,21 +27,33 @@ export const INBOX_BRIDGE_SCRIPT = `
     }
 
     var GET_TRAJECTORIES_PATH = '/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories';
+    var LIST_PROJECTS_PATH = '/exa.language_server_pb.LanguageServerService/ListProjects';
+    var READ_PROJECTS_PATH = '/exa.language_server_pb.LanguageServerService/ReadProjects';
+    var GET_WORKSPACE_INFOS_PATH = '/exa.language_server_pb.LanguageServerService/GetWorkspaceInfos';
+    var GET_DEFAULT_PROJECT_DIR_PATH = '/exa.language_server_pb.LanguageServerService/GetDefaultProjectDir';
+    var READ_DIR_PATH = '/exa.language_server_pb.LanguageServerService/ReadDir';
+    var RESOLVE_FOLDER_PATH = '/exa.language_server_pb.LanguageServerService/ResolveFolder';
+    var CREATE_SCRATCH_PROJECT_FOLDER_PATH = '/exa.language_server_pb.LanguageServerService/CreateScratchProjectFolder';
+    var CREATE_PROJECT_PATH = '/exa.language_server_pb.LanguageServerService/CreateProject';
+    var ADD_TRACKED_WORKSPACE_PATH = '/exa.language_server_pb.LanguageServerService/AddTrackedWorkspace';
     var START_CASCADE_PATH = '/exa.language_server_pb.LanguageServerService/StartCascade';
     var UPDATE_ANNOTATIONS_PATH = '/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations';
     var RETRIEVE_QUOTA_SUMMARY_PATH = '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary';
     var GET_USER_STATUS_PATH = '/exa.language_server_pb.LanguageServerService/GetUserStatus';
     var GET_COMMAND_MODEL_CONFIGS_PATH = '/exa.language_server_pb.LanguageServerService/GetCommandModelConfigs';
+    var DEFAULT_LS_METADATA_OBJ = {
+      ideName: 'antigravity',
+      extensionName: 'antigravity',
+      locale: 'en'
+    };
     var DEFAULT_LS_METADATA_BODY = JSON.stringify({
-      metadata: {
-        ideName: 'antigravity',
-        extensionName: 'antigravity',
-        locale: 'en'
-      }
+      metadata: DEFAULT_LS_METADATA_OBJ
     });
     var POLL_INTERVAL_MS = 20000;
     var USAGE_POLL_MIN_INTERVAL_MS = 45000;
     var INSTANCE_RPC_TIMEOUT_MS = 8000;
+    var PROJECTS_RPC_TIMEOUT_MS = 5000;
+    var START_CASCADE_TIMEOUT_MS = 5000;
     var USAGE_RPC_TIMEOUT_MS = 3500;
     var USAGE_INLINE_BUDGET_MS = 1200;
     var SAFE_ID_RE = /^[a-zA-Z0-9._-]+$/;
@@ -53,6 +65,9 @@ export const INBOX_BRIDGE_SCRIPT = `
     var cachedAuthFirstParty = null;
     var cachedApiKey = null;
     var lastTrajectoryCache = Object.create(null);
+    var lastProjectsCache = Object.create(null);
+    var lastWorkspaceInfosCache = Object.create(null);
+    var lastHomeDirCache = Object.create(null);
     var lastInstancesPayloadCache = [];
     var lastUsageCache = null;
     var lastUsageFetchedAtMs = 0;
@@ -64,10 +79,64 @@ export const INBOX_BRIDGE_SCRIPT = `
     var activeIframeInstanceUuid = null;
     var hasIframeRouteOverride = false;
     var pendingFastNav = null;
+    var pendingStartNav = null;
     var FAST_NAV_CONFIRM_MS = 380;
+    var START_NAV_CONFIRM_MS = 1200;
     var refreshTimer = null;
     var inFlightRefresh = null;
     var isStopped = false;
+
+    function generateUuidV4() {
+      try {
+        if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+          return window.crypto.randomUUID();
+        }
+        if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
+          var bytes = new Uint8Array(16);
+          window.crypto.getRandomValues(bytes);
+          bytes[6] = (bytes[6] & 0x0f) | 0x40;
+          bytes[8] = (bytes[8] & 0x3f) | 0x80;
+          var hex = '';
+          for (var i = 0; i < 16; i++) {
+            var h = bytes[i].toString(16);
+            hex += h.length === 1 ? '0' + h : h;
+            if (i === 3 || i === 5 || i === 7 || i === 9) hex += '-';
+          }
+          return hex;
+        }
+      } catch (_) {}
+      var tpl = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx';
+      var out = '';
+      for (var j = 0; j < tpl.length; j++) {
+        var ch = tpl.charAt(j);
+        if (ch === 'x' || ch === 'y') {
+          var r = Math.floor(Math.random() * 16);
+          var v = ch === 'x' ? r : (r & 0x3) | 0x8;
+          out += v.toString(16);
+        } else {
+          out += ch;
+        }
+      }
+      return out;
+    }
+
+    function hasConnectRpcError(res) {
+      return Boolean(
+        res &&
+          typeof res === 'object' &&
+          typeof res.code === 'string' &&
+          typeof res.message === 'string' &&
+          !res.cascadeId &&
+          !res.cascade_id &&
+          !res.project &&
+          !res.projects &&
+          !res.projectIds &&
+          !res.project_ids &&
+          !res.entries &&
+          !res.folderUri &&
+          !res.folder_uri
+      );
+    }
 
     function extractInstanceUuidFromHostPath() {
       var pathname = (window.location && window.location.pathname) || '';
@@ -809,6 +878,104 @@ export const INBOX_BRIDGE_SCRIPT = `
       return job;
     }
 
+    function fetchProjectsForInstance(ctx, uuid) {
+      return callProxyJson(ctx, uuid, LIST_PROJECTS_PATH, '{}', PROJECTS_RPC_TIMEOUT_MS)
+        .then(function(listRes) {
+          if (!listRes || typeof listRes !== 'object' || hasConnectRpcError(listRes)) {
+            return lastProjectsCache[uuid] || null;
+          }
+          var inlineProjects = Array.isArray(listRes.projects) ? listRes.projects : null;
+          var ids = Array.isArray(listRes.projectIds)
+            ? listRes.projectIds
+            : Array.isArray(listRes.project_ids)
+              ? listRes.project_ids
+              : [];
+          var cleanIds = [];
+          for (var i = 0; i < ids.length; i++) {
+            if (
+              typeof ids[i] === 'string' &&
+              ids[i] !== 'outside-of-project' &&
+              SAFE_ID_RE.test(ids[i])
+            ) {
+              cleanIds.push(ids[i]);
+            }
+          }
+          if (cleanIds.length === 0) {
+            var resolvedEmpty = inlineProjects || [];
+            lastProjectsCache[uuid] = resolvedEmpty;
+            return resolvedEmpty;
+          }
+          if (inlineProjects && inlineProjects.length >= cleanIds.length) {
+            lastProjectsCache[uuid] = inlineProjects;
+            return inlineProjects;
+          }
+          return callProxyJson(
+            ctx,
+            uuid,
+            READ_PROJECTS_PATH,
+            JSON.stringify({ ids: cleanIds }),
+            PROJECTS_RPC_TIMEOUT_MS
+          )
+            .then(function(readRes) {
+              if (readRes && Array.isArray(readRes.projects)) {
+                lastProjectsCache[uuid] = readRes.projects;
+                return readRes.projects;
+              }
+              return inlineProjects || lastProjectsCache[uuid] || null;
+            })
+            .catch(function() {
+              return inlineProjects || lastProjectsCache[uuid] || null;
+            });
+        })
+        .catch(function() {
+          return lastProjectsCache[uuid] || null;
+        });
+    }
+
+    function fetchWorkspaceInfosForInstance(ctx, uuid) {
+      return callProxyJson(ctx, uuid, GET_WORKSPACE_INFOS_PATH, '{}', PROJECTS_RPC_TIMEOUT_MS)
+        .then(function(wsRes) {
+          if (!wsRes || typeof wsRes !== 'object' || hasConnectRpcError(wsRes)) {
+            return {
+              workspaceInfos: lastWorkspaceInfosCache[uuid] || null,
+              homeDirUri: lastHomeDirCache[uuid] || null
+            };
+          }
+          var infos = Array.isArray(wsRes.workspaceInfos)
+            ? wsRes.workspaceInfos
+            : Array.isArray(wsRes.workspace_infos)
+              ? wsRes.workspace_infos
+              : null;
+          var homeUri =
+            (typeof wsRes.homeDirUri === 'string' && wsRes.homeDirUri.trim()) ||
+            (typeof wsRes.home_dir_uri === 'string' && wsRes.home_dir_uri.trim()) ||
+            (typeof wsRes.homeDirPath === 'string' && wsRes.homeDirPath.trim()
+              ? 'file://' + wsRes.homeDirPath.trim()
+              : null) ||
+            (typeof wsRes.home_dir_path === 'string' && wsRes.home_dir_path.trim()
+              ? 'file://' + wsRes.home_dir_path.trim()
+              : null) ||
+            lastHomeDirCache[uuid] ||
+            null;
+          if (infos) {
+            lastWorkspaceInfosCache[uuid] = infos;
+          }
+          if (homeUri) {
+            lastHomeDirCache[uuid] = homeUri;
+          }
+          return {
+            workspaceInfos: infos || lastWorkspaceInfosCache[uuid] || null,
+            homeDirUri: homeUri
+          };
+        })
+        .catch(function() {
+          return {
+            workspaceInfos: lastWorkspaceInfosCache[uuid] || null,
+            homeDirUri: lastHomeDirCache[uuid] || null
+          };
+        });
+    }
+
     function refresh(forceUsage) {
       syncFullBleedWorkspace();
       var wantForcedUsage = Boolean(forceUsage);
@@ -878,6 +1045,9 @@ export const INBOX_BRIDGE_SCRIPT = `
 
                 if (!shouldQuery) {
                   delete lastTrajectoryCache[uuid];
+                  delete lastProjectsCache[uuid];
+                  delete lastWorkspaceInfosCache[uuid];
+                  delete lastHomeDirCache[uuid];
                   instanceJobs.push(
                     Promise.resolve({
                       uuid: uuid,
@@ -885,7 +1055,10 @@ export const INBOX_BRIDGE_SCRIPT = `
                       status: status,
                       version: version || undefined,
                       updatedAtMs: updatedAtMs,
-                      trajectories: null
+                      homeDirUri: null,
+                      trajectories: null,
+                      projects: null,
+                      workspaceInfos: null
                     })
                   );
                   return;
@@ -901,36 +1074,62 @@ export const INBOX_BRIDGE_SCRIPT = `
                   usageCandidates.push(candidateEntry);
                 }
 
+                var trajJob = callProxyJson(ctx, uuid, GET_TRAJECTORIES_PATH, '{}')
+                  .then(function(parsed) {
+                    var summaries =
+                      (parsed &&
+                        (parsed.trajectorySummaries ||
+                          parsed.trajectory_summaries)) ||
+                      parsed ||
+                      Object.create(null);
+                    lastTrajectoryCache[uuid] = summaries;
+                    return {
+                      ok: true,
+                      trajectories: summaries,
+                      error: undefined
+                    };
+                  })
+                  .catch(function(err) {
+                    return {
+                      ok: false,
+                      trajectories: lastTrajectoryCache[uuid] || null,
+                      error: err && err.message ? String(err.message) : 'Unreachable'
+                    };
+                  });
+                var isHiddenBackgroundPoll =
+                  typeof document !== 'undefined' &&
+                  document.visibilityState === 'hidden';
+                var projectsJob = isHiddenBackgroundPoll
+                  ? Promise.resolve(lastProjectsCache[uuid] || null)
+                  : fetchProjectsForInstance(ctx, uuid);
+                var wsInfoJob = isHiddenBackgroundPoll
+                  ? Promise.resolve({
+                      workspaceInfos: lastWorkspaceInfosCache[uuid] || null,
+                      homeDirUri: lastHomeDirCache[uuid] || null
+                    })
+                  : fetchWorkspaceInfosForInstance(ctx, uuid);
+
                 instanceJobs.push(
-                  callProxyJson(ctx, uuid, GET_TRAJECTORIES_PATH, '{}')
-                    .then(function(parsed) {
-                      var summaries =
-                        (parsed &&
-                          (parsed.trajectorySummaries ||
-                            parsed.trajectory_summaries)) ||
-                        parsed ||
-                        Object.create(null);
-                      lastTrajectoryCache[uuid] = summaries;
-                      return {
-                        uuid: uuid,
-                        name: name || uuid,
-                        status: status,
-                        version: version || undefined,
-                        updatedAtMs: updatedAtMs,
-                        trajectories: summaries
-                      };
-                    })
-                    .catch(function(err) {
-                      return {
-                        uuid: uuid,
-                        name: name || uuid,
-                        status: status,
-                        version: version || undefined,
-                        updatedAtMs: updatedAtMs,
-                        trajectories: lastTrajectoryCache[uuid] || null,
-                        error: err && err.message ? String(err.message) : 'Unreachable'
-                      };
-                    })
+                  Promise.all([trajJob, projectsJob, wsInfoJob]).then(function(triple) {
+                    var trajResult = triple[0];
+                    var projectsResult = triple[1];
+                    var wsResult = triple[2] || { workspaceInfos: null, homeDirUri: null };
+                    var payload = {
+                      uuid: uuid,
+                      name: name || uuid,
+                      status: status,
+                      version: version || undefined,
+                      updatedAtMs: updatedAtMs,
+                      homeDirUri: wsResult.homeDirUri || null,
+                      trajectories: trajResult.trajectories,
+                      projects: projectsResult,
+                      workspaceInfos: wsResult.workspaceInfos
+                    };
+                    if (trajResult.error) {
+                      payload.error = trajResult.error;
+                    }
+                    return payload;
+                  })
                 );
               })(rawList[i]);
             }
@@ -1577,6 +1776,49 @@ export const INBOX_BRIDGE_SCRIPT = `
       pendingFastNav = null;
     }
 
+    function clearPendingStartNav() {
+      if (pendingStartNav) {
+        if (pendingStartNav.timer) {
+          clearTimeout(pendingStartNav.timer);
+        }
+        if (pendingStartNav.probeTimers) {
+          for (var i = 0; i < pendingStartNav.probeTimers.length; i++) {
+            clearTimeout(pendingStartNav.probeTimers[i]);
+          }
+        }
+      }
+      pendingStartNav = null;
+    }
+
+    function completePendingStartNavIfMatched(confirmedCascadeId, hostHandlesUrlSync) {
+      if (!pendingStartNav || !confirmedCascadeId) {
+        return false;
+      }
+      if (confirmedCascadeId !== pendingStartNav.expectedCascadeId) {
+        return false;
+      }
+      var completed = pendingStartNav;
+      clearPendingStartNav();
+      if (!hostHandlesUrlSync) {
+        syncHostLocationUrl(completed.targetUrl);
+      }
+      setIframeCascadeOverride(confirmedCascadeId);
+      postToNative({
+        type: 'AGY_INBOX_START_CHAT_RESULT',
+        requestId: completed.requestId,
+        handled: true,
+        cascadeId: confirmedCascadeId,
+        targetUrl: completed.targetUrl
+      });
+      postToNative({
+        type: 'AGY_INBOX_ACTIVE_ROUTE',
+        activeUrl: completed.targetUrl || window.location.href,
+        activeInstanceUuid: completed.instanceUuid,
+        activeCascadeId: confirmedCascadeId
+      });
+      return true;
+    }
+
     function syncHostLocationUrl(targetUrl) {
       if (
         typeof targetUrl !== 'string' ||
@@ -1733,7 +1975,7 @@ export const INBOX_BRIDGE_SCRIPT = `
     }
 
     function extractCreatedCascadeId(res) {
-      if (!res || typeof res !== 'object') return null;
+      if (!res || typeof res !== 'object' || hasConnectRpcError(res)) return null;
       var candidate =
         res.cascadeId ||
         res.cascade_id ||
@@ -1759,9 +2001,16 @@ export const INBOX_BRIDGE_SCRIPT = `
       }
     }
 
-    function navigateIframeToNewChatOverview(requestId, instanceUuid, targetUrl) {
+    function navigateIframeToNewChatOverview(requestId, instanceUuid, targetUrl, projectId) {
       var route = parseRouteFromLocation();
       var frame = findHubIframe();
+      var cleanProjectId =
+        typeof projectId === 'string' && SAFE_ID_RE.test(projectId.trim())
+          ? projectId.trim()
+          : null;
+      var navPath = cleanProjectId
+        ? '/?project=' + encodeURIComponent(cleanProjectId)
+        : '/';
       if (
         route.instanceUuid === instanceUuid &&
         frame &&
@@ -1771,7 +2020,7 @@ export const INBOX_BRIDGE_SCRIPT = `
         try {
           var frameOrigin = new URL(frame.src).origin;
           frame.contentWindow.postMessage(
-            { jspbPayload: JSON.stringify([null, ['/']]) },
+            { jspbPayload: JSON.stringify([null, [navPath]]) },
             frameOrigin
           );
           frame.contentWindow.postMessage(
@@ -1806,7 +2055,42 @@ export const INBOX_BRIDGE_SCRIPT = `
       return false;
     }
 
-    function startProjectChat(requestId, instanceUuid, workspaceUri, targetUrl) {
+    function tryStartCascadeRequest(ctx, instanceUuid, bodyObj) {
+      var requestedId = bodyObj.cascadeId;
+      return callProxyJson(
+        ctx,
+        instanceUuid,
+        START_CASCADE_PATH,
+        JSON.stringify(bodyObj),
+        START_CASCADE_TIMEOUT_MS
+      )
+        .then(function(res) {
+          if (hasConnectRpcError(res)) {
+            return null;
+          }
+          var returnedId = extractCreatedCascadeId(res);
+          if (returnedId) {
+            return returnedId;
+          }
+          // Some Connect responses return an empty JSON object {} when the
+          // client-generated cascadeId was accepted without modification.
+          if (
+            res &&
+            typeof res === 'object' &&
+            Object.keys(res).length === 0 &&
+            typeof requestedId === 'string' &&
+            SAFE_ID_RE.test(requestedId)
+          ) {
+            return requestedId;
+          }
+          return null;
+        })
+        .catch(function() {
+          return null;
+        });
+    }
+
+    function startProjectChat(requestId, instanceUuid, workspaceUri, targetUrl, projectId) {
       if (!instanceUuid || instanceUuid === '__cloud__') {
         postToNative({
           type: 'AGY_INBOX_START_CHAT_RESULT',
@@ -1818,67 +2102,70 @@ export const INBOX_BRIDGE_SCRIPT = `
         return Promise.resolve(false);
       }
 
+      var cleanProjectId =
+        typeof projectId === 'string' && SAFE_ID_RE.test(projectId.trim())
+          ? projectId.trim()
+          : null;
+      var cleanUri =
+        typeof workspaceUri === 'string' && workspaceUri.trim()
+          ? workspaceUri.trim()
+          : null;
+
       return getClientWithMetadata()
         .then(function(ctx) {
           if (!ctx) {
             return null;
           }
-          var cleanUri =
-            typeof workspaceUri === 'string' && workspaceUri.trim()
-              ? workspaceUri.trim()
-              : null;
-          var primaryBody = cleanUri
-            ? JSON.stringify({
-                metadata: {
-                  ideName: 'antigravity',
-                  extensionName: 'antigravity',
-                  locale: 'en'
-                },
-                workspaceUris: [cleanUri]
-              })
-            : DEFAULT_LS_METADATA_BODY;
-
-          return callProxyJson(
-            ctx,
-            instanceUuid,
-            START_CASCADE_PATH,
-            primaryBody,
-            1800
-          )
-            .then(function(res) {
-              var cid = extractCreatedCascadeId(res);
-              if (cid || !cleanUri) {
-                return cid;
-              }
-              return callProxyJson(
-                ctx,
-                instanceUuid,
-                START_CASCADE_PATH,
-                DEFAULT_LS_METADATA_BODY,
-                1800
-              ).then(extractCreatedCascadeId);
-            })
-            .catch(function() {
-              if (!cleanUri) return null;
-              return callProxyJson(
-                ctx,
-                instanceUuid,
-                START_CASCADE_PATH,
-                DEFAULT_LS_METADATA_BODY,
-                1800
-              )
-                .then(extractCreatedCascadeId)
-                .catch(function() {
-                  return null;
-                });
+          var attempts = [];
+          if (cleanProjectId) {
+            // Note: StartCascadeRequest carries projectId exclusively inside
+            // projectEnvConfig (never as a top-level field, which strict
+            // protojson unmarshalers reject).
+            attempts.push({
+              cascadeId: generateUuidV4(),
+              source: 'CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT',
+              projectEnvConfig: {
+                projectId: cleanProjectId,
+                defaultProjectEnvironment: {}
+              },
+              workspaceUris: [],
+              metadata: DEFAULT_LS_METADATA_OBJ
             });
+          }
+          if (cleanUri) {
+            attempts.push({
+              cascadeId: generateUuidV4(),
+              source: 'CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT',
+              workspaceUris: [cleanUri],
+              metadata: DEFAULT_LS_METADATA_OBJ
+            });
+          }
+          attempts.push({
+            cascadeId: generateUuidV4(),
+            source: 'CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT',
+            metadata: DEFAULT_LS_METADATA_OBJ
+          });
+
+          var idx = 0;
+          function runNextAttempt() {
+            if (idx >= attempts.length) {
+              return Promise.resolve(null);
+            }
+            var bodyObj = attempts[idx++];
+            return tryStartCascadeRequest(ctx, instanceUuid, bodyObj).then(function(cid) {
+              if (cid) return cid;
+              return runNextAttempt();
+            });
+          }
+          return runNextAttempt();
         })
         .then(function(cascadeId) {
           if (!cascadeId) {
             return navigateIframeToNewChatOverview(
               requestId,
               instanceUuid,
-              targetUrl
+              targetUrl,
+              cleanProjectId
             );
           }
 
@@ -1893,32 +2180,66 @@ export const INBOX_BRIDGE_SCRIPT = `
             frame.src
           ) {
             try {
+              clearPendingStartNav();
               var frameOrigin = new URL(frame.src).origin;
+              var navChildPath =
+                '/c/' +
+                cascadeId +
+                (cleanProjectId ? '?project=' + encodeURIComponent(cleanProjectId) : '');
+              var probeTimers = [];
+              var scheduleUrlProbe = function(delayMs) {
+                var probeTimer = setTimeout(function() {
+                  if (!pendingStartNav || pendingStartNav.requestId !== requestId) {
+                    return;
+                  }
+                  try {
+                    if (frame && frame.contentWindow) {
+                      frame.contentWindow.postMessage(
+                        { jspbPayload: JSON.stringify([null, null, []]) },
+                        frameOrigin
+                      );
+                    }
+                  } catch (_) {}
+                }, delayMs);
+                probeTimers.push(probeTimer);
+              };
+              var timer = setTimeout(function() {
+                if (!pendingStartNav || pendingStartNav.requestId !== requestId) {
+                  return;
+                }
+                clearPendingStartNav();
+                postToNative({
+                  type: 'AGY_INBOX_START_CHAT_RESULT',
+                  requestId: requestId,
+                  handled: false,
+                  cascadeId: cascadeId,
+                  targetUrl: createdUrl
+                });
+              }, START_NAV_CONFIRM_MS);
+              pendingStartNav = {
+                requestId: requestId,
+                instanceUuid: instanceUuid,
+                expectedCascadeId: cascadeId,
+                targetUrl: createdUrl,
+                timer: timer,
+                probeTimers: probeTimers
+              };
               frame.contentWindow.postMessage(
-                { jspbPayload: JSON.stringify([null, ['/c/' + cascadeId]]) },
+                { jspbPayload: JSON.stringify([null, [navChildPath]]) },
                 frameOrigin
               );
               frame.contentWindow.postMessage(
                 { jspbPayload: JSON.stringify([null, null, []]) },
                 frameOrigin
               );
-              syncHostLocationUrl(createdUrl);
-              setIframeCascadeOverride(cascadeId);
-              postToNative({
-                type: 'AGY_INBOX_START_CHAT_RESULT',
-                requestId: requestId,
-                handled: true,
-                cascadeId: cascadeId,
-                targetUrl: createdUrl
-              });
-              postToNative({
-                type: 'AGY_INBOX_ACTIVE_ROUTE',
-                activeUrl: createdUrl,
-                activeInstanceUuid: instanceUuid,
-                activeCascadeId: cascadeId
-              });
+              // TanStack Router's navigate() settles asynchronously; follow-up GET_URL
+              // probes confirm route activation even if URL_CHANGED is not emitted.
+              scheduleUrlProbe(180);
+              scheduleUrlProbe(550);
               return true;
-            } catch (_) {}
+            } catch (_) {
+              clearPendingStartNav();
+            }
           }
 
           postToNative({
@@ -1934,8 +2255,391 @@ export const INBOX_BRIDGE_SCRIPT = `
           return navigateIframeToNewChatOverview(
             requestId,
             instanceUuid,
-            targetUrl
+            targetUrl,
+            cleanProjectId
           );
+        });
+    }
+
+    function normalizeFolderPathToFileUri(rawInput, homeDirUri) {
+      if (typeof rawInput !== 'string') return '';
+      var trimmed = rawInput.trim();
+      if (!trimmed) return '';
+      if (
+        (trimmed === '~' || trimmed.indexOf('~/') === 0 || trimmed.indexOf('~\\\\') === 0) &&
+        typeof homeDirUri === 'string' &&
+        homeDirUri.trim()
+      ) {
+        var cleanHome = homeDirUri.trim().replace(/\\/+$/, '');
+        var suffix = trimmed.length > 1 ? trimmed.substring(1).replace(/\\\\/g, '/') : '';
+        var cleanSuffix = suffix.length > 1 ? suffix.replace(/\\/+$/, '') : '';
+        if (cleanHome.indexOf('file://') === 0) {
+          return cleanHome + (cleanSuffix ? encodeURI(cleanSuffix) : '');
+        }
+        trimmed = cleanHome + cleanSuffix;
+      }
+      if (trimmed.indexOf('file://') === 0) {
+        return trimmed.length > 8 ? trimmed.replace(/\\/+$/, '') : trimmed;
+      }
+      if (trimmed.charAt(0) === '/') {
+        var cleaned = trimmed.length > 1 ? trimmed.replace(/\\/+$/, '') : '/';
+        return 'file://' + encodeURI(cleaned);
+      }
+      if (/^[a-zA-Z]:[\\\\/]/.test(trimmed)) {
+        var normWin = trimmed.replace(/\\\\/g, '/').replace(/\\/+$/, '');
+        return 'file:///' + encodeURI(normWin);
+      }
+      return '';
+    }
+
+    function extractDirDisplayName(uri) {
+      if (typeof uri !== 'string' || !uri) return '';
+      try {
+        var decoded = decodeURIComponent(uri).replace(/\\/+$/, '');
+        var stripped = decoded.replace(/^file:\\/\\//i, '');
+        var parts = stripped.split('/').filter(Boolean);
+        return parts.length > 0 ? parts[parts.length - 1] : stripped || '/';
+      } catch (_) {
+        var fallback = uri.replace(/\\/+$/, '').split('/').filter(Boolean);
+        return fallback.length > 0 ? fallback[fallback.length - 1] : uri;
+      }
+    }
+
+    function computeParentFileUri(uri) {
+      if (typeof uri !== 'string' || !uri) return null;
+      try {
+        var cleaned = uri.replace(/\\/+$/, '');
+        if (!cleaned || cleaned === 'file://' || cleaned === 'file:///') {
+          return null;
+        }
+        var stripped = cleaned.replace(/^file:\\/\\//i, '');
+        // Stop at Windows drive root (e.g. file:///C: or file:///c%3A)
+        if (/^\\/[a-zA-Z](?::|%3[aA])$/.test(stripped)) {
+          return null;
+        }
+        var lastSlash = stripped.lastIndexOf('/');
+        if (lastSlash <= 0) {
+          return 'file:///';
+        }
+        return 'file://' + stripped.substring(0, lastSlash);
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function listDirectory(requestId, instanceUuid, rawUri) {
+      if (!instanceUuid || instanceUuid === '__cloud__') {
+        postToNative({
+          type: 'AGY_INBOX_LIST_DIR_RESULT',
+          requestId: requestId,
+          ok: false,
+          currentUri: '',
+          parentUri: null,
+          entries: [],
+          error: 'Select a connected workstation first.'
+        });
+        return Promise.resolve(false);
+      }
+
+      return getClientWithMetadata()
+        .then(function(ctx) {
+          if (!ctx) {
+            throw new Error('Workstation bridge is not ready yet.');
+          }
+          var initialUri = normalizeFolderPathToFileUri(
+            rawUri,
+            lastHomeDirCache[instanceUuid]
+          );
+          var resolveStartUri = initialUri
+            ? Promise.resolve(initialUri)
+            : callProxyJson(ctx, instanceUuid, GET_DEFAULT_PROJECT_DIR_PATH, '{}', PROJECTS_RPC_TIMEOUT_MS)
+                .then(function(defRes) {
+                  var defUri =
+                    defRes &&
+                    !hasConnectRpcError(defRes) &&
+                    (defRes.defaultProjectDirUri || defRes.default_project_dir_uri);
+                  if (typeof defUri === 'string' && defUri.trim()) {
+                    return normalizeFolderPathToFileUri(defUri) || defUri.trim();
+                  }
+                  return null;
+                })
+                .catch(function() {
+                  return null;
+                })
+                .then(function(defUri) {
+                  if (defUri) return defUri;
+                  if (lastHomeDirCache[instanceUuid]) {
+                    return lastHomeDirCache[instanceUuid];
+                  }
+                  return fetchWorkspaceInfosForInstance(ctx, instanceUuid).then(function(ws) {
+                    return (ws && ws.homeDirUri) || 'file:///';
+                  });
+                });
+
+          return resolveStartUri.then(function(targetUri) {
+            return callProxyJson(
+              ctx,
+              instanceUuid,
+              READ_DIR_PATH,
+              JSON.stringify({ uri: targetUri, userInitiated: true }),
+              PROJECTS_RPC_TIMEOUT_MS
+            ).then(function(dirRes) {
+              if (!dirRes || typeof dirRes !== 'object' || hasConnectRpcError(dirRes)) {
+                throw new Error(
+                  (dirRes && dirRes.message) || 'Unable to read directory on workstation.'
+                );
+              }
+              var rawEntries = Array.isArray(dirRes.entries) ? dirRes.entries : [];
+              var dirs = [];
+              for (var i = 0; i < rawEntries.length; i++) {
+                var item = rawEntries[i];
+                if (!item || typeof item !== 'object') continue;
+                var ft = item.fileType !== undefined ? item.fileType : item.file_type;
+                var isDir =
+                  ft === 2 ||
+                  (typeof ft === 'string' && ft.toUpperCase().indexOf('DIR') !== -1);
+                if (!isDir) continue;
+                var entryUri =
+                  typeof item.uri === 'string' && item.uri.trim()
+                    ? item.uri.trim().replace(/\\/+$/, '')
+                    : '';
+                var entryName =
+                  (typeof item.name === 'string' && item.name.trim()) ||
+                  extractDirDisplayName(entryUri);
+                if (!entryUri || !entryName || entryName === '.' || entryName === '..') {
+                  continue;
+                }
+                dirs.push({ name: entryName, uri: entryUri });
+              }
+              dirs.sort(function(a, b) {
+                var aHidden = a.name.charAt(0) === '.';
+                var bHidden = b.name.charAt(0) === '.';
+                if (aHidden !== bHidden) return aHidden ? 1 : -1;
+                return a.name.localeCompare(b.name);
+              });
+              postToNative({
+                type: 'AGY_INBOX_LIST_DIR_RESULT',
+                requestId: requestId,
+                ok: true,
+                currentUri: targetUri,
+                parentUri: computeParentFileUri(targetUri),
+                entries: dirs.slice(0, 200),
+                error: null
+              });
+              return true;
+            });
+          });
+        })
+        .catch(function(err) {
+          postToNative({
+            type: 'AGY_INBOX_LIST_DIR_RESULT',
+            requestId: requestId,
+            ok: false,
+            currentUri: normalizeFolderPathToFileUri(rawUri) || '',
+            parentUri: computeParentFileUri(normalizeFolderPathToFileUri(rawUri)),
+            entries: [],
+            error: err && err.message ? String(err.message) : 'Failed to list folders.'
+          });
+          return false;
+        });
+    }
+
+    function createProject(requestId, instanceUuid, mode, rawName, rawFolderPathOrUri) {
+      if (!instanceUuid || instanceUuid === '__cloud__') {
+        postToNative({
+          type: 'AGY_INBOX_CREATE_PROJECT_RESULT',
+          requestId: requestId,
+          ok: false,
+          error: 'Select a connected workstation first.'
+        });
+        return Promise.resolve(false);
+      }
+
+      var effectiveMode = mode === 'scratch' ? 'scratch' : 'existing';
+      var trimmedName = typeof rawName === 'string' ? rawName.trim() : '';
+
+      return getClientWithMetadata()
+        .then(function(ctx) {
+          if (!ctx) {
+            throw new Error('Workstation bridge is not ready yet.');
+          }
+
+          var resolveFolderTarget;
+          if (effectiveMode === 'scratch') {
+            if (!trimmedName) {
+              throw new Error('Enter a project name.');
+            }
+            var folderSlug =
+              trimmedName
+                .replace(/[^a-zA-Z0-9._-]+/g, '-')
+                .replace(/^-+|-+$/g, '') || 'project';
+            resolveFolderTarget = callProxyJson(
+              ctx,
+              instanceUuid,
+              CREATE_SCRATCH_PROJECT_FOLDER_PATH,
+              JSON.stringify({ name: folderSlug }),
+              INSTANCE_RPC_TIMEOUT_MS
+            ).then(function(scratchRes) {
+              if (!scratchRes || hasConnectRpcError(scratchRes)) {
+                throw new Error(
+                  (scratchRes && scratchRes.message) ||
+                    'Unable to create project folder on server.'
+                );
+              }
+              var folderUri = scratchRes.folderUri || scratchRes.folder_uri || '';
+              if (!folderUri) {
+                throw new Error(
+                  scratchRes.errorMessage ||
+                    scratchRes.error_message ||
+                    'Server did not return a folder path.'
+                );
+              }
+              return {
+                folderUri: String(folderUri).trim().replace(/\\/+$/, ''),
+                isGitRepo: Boolean(scratchRes.isGitRepo || scratchRes.is_git_repo),
+                projectName: trimmedName
+              };
+            });
+          } else {
+            var resolveHomeThenNormalize =
+              typeof rawFolderPathOrUri === 'string' &&
+              rawFolderPathOrUri.trim().charAt(0) === '~' &&
+              !lastHomeDirCache[instanceUuid]
+                ? fetchWorkspaceInfosForInstance(ctx, instanceUuid).then(function(ws) {
+                    return normalizeFolderPathToFileUri(
+                      rawFolderPathOrUri,
+                      (ws && ws.homeDirUri) || lastHomeDirCache[instanceUuid]
+                    );
+                  })
+                : Promise.resolve(
+                    normalizeFolderPathToFileUri(
+                      rawFolderPathOrUri,
+                      lastHomeDirCache[instanceUuid]
+                    )
+                  );
+
+            resolveFolderTarget = resolveHomeThenNormalize.then(function(normalizedUri) {
+              if (!normalizedUri) {
+                throw new Error(
+                  'Select or enter a valid absolute folder path (e.g. /home/user/repo or ~/repo).'
+                );
+              }
+              var finalName =
+                trimmedName || extractDirDisplayName(normalizedUri) || 'Project';
+              return callProxyJson(
+                ctx,
+                instanceUuid,
+                RESOLVE_FOLDER_PATH,
+                JSON.stringify({ folderUri: normalizedUri }),
+                PROJECTS_RPC_TIMEOUT_MS
+              )
+                .then(function(res) {
+                  var rType =
+                    res && (res.resourceType !== undefined ? res.resourceType : res.resource_type);
+                  var vcs = res && (res.vcsType !== undefined ? res.vcsType : res.vcs_type);
+                  var isGit =
+                    rType === 2 ||
+                    (typeof rType === 'string' && rType.toUpperCase().indexOf('GIT') !== -1) ||
+                    vcs === 1 ||
+                    (typeof vcs === 'string' && vcs.toUpperCase().indexOf('GIT') !== -1);
+                  return {
+                    folderUri: normalizedUri,
+                    isGitRepo: isGit,
+                    projectName: finalName
+                  };
+                })
+                .catch(function() {
+                  return {
+                    folderUri: normalizedUri,
+                    isGitRepo: false,
+                    projectName: finalName
+                  };
+                });
+            });
+          }
+
+          return resolveFolderTarget.then(function(target) {
+            var newProjectId = generateUuidV4();
+            var resourceEntry = target.isGitRepo
+              ? { gitFolder: { folderUri: target.folderUri } }
+              : { folderUri: target.folderUri };
+            var projectPayload = {
+              id: newProjectId,
+              name: target.projectName,
+              isWorkspaceOnly: false,
+              projectResources: {
+                resources: [resourceEntry]
+              }
+            };
+
+            return callProxyJson(
+              ctx,
+              instanceUuid,
+              CREATE_PROJECT_PATH,
+              JSON.stringify({ project: projectPayload }),
+              INSTANCE_RPC_TIMEOUT_MS
+            )
+              .then(function(createRes) {
+                if (hasConnectRpcError(createRes)) {
+                  throw new Error(createRes.message || 'CreateProject failed');
+                }
+                var createdProj =
+                  (createRes && createRes.project && typeof createRes.project === 'object'
+                    ? createRes.project
+                    : null) || projectPayload;
+                var resolvedId =
+                  (typeof createdProj.id === 'string' && createdProj.id) || newProjectId;
+                scheduleRefresh(150);
+                postToNative({
+                  type: 'AGY_INBOX_CREATE_PROJECT_RESULT',
+                  requestId: requestId,
+                  ok: true,
+                  projectId: resolvedId,
+                  projectName: target.projectName,
+                  workspaceUri: target.folderUri,
+                  error: null
+                });
+                return true;
+              })
+              .catch(function(createErr) {
+                // Graceful fallback for older language servers without CreateProject
+                return callProxyJson(
+                  ctx,
+                  instanceUuid,
+                  ADD_TRACKED_WORKSPACE_PATH,
+                  JSON.stringify({ workspace: target.folderUri }),
+                  PROJECTS_RPC_TIMEOUT_MS
+                )
+                  .then(function(wsRes) {
+                    if (hasConnectRpcError(wsRes)) {
+                      throw createErr;
+                    }
+                    scheduleRefresh(150);
+                    postToNative({
+                      type: 'AGY_INBOX_CREATE_PROJECT_RESULT',
+                      requestId: requestId,
+                      ok: true,
+                      projectId: null,
+                      projectName: target.projectName,
+                      workspaceUri: target.folderUri,
+                      error: null
+                    });
+                    return true;
+                  })
+                  .catch(function() {
+                    throw createErr;
+                  });
+              });
+          });
+        })
+        .catch(function(err) {
+          postToNative({
+            type: 'AGY_INBOX_CREATE_PROJECT_RESULT',
+            requestId: requestId,
+            ok: false,
+            error: err && err.message ? String(err.message) : 'Unable to add project to server.'
+          });
+          return false;
         });
     }
 
@@ -1964,10 +2668,21 @@ export const INBOX_BRIDGE_SCRIPT = `
         var frame = findHubIframe();
         var frameSrc = frame ? frame.src : '';
 
+        if (data.type === 'AGY_REMOTE_OPEN_DRAWER') {
+          postToNative({
+            type: 'AGY_INBOX_OPEN_DRAWER_REQUEST',
+            mode: data.mode === 'projects' ? 'projects' : 'inbox'
+          });
+          return;
+        }
+
         if (data.type === 'URL_CHANGED') {
           var rawChangedPath = typeof data.path === 'string' ? data.path : '';
           var changedCascadeId = extractCascadeIdFromIframePath(rawChangedPath, frameSrc);
           if (completePendingFastNavIfMatched(changedCascadeId, true)) {
+            return;
+          }
+          if (completePendingStartNavIfMatched(changedCascadeId, true)) {
             return;
           }
           if (!changedCascadeId) {
@@ -1999,6 +2714,9 @@ export const INBOX_BRIDGE_SCRIPT = `
         if (reportedPath !== null) {
           var extractedCascadeId = extractCascadeIdFromIframePath(reportedPath, frameSrc);
           if (completePendingFastNavIfMatched(extractedCascadeId, isUrlChangeEvent)) {
+            return;
+          }
+          if (completePendingStartNavIfMatched(extractedCascadeId, isUrlChangeEvent)) {
             return;
           }
           if (isUrlChangeEvent) {
@@ -2137,12 +2855,15 @@ export const INBOX_BRIDGE_SCRIPT = `
       markThreadRead: markThreadRead,
       fastNavigate: fastNavigate,
       startProjectChat: startProjectChat,
+      listDirectory: listDirectory,
+      createProject: createProject,
       syncFullBleedWorkspace: syncFullBleedWorkspace,
       restoreHostChrome: restoreHostChrome,
       openHostSettings: openHostSettings,
       stop: function() {
         isStopped = true;
         clearPendingFastNav();
+        clearPendingStartNav();
         if (refreshTimer) clearTimeout(refreshTimer);
         if (fullBleedTimer) clearTimeout(fullBleedTimer);
         if (pollId) clearInterval(pollId);
@@ -2283,12 +3004,14 @@ export function buildOpenHostSettingsScript(): string {
 export function buildStartProjectChatScript(params: {
   requestId: string;
   instanceUuid: string;
+  projectId?: string | null;
   workspaceUri?: string | null;
   targetUrl: string;
 }): string {
   const serialized = JSON.stringify({
     requestId: params.requestId,
     instanceUuid: params.instanceUuid,
+    projectId: params.projectId ?? null,
     workspaceUri: params.workspaceUri ?? null,
     targetUrl: params.targetUrl,
   });
@@ -2302,7 +3025,8 @@ export function buildStartProjectChatScript(params: {
         args.requestId,
         args.instanceUuid,
         args.workspaceUri,
-        args.targetUrl
+        args.targetUrl,
+        args.projectId
       );
       return true;
     }
@@ -2315,6 +3039,93 @@ export function buildStartProjectChatScript(params: {
         handled: false,
         cascadeId: null,
         targetUrl: args.targetUrl
+      }));
+    }
+  } catch (_) {}
+  return true;
+})();
+`;
+}
+
+export function buildListDirectoryScript(params: {
+  requestId: string;
+  instanceUuid: string;
+  uri?: string | null;
+}): string {
+  const serialized = JSON.stringify({
+    requestId: params.requestId,
+    instanceUuid: params.instanceUuid,
+    uri: params.uri ?? null,
+  });
+
+  return `
+(function() {
+  var args = ${serialized};
+  try {
+    if (window.__agyInboxBridge && typeof window.__agyInboxBridge.listDirectory === 'function') {
+      window.__agyInboxBridge.listDirectory(
+        args.requestId,
+        args.instanceUuid,
+        args.uri
+      );
+      return true;
+    }
+  } catch (_) {}
+  try {
+    if (window.ReactNativeWebView && typeof window.ReactNativeWebView.postMessage === 'function') {
+      window.ReactNativeWebView.postMessage(JSON.stringify({
+        type: 'AGY_INBOX_LIST_DIR_RESULT',
+        requestId: args.requestId,
+        ok: false,
+        currentUri: args.uri || '',
+        parentUri: null,
+        entries: [],
+        error: 'Workstation bridge is unavailable.'
+      }));
+    }
+  } catch (_) {}
+  return true;
+})();
+`;
+}
+
+export function buildCreateProjectScript(params: {
+  requestId: string;
+  instanceUuid: string;
+  mode: 'existing' | 'scratch';
+  name: string;
+  folderPathOrUri?: string | null;
+}): string {
+  const serialized = JSON.stringify({
+    requestId: params.requestId,
+    instanceUuid: params.instanceUuid,
+    mode: params.mode,
+    name: params.name,
+    folderPathOrUri: params.folderPathOrUri ?? null,
+  });
+
+  return `
+(function() {
+  var args = ${serialized};
+  try {
+    if (window.__agyInboxBridge && typeof window.__agyInboxBridge.createProject === 'function') {
+      window.__agyInboxBridge.createProject(
+        args.requestId,
+        args.instanceUuid,
+        args.mode,
+        args.name,
+        args.folderPathOrUri
+      );
+      return true;
+    }
+  } catch (_) {}
+  try {
+    if (window.ReactNativeWebView && typeof window.ReactNativeWebView.postMessage === 'function') {
+      window.ReactNativeWebView.postMessage(JSON.stringify({
+        type: 'AGY_INBOX_CREATE_PROJECT_RESULT',
+        requestId: args.requestId,
+        ok: false,
+        error: 'Workstation bridge is unavailable.'
       }));
     }
   } catch (_) {}

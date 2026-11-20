@@ -1,4 +1,15 @@
 import { requireNativeModule } from 'expo';
+import { InboxAttentionKind } from '../types/inbox';
+
+export interface ActionNotificationThreadItem {
+  id: string;
+  title: string;
+  attentionKind: InboxAttentionKind;
+  statusLabel: string;
+  attentionReason: string;
+  subtitle: string;
+  deepLinkUrl: string;
+}
 
 export interface NativeActionNotificationPayload {
   title: string;
@@ -7,6 +18,8 @@ export interface NativeActionNotificationPayload {
   count: number;
   deepLinkUrl: string;
   shouldAlert: boolean;
+  /** Structured per-thread cards rendered by native Android/iOS notifications. */
+  items?: ActionNotificationThreadItem[];
 }
 
 interface RemoteSessionNativeModule {
@@ -23,6 +36,7 @@ interface RemoteSessionNativeModule {
     count: number,
     deepLinkUrl: string,
     shouldAlert: boolean,
+    itemsJson?: string,
   ): Promise<void>;
   clearActionNotification?(): Promise<void>;
   requestNotificationPermission?(): Promise<boolean>;
@@ -65,6 +79,7 @@ export async function syncNativeActionNotification(
     const nativeModule =
       requireNativeModule<RemoteSessionNativeModule>('RemoteSession');
     if (typeof nativeModule.syncActionNotification === 'function') {
+      const itemsJson = JSON.stringify(payload.items ?? []);
       await nativeModule.syncActionNotification(
         payload.title,
         payload.body,
@@ -72,6 +87,7 @@ export async function syncNativeActionNotification(
         payload.count,
         payload.deepLinkUrl,
         payload.shouldAlert,
+        itemsJson,
       );
     }
   } catch {

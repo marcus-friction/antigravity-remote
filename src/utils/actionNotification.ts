@@ -1,7 +1,13 @@
 import { ACTION_INBOX_DEEP_LINK } from '../constants/config';
-import { NativeActionNotificationPayload } from '../services/webData';
-import { InboxThreadItem } from '../types/inbox';
+import { getAttentionVisuals } from '../constants/theme';
+import {
+  ActionNotificationThreadItem,
+  NativeActionNotificationPayload,
+} from '../services/webData';
+import { InboxAttentionKind, InboxThreadItem } from '../types/inbox';
 import { ActionNotificationMode, AuthFlowStage } from '../types/session';
+
+const MAX_NOTIFICATION_CARDS = 4;
 
 export interface ActionNotificationSyncResult {
   /** Deterministic key for deduplicating redundant native notification updates. */
@@ -46,11 +52,54 @@ export function buildThreadNotificationDeepLink(
   }
 }
 
+function getNotificationStatusEmoji(kind: InboxAttentionKind): string {
+  switch (kind) {
+    case 'approval':
+      return '🟠';
+    case 'error':
+      return '🔴';
+    case 'unread':
+      return '🔵';
+    case 'running':
+      return '🟢';
+    default:
+      return '⚪';
+  }
+}
+
+function buildThreadCardItem(
+  thread: InboxThreadItem,
+): ActionNotificationThreadItem {
+  const visuals = getAttentionVisuals(thread.attentionKind);
+  const subtitle = thread.workspaceName
+    ? `${thread.instanceName} • ${thread.workspaceName}`
+    : thread.instanceName;
+  const deepLinkUrl =
+    buildThreadNotificationDeepLink(thread.targetUrl) ?? ACTION_INBOX_DEEP_LINK;
+
+  return {
+    id: thread.id,
+    title: thread.title,
+    attentionKind: thread.attentionKind,
+    statusLabel: visuals.label,
+    attentionReason: thread.attentionReason,
+    subtitle,
+    deepLinkUrl,
+  };
+}
+
+function formatFallbackCardBlock(item: ActionNotificationThreadItem): string {
+  const badge = `${getNotificationStatusEmoji(item.attentionKind)} ${item.statusLabel}`;
+  const meta = item.subtitle ? ` · ${item.subtitle}` : '';
+  return `${badge}${meta}\n${item.title} — ${item.attentionReason}`;
+}
+
 /**
  * Computes the single OS notification payload for currently open actions:
  * - `count === 0` (or `mode === 'off'` / unauthenticated): clears the notification.
- * - `count === 1`: displays the single action and links directly to that thread.
- * - `count > 1`: displays the open action count and links directly to the Inbox.
+ * - `count === 1`: renders a single color-coded thread card and links directly to that thread.
+ * - `count > 1`: renders a stacked deck of color-coded thread cards (each tappable directly
+ *   to its thread on Android) and links the notification container to the Inbox.
  *
  * Alerts (`shouldAlert: true`) only when at least one new open-action thread ID
  * arrives while the Inbox drawer is not already open on screen; count decrements
@@ -110,18 +159,24 @@ export function buildActionNotificationSyncState(params: {
   const count = openThreads.length;
   const hasNewThread = openThreads.some((t) => !previousOpenThreadIds.has(t.id));
   const shouldAlert = hasNewThread && !(isAppForeground && isDrawerOpen);
+  const items = openThreads.slice(0, MAX_NOTIFICATION_CARDS).map(buildThreadCardItem);
+  const itemsSig = items
+    .map(
+      (it) =>
+        `${it.id}:${it.attentionKind}:${it.title}:${it.attentionReason}:${it.subtitle}:${it.deepLinkUrl}`,
+    )
+    .join(';');
 
   if (count === 1) {
     const single = openThreads[0];
-    const deepLinkUrl =
-      buildThreadNotificationDeepLink(single.targetUrl) ??
-      ACTION_INBOX_DEEP_LINK;
+    const card = items[0];
+    const deepLinkUrl = card.deepLinkUrl;
     const title = single.instanceName
       ? `1 action open • ${single.instanceName}`
       : '1 action open';
     const body = `${single.title} — ${single.attentionReason}`;
-    const expandedBody = `${single.title}\n${single.attentionReason}`;
-    const signature = `1|${deepLinkUrl}|${title}|${body}|${expandedBody}`;
+    const expandedBody = formatFallbackCardBlock(card);
+    const signature = `1|${deepLinkUrl}|${title}|${body}|${expandedBody}|${itemsSig}`;
 
     return {
       signature,
@@ -132,6 +187,7 @@ export function buildActionNotificationSyncState(params: {
         count: 1,
         deepLinkUrl,
         shouldAlert,
+        items,
       },
       openThreadIds,
     };
@@ -140,14 +196,12 @@ export function buildActionNotificationSyncState(params: {
   const deepLinkUrl = ACTION_INBOX_DEEP_LINK;
   const title = `${count} actions open`;
   const body = `${openThreads[0].title} (+${count - 1} more) • Tap to open Inbox`;
-  const lines = openThreads
-    .slice(0, 4)
-    .map((thread) => `• ${thread.title} — ${thread.attentionReason}`);
-  if (count > 4) {
-    lines.push(`+${count - 4} more in Thread Inbox`);
+  const blocks = items.map(formatFallbackCardBlock);
+  if (count > MAX_NOTIFICATION_CARDS) {
+    blocks.push(`+${count - MAX_NOTIFICATION_CARDS} more in Thread Inbox`);
   }
-  const expandedBody = lines.join('\n');
-  const signature = `${count}|${deepLinkUrl}|${title}|${body}|${expandedBody}`;
+  const expandedBody = blocks.join('\n\n');
+  const signature = `${count}|${deepLinkUrl}|${title}|${body}|${expandedBody}|${itemsSig}`;
 
   return {
     signature,
@@ -158,6 +212,7 @@ export function buildActionNotificationSyncState(params: {
       count,
       deepLinkUrl,
       shouldAlert,
+      items,
     },
     openThreadIds,
   };

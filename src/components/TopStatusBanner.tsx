@@ -1,5 +1,6 @@
 import React from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { ANTIGRAVITY_THEME } from '../constants/theme';
 import { AuthFlowStage } from '../types/session';
 
 interface TopStatusBannerProps {
@@ -52,6 +53,8 @@ export const TopStatusBanner: React.FC<TopStatusBannerProps> = ({
   );
 };
 
+const { colors } = ANTIGRAVITY_THEME;
+
 const styles = StyleSheet.create({
   banner: {
     flexDirection: 'row',
@@ -61,30 +64,30 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
   authBanner: {
-    backgroundColor: '#101929',
-    borderBottomColor: '#1E3A5F',
+    backgroundColor: colors.sidebar,
+    borderBottomColor: colors.border,
   },
   offlineBanner: {
-    backgroundColor: '#2A1215',
-    borderBottomColor: '#5C232A',
+    backgroundColor: colors.errorBannerBg,
+    borderBottomColor: colors.errorBannerBorder,
   },
   dotAuth: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: '#60A5FA',
+    width: 7,
+    height: 7,
+    borderRadius: 999,
+    backgroundColor: colors.primaryBright,
     marginRight: 8,
   },
   dotOffline: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: '#F87171',
+    width: 7,
+    height: 7,
+    borderRadius: 999,
+    backgroundColor: colors.errorMuted,
     marginRight: 8,
   },
   bannerText: {
     flex: 1,
-    color: '#E2E8F0',
+    color: colors.textPrimary,
     fontSize: 12,
     fontWeight: '500',
   },
@@ -92,13 +95,13 @@ const styles = StyleSheet.create({
     marginLeft: 10,
     paddingHorizontal: 10,
     paddingVertical: 4,
-    borderRadius: 6,
-    backgroundColor: '#3B1D22',
+    borderRadius: 7,
+    backgroundColor: colors.errorSoft,
     borderWidth: 1,
-    borderColor: '#F87171',
+    borderColor: colors.errorBorder,
   },
   retryButtonText: {
-    color: '#FCA5A5',
+    color: colors.errorText,
     fontSize: 12,
     fontWeight: '600',
   },
@@ -106,13 +109,13 @@ const styles = StyleSheet.create({
     marginLeft: 10,
     paddingHorizontal: 10,
     paddingVertical: 4,
-    borderRadius: 6,
-    backgroundColor: '#1E293B',
+    borderRadius: 7,
+    backgroundColor: colors.primarySoft,
     borderWidth: 1,
-    borderColor: '#3B82F6',
+    borderColor: colors.primaryBorder,
   },
   authReloadButtonText: {
-    color: '#93C5FD',
+    color: colors.primaryText,
     fontSize: 11,
     fontWeight: '600',
   },

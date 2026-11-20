@@ -360,7 +360,9 @@ describe('End-to-End <App /> Flow', () => {
       'Google Sign-In active — your session will be saved automatically',
     );
 
-    // 6. Open unified left-hand navigation drawer, switch to Settings mode, expand machine link input, and paste CLI output
+    // 6. Because Antigravity's native sidebar is hidden, authenticating onto `/` (no thread)
+    // opens our native Inbox drawer automatically; verify old floating pill is absent and
+    // switch to Settings mode, expand machine link input, and paste CLI output.
     expect(
       tree.root.findAll(
         (node) =>
@@ -368,17 +370,7 @@ describe('End-to-End <App /> Flow', () => {
           node.props.accessibilityLabel === 'Open Antigravity Remote controls',
       ),
     ).toHaveLength(0);
-
-    const drawerHandleButton = tree.root.findAll(
-      (node) =>
-        node.type === ('TouchableOpacity' as any) &&
-        node.props.accessibilityLabel === 'Open Antigravity drawer',
-    )[0];
-    expect(drawerHandleButton).toBeDefined();
-
-    await act(async () => {
-      drawerHandleButton.props.onPress();
-    });
+    expect(tree.root.findByType(LeftNavigationDrawer).props.visible).toBe(true);
 
     const settingsModeBtn = tree.root.findAll(
       (node) =>
@@ -479,14 +471,14 @@ describe('End-to-End <App /> Flow', () => {
       }
     });
 
-    // Verify closed left-drawer handle hides while typing and WebView wrapper shrinks above keyboard
+    // Verify closed left-drawer handle STAYS VISIBLE and interactive while typing above the keyboard (Item 2)
     expect(
       tree.root.findAll(
         (node) =>
           node.type === ('TouchableOpacity' as any) &&
           node.props.accessibilityLabel === 'Open Antigravity drawer',
       ).length,
-    ).toBe(0);
+    ).toBe(1);
     expect(mockWebViewInjectJavaScript).toHaveBeenCalled();
 
     // Simulate keyboard closing
@@ -945,15 +937,9 @@ describe('Session and navigation regressions', () => {
       ),
     ).toBe(true);
 
-    // Open left drawer, switch to Settings mode, verify concise guidance, and adjust ('5m' -> '60m' -> 'Off')
-    const drawerHandle = tree.root.findAll(
-      (node) =>
-        node.type === ('TouchableOpacity' as any) &&
-        node.props.accessibilityLabel === 'Open Antigravity drawer',
-    )[0];
-    await act(async () => {
-      drawerHandle.props.onPress();
-    });
+    // Returning authenticated onto a non-thread workstation route automatically has our Inbox drawer open;
+    // switch to Settings mode, verify concise guidance, and adjust ('5m' -> '60m' -> 'Off')
+    expect(controls().props.visible).toBe(true);
     const settingsModeBtn = tree.root
       .findAllByType('TouchableOpacity' as any)
       .find((node) => node.props.accessibilityLabel === 'Drawer mode Settings')!;
@@ -1061,14 +1047,8 @@ describe('Session and navigation regressions', () => {
       });
     });
 
-    const openBtn1 = tree.root.findAll(
-      (node) =>
-        node.type === ('TouchableOpacity' as any) &&
-        node.props.accessibilityLabel === 'Open Antigravity drawer',
-    )[0];
-    await act(async () => {
-      openBtn1.props.onPress();
-    });
+    // Drawer auto-opened on Inbox after landing on non-thread route `/r/studio-mac`
+    expect(controls().props.visible).toBe(true);
     // Complete refresh response with 0 connected machines
     await act(async () => {
       webView().props.onMessage({
@@ -2636,9 +2616,8 @@ describe('Session and navigation regressions', () => {
         .findAllByType('Text' as any)
         .map((t) => t.props.children);
 
-    await act(async () => {
-      getOpenHandle().props.onPress();
-    });
+    // Drawer is auto-open in Inbox after authenticating onto non-thread route `/u/1/`
+    expect(controls().props.visible).toBe(true);
     expect(getPillLabels()).toEqual(['All Machines']);
 
     await act(async () => {
@@ -3281,13 +3260,13 @@ describe('Session and navigation regressions', () => {
       expect(
         findWebViewWrapperStyle(androidTree).paddingBottom,
       ).toBeUndefined();
-      expect(
-        androidTree.root.findAll(
-          (node) =>
-            node.type === ('TouchableOpacity' as any) &&
-            node.props.accessibilityLabel === 'Open Antigravity drawer',
-        ),
-      ).toHaveLength(0);
+      // Drawer handle MUST stay visible and interactive even while the Android software keyboard is displaying!
+      const handleWhileKeyboardOpen = androidTree.root.findAll(
+        (node) =>
+          node.type === ('TouchableOpacity' as any) &&
+          node.props.accessibilityLabel === 'Open Antigravity drawer',
+      );
+      expect(handleWhileKeyboardOpen).toHaveLength(1);
 
       // Full-height keyboardDidShow on Android also keeps JS padding at 0 (no double push-up)
       await act(async () => {
@@ -3300,6 +3279,17 @@ describe('Session and navigation regressions', () => {
       expect(
         findWebViewWrapperStyle(androidTree).paddingBottom,
       ).toBeUndefined();
+
+      // Tapping the handle while the software keyboard is up opens our drawer & dismisses the keyboard
+      await act(async () => {
+        handleWhileKeyboardOpen[0].props.onPress();
+      });
+      expect(androidControls().props.visible).toBe(true);
+
+      // Close drawer again before testing backgrounding keyboard cleanup
+      await act(async () => {
+        androidControls().props.onClose();
+      });
 
       // Backgrounding clears stuck keyboard visibility if OS dismisses IME while paused
       await act(async () => {
@@ -3317,5 +3307,222 @@ describe('Session and navigation regressions', () => {
       }
       RN.Platform.OS = prevOS;
     }
+  });
+
+  it('lists all server projects with nested Inbox-style cards, supports Add Project in sidebar, and enforces thread-or-Inbox open behavior', async () => {
+    mockCookieStore.set('https://antigravity.google.com', {
+      SID: { name: 'SID', value: 'full-projects-session', domain: '.google.com' },
+    });
+    // Start authenticated in a thread -> drawer stays closed!
+    await navigate(
+      'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-1',
+      false,
+    );
+    expect(controls().props.visible).toBe(false);
+
+    // Clicking Antigravity's hidden-sidebar Back-to-Home button posts AGY_INBOX_OPEN_DRAWER_REQUEST -> opens our Inbox drawer
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_OPEN_DRAWER_REQUEST',
+            mode: 'inbox',
+          }),
+        },
+      });
+    });
+    expect(controls().props.visible).toBe(true);
+
+    // Deliver snapshot containing BOTH an active project with an approval thread AND an inactive 0-thread server project
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_SNAPSHOT',
+            fetchedAtMs: 1_762_310_000_000,
+            activeUrl:
+              'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-1',
+            activeInstanceUuid: 'workstation-1',
+            activeCascadeId: 'thread-1',
+            instances: [
+              {
+                uuid: 'workstation-1',
+                name: 'Primary Laptop',
+                status: 1,
+                homeDirUri: 'file:///home/marcus',
+                trajectories: {
+                  'thread-1': {
+                    summary: 'Ship Onyx redesign',
+                    status: 3,
+                    waitingSteps: [
+                      {
+                        type: 'CORTEX_STEP_TYPE_RUN_COMMAND',
+                        runCommand: { commandLine: 'npm test' },
+                      },
+                    ],
+                    lastModifiedTime: '2026-11-05T14:00:00Z',
+                    lastUserViewTime: '2026-11-05T13:55:00Z',
+                    trajectoryMetadata: { projectId: 'proj-1' },
+                  },
+                },
+                projects: [
+                  {
+                    id: 'proj-1',
+                    name: 'antigravity-remote',
+                    archived: false,
+                    updatedAt: '2026-11-05T14:00:00Z',
+                    projectResources: {
+                      resources: [
+                        {
+                          gitFolder: {
+                            folderUri:
+                              'file:///home/marcus/projects/antigravity-remote',
+                          },
+                        },
+                      ],
+                    },
+                  },
+                  {
+                    id: 'proj-2',
+                    name: 'dormant-service',
+                    archived: false,
+                    updatedAt: '2026-10-01T08:00:00Z',
+                    projectResources: {
+                      resources: [
+                        {
+                          folderUri:
+                            'file:///home/marcus/projects/dormant-service',
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+            ],
+          }),
+        },
+      });
+    });
+
+    // Switch to Projects tab -> BOTH projects (including 0-thread dormant-service) are listed,
+    // and nested thread card displays Inbox-style NEEDS APPROVAL + OPEN badges!
+    const projectsTab = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((n) => n.props.accessibilityLabel === 'Drawer mode Projects')!;
+    await act(async () => {
+      projectsTab.props.onPress();
+    });
+
+    const projectTexts = tree.root
+      .findAllByType('Text' as any)
+      .map((t) =>
+        Array.isArray(t.props.children)
+          ? t.props.children.join('')
+          : String(t.props.children ?? ''),
+      );
+    expect(projectTexts).toContain('antigravity-remote');
+    expect(projectTexts).toContain('dormant-service');
+    expect(projectTexts).toContain('NEEDS APPROVAL');
+    expect(projectTexts).toContain('OPEN');
+    expect(projectTexts).toContain('Ship Onyx redesign');
+
+    // Open Add Project panel -> requests directory listing -> returns folders -> submits new project
+    mockWebViewInjectJavaScript.mockClear();
+    const addProjectBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((n) => n.props.accessibilityLabel === 'Add new project')!;
+    await act(async () => {
+      addProjectBtn.props.onPress();
+    });
+
+    const listDirCall = mockWebViewInjectJavaScript.mock.calls
+      .map(([script]) => String(script))
+      .find((s) => s.includes('window.__agyInboxBridge.listDirectory('));
+    expect(listDirCall).toBeDefined();
+    const listReqId = listDirCall!.match(/"requestId":"([^"]+)"/)![1];
+
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_LIST_DIR_RESULT',
+            requestId: listReqId,
+            ok: true,
+            currentUri: 'file:///home/marcus/projects',
+            parentUri: 'file:///home/marcus',
+            entries: [
+              {
+                name: 'new-api',
+                uri: 'file:///home/marcus/projects/new-api',
+              },
+            ],
+            error: null,
+          }),
+        },
+      });
+    });
+
+    // Tap folder 'new-api' then confirm Add Project
+    const folderBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((n) => n.props.accessibilityLabel === 'Open folder new-api')!;
+    expect(folderBtn).toBeDefined();
+    await act(async () => {
+      folderBtn.props.onPress();
+    });
+
+    mockWebViewInjectJavaScript.mockClear();
+    const confirmAddBtn = tree.root
+      .findAllByType('TouchableOpacity' as any)
+      .find((n) => n.props.accessibilityLabel === 'Confirm add project')!;
+    await act(async () => {
+      confirmAddBtn.props.onPress();
+    });
+
+    const createProjCall = mockWebViewInjectJavaScript.mock.calls
+      .map(([script]) => String(script))
+      .find((s) => s.includes('window.__agyInboxBridge.createProject('));
+    expect(createProjCall).toBeDefined();
+    expect(createProjCall).toContain('/home/marcus/projects/new-api');
+    const createReqId = createProjCall!.match(/"requestId":"([^"]+)"/)![1];
+
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_CREATE_PROJECT_RESULT',
+            requestId: createReqId,
+            ok: true,
+            projectId: 'proj-new-api',
+            projectName: 'new-api',
+            workspaceUri: 'file:///home/marcus/projects/new-api',
+          }),
+        },
+      });
+    });
+
+    // Panel closes cleanly after creation
+    expect(
+      tree.root.findAll((n) => n.props.testID === 'add-project-panel'),
+    ).toHaveLength(0);
+
+    // Navigating to non-thread route, closing drawer, backgrounding & returning to foreground
+    // automatically reopens the Inbox sidebar (Item 9)
+    await navigate('https://antigravity.google.com/r/workstation-1', false);
+    await act(async () => {
+      controls().props.onClose();
+    });
+    expect(controls().props.visible).toBe(false);
+    await act(async () => {
+      for (const listener of mockAppStateListeners) listener('background');
+    });
+    await act(async () => {
+      for (const listener of mockAppStateListeners) listener('active');
+    });
+    expect(controls().props.visible).toBe(true);
   });
 });

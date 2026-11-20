@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { StyleSheet } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { RemoteWebView } from './src/components/RemoteWebView';
+import { ANTIGRAVITY_THEME } from './src/constants/theme';
 import { parseIncomingAppLink } from './src/utils/urlValidator';
 
 export default function App(): React.JSX.Element {
@@ -68,7 +69,10 @@ export default function App(): React.JSX.Element {
         style={styles.safeArea}
         edges={['top', 'bottom', 'left', 'right']}
       >
-        <StatusBar style="light" backgroundColor="#0B0F17" />
+        <StatusBar
+          style="light"
+          backgroundColor={ANTIGRAVITY_THEME.colors.canvas}
+        />
         <RemoteWebView
           incomingDeepLinkUrl={incomingDeepLinkUrl}
           pendingOpenInbox={pendingOpenInbox}
@@ -84,6 +88,6 @@ export default function App(): React.JSX.Element {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: '#0B0F17',
+    backgroundColor: ANTIGRAVITY_THEME.colors.canvas,
   },
 });

@@ -1,10 +1,12 @@
 import { ANTIGRAVITY_DASHBOARD_URL } from '../constants/config';
 import {
+  DirectoryEntry,
   InboxAttentionKind,
   InboxBridgeMessage,
   InboxInstanceStatus,
   InboxInstanceSummary,
   InboxProjectGroup,
+  InboxServerProject,
   InboxSnapshot,
   InboxThreadItem,
   RawBridgeInstancePayload,
@@ -19,12 +21,39 @@ import { validateNavigationUrl } from './urlValidator';
 
 const MAX_INBOX_BRIDGE_PAYLOAD_LENGTH = 2 * 1024 * 1024;
 const MAX_INSTANCES_PER_SNAPSHOT = 64;
+const MAX_PROJECTS_PER_INSTANCE = 128;
+const MAX_DIR_ENTRIES = 250;
 const MAX_USAGE_GROUPS = 16;
 const MAX_USAGE_BUCKETS_PER_GROUP = 16;
 const MAX_USAGE_MODELS = 48;
 const MAX_USAGE_CREDITS = 12;
 const MAX_TRACKED_TRANSITION_ENTRIES = 500;
 const SAFE_ID_PATTERN = /^[a-zA-Z0-9._-]+$/;
+
+/**
+ * Matches Antigravity thinking/effort-level suffixes on model labels
+ * (e.g. `Gemini 4 Neon (Low)`, `Gemini 4 Neon (Extra)`, `Gemini 3.1 Pro (High Thinking)`).
+ */
+const MODEL_THINKING_LEVEL_PATTERN =
+  /^(.*?)\s*\((?:(?:thinking\s*[-:]?\s*)?(fast|minimal|low|medium|high|extra(?:\s+high)?|xhigh|max)(?:\s+thinking)?|no\s+thinking)\)\s*$/i;
+const MODEL_THINKING_TAG_PATTERN = /^(.*?)\s*\(thinking\)\s*$/i;
+
+function isHiddenCredit(rawIdOrLabelOrType: unknown): boolean {
+  if (typeof rawIdOrLabelOrType !== 'string') return false;
+  const upper = rawIdOrLabelOrType.trim().toUpperCase();
+  return upper.includes('PROMPT') || upper.includes('FLOW');
+}
+
+function normalizeWorkspaceUriKey(uri: string | null | undefined): string | null {
+  if (!uri || typeof uri !== 'string') return null;
+  const trimmed = uri.trim().replace(/\/+$/, '');
+  if (!trimmed) return null;
+  try {
+    return decodeURIComponent(trimmed).toLowerCase();
+  } catch {
+    return trimmed.toLowerCase();
+  }
+}
 
 const ATTENTION_PRIORITY: Record<InboxAttentionKind, number> = {
   approval: 0,
@@ -898,12 +927,23 @@ function parseTrajectoriesForSource(params: {
     );
 
     const isPinned = Boolean(annotations?.pinned || annotations?.starred);
+    const rawProjectId = metadata
+      ? (metadata.projectId ?? metadata.project_id)
+      : (raw.projectId ?? raw.project_id);
+    const projectId =
+      typeof rawProjectId === 'string' &&
+      rawProjectId.trim().length > 0 &&
+      rawProjectId.trim() !== 'outside-of-project' &&
+      SAFE_ID_PATTERN.test(rawProjectId.trim())
+        ? rawProjectId.trim()
+        : null;
 
     items.push({
       id: compositeId,
       cascadeId,
       trajectoryId,
       title,
+      projectId,
       workspaceName: extractWorkspaceName(raw),
       workspaceUri: extractWorkspaceUri(raw),
       instanceUuid,
@@ -1291,6 +1331,7 @@ export function buildUsageSnapshot(
 
   const addCreditEntry = (entry: UsageCreditBalance) => {
     if (credits.length >= MAX_USAGE_CREDITS) return;
+    if (isHiddenCredit(entry.id) || isHiddenCredit(entry.label)) return;
     if (seenCreditKeys.has(entry.id)) return;
     seenCreditKeys.add(entry.id);
     credits.push(entry);
@@ -1314,7 +1355,9 @@ export function buildUsageSnapshot(
           item.minimum_credit_amount_for_usage,
       );
       const rawType = item.creditType ?? item.credit_type ?? `${prefix}-${i}`;
+      if (isHiddenCredit(rawType)) continue;
       const label = humanizeCreditLabel(rawType);
+      if (isHiddenCredit(label)) continue;
       addCreditEntry({
         id: `${label.toLowerCase().replace(/\s+/g, '-')}`,
         label,
@@ -1389,43 +1432,6 @@ export function buildUsageSnapshot(
         label: 'AI Credits',
         available: Math.floor(directG1 * 100) / 100,
       });
-    }
-
-    if (planStatus) {
-      const availPrompt = parseOptionalNumber(
-        planStatus.availablePromptCredits ?? planStatus.available_prompt_credits,
-      );
-      const monthlyPrompt = parseOptionalNumber(
-        planInfo?.monthlyPromptCredits ?? planInfo?.monthly_prompt_credits,
-      );
-      if (availPrompt !== null && availPrompt >= 0) {
-        addCreditEntry({
-          id: 'prompt-credits',
-          label: 'Prompt Credits',
-          available: Math.floor(availPrompt),
-          limit:
-            monthlyPrompt !== null && monthlyPrompt > 0
-              ? Math.floor(monthlyPrompt)
-              : undefined,
-        });
-      }
-      const availFlow = parseOptionalNumber(
-        planStatus.availableFlowCredits ?? planStatus.available_flow_credits,
-      );
-      const monthlyFlow = parseOptionalNumber(
-        planInfo?.monthlyFlowCredits ?? planInfo?.monthly_flow_credits,
-      );
-      if (availFlow !== null && availFlow >= 0) {
-        addCreditEntry({
-          id: 'flow-credits',
-          label: 'Flow Credits',
-          available: Math.floor(availFlow),
-          limit:
-            monthlyFlow !== null && monthlyFlow > 0
-              ? Math.floor(monthlyFlow)
-              : undefined,
-        });
-      }
     }
   }
 
@@ -1559,6 +1565,9 @@ export function buildUsageSnapshot(
     extractModelsFromSource(rawUsage.commandModelConfigs);
   }
 
+  // Combine separate thinking/effort-level entries for the same model into one row.
+  const combinedModels = combineModelThinkingLevels(models);
+
   const error =
     typeof rawUsage.error === 'string' && rawUsage.error.trim()
       ? truncateText(rawUsage.error.trim(), 160)
@@ -1566,7 +1575,7 @@ export function buildUsageSnapshot(
 
   if (
     groups.length === 0 &&
-    models.length === 0 &&
+    combinedModels.length === 0 &&
     !planName &&
     !accountEmail &&
     credits.length === 0 &&
@@ -1586,7 +1595,7 @@ export function buildUsageSnapshot(
       }
     }
   }
-  for (const m of models) {
+  for (const m of combinedModels) {
     if (
       lowestRemainingFraction === null ||
       m.remainingFraction < lowestRemainingFraction
@@ -1603,10 +1612,96 @@ export function buildUsageSnapshot(
     accountEmail,
     credits,
     groups,
-    models,
+    models: combinedModels,
     lowestRemainingFraction,
     error,
   };
+}
+
+/**
+ * Combines separate thinking/effort-level entries for the same base model
+ * (e.g. `Gemini 4 Neon (Low)`, `(Medium)`, `(High)`, `(Extra)`) into a single
+ * consolidated quota row while preserving Antigravity's model order.
+ */
+export function combineModelThinkingLevels(
+  rawModels: readonly UsageModelQuota[],
+): UsageModelQuota[] {
+  if (rawModels.length <= 1) {
+    return [...rawModels];
+  }
+
+  const exactLowerLabels = new Set(
+    rawModels.map((m) => m.label.trim().toLowerCase()),
+  );
+
+  const getThinkingBase = (
+    label: string,
+  ): { base: string; stripped: boolean } => {
+    const levelMatch = MODEL_THINKING_LEVEL_PATTERN.exec(label);
+    if (levelMatch && levelMatch[1].trim()) {
+      return { base: levelMatch[1].trim(), stripped: true };
+    }
+    const thinkingTagMatch = MODEL_THINKING_TAG_PATTERN.exec(label);
+    if (
+      thinkingTagMatch &&
+      thinkingTagMatch[1].trim() &&
+      exactLowerLabels.has(thinkingTagMatch[1].trim().toLowerCase())
+    ) {
+      return { base: thinkingTagMatch[1].trim(), stripped: true };
+    }
+    return { base: label.trim(), stripped: false };
+  };
+
+  const groupCounts = new Map<string, number>();
+  const parsed = rawModels.map((model) => {
+    const info = getThinkingBase(model.label);
+    const key = info.base.toLowerCase();
+    groupCounts.set(key, (groupCounts.get(key) ?? 0) + 1);
+    return { model, base: info.base, key, stripped: info.stripped };
+  });
+
+  const mergedByKey = new Map<string, UsageModelQuota>();
+  const result: UsageModelQuota[] = [];
+
+  for (const entry of parsed) {
+    const count = groupCounts.get(entry.key) ?? 1;
+    if (count < 2) {
+      result.push(entry.model);
+      continue;
+    }
+
+    const existing = mergedByKey.get(entry.key);
+    if (!existing) {
+      const consolidated: UsageModelQuota = {
+        ...entry.model,
+        label: entry.base,
+      };
+      mergedByKey.set(entry.key, consolidated);
+      result.push(consolidated);
+      continue;
+    }
+
+    const nextFraction = Math.min(
+      existing.remainingFraction,
+      entry.model.remainingFraction,
+    );
+    const nextResetMs =
+      existing.resetTimeMs > 0 && entry.model.resetTimeMs > 0
+        ? Math.min(existing.resetTimeMs, entry.model.resetTimeMs)
+        : existing.resetTimeMs || entry.model.resetTimeMs;
+
+    existing.remainingFraction = nextFraction;
+    existing.remainingPercent = fractionToPercent(nextFraction);
+    existing.resetTimeMs = nextResetMs;
+    existing.isExhausted = nextFraction <= 0;
+    existing.isDefault = existing.isDefault || entry.model.isDefault;
+    existing.isRecommended =
+      existing.isRecommended || entry.model.isRecommended;
+    existing.supportsImages =
+      existing.supportsImages || entry.model.supportsImages;
+  }
+
+  return result;
 }
 
 /**
@@ -1644,6 +1739,172 @@ export function resolveActiveRouteFromBridgeMessage(
   return { instanceUuid, cascadeId };
 }
 
+function extractProjectWorkspaceUris(rawProject: Record<string, unknown>): string[] {
+  const uris: string[] = [];
+  const seen = new Set<string>();
+  const addUri = (candidate: unknown) => {
+    if (typeof candidate !== 'string' || !candidate.trim()) return;
+    const cleaned = candidate.trim().replace(/\/+$/, '').slice(0, 512);
+    const key = normalizeWorkspaceUriKey(cleaned);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    uris.push(cleaned);
+  };
+
+  const projectResources = isRecord(rawProject.projectResources)
+    ? rawProject.projectResources
+    : isRecord(rawProject.project_resources)
+      ? rawProject.project_resources
+      : null;
+  const rawResList = Array.isArray(projectResources?.resources)
+    ? projectResources.resources
+    : Array.isArray(rawProject.resources)
+      ? rawProject.resources
+      : [];
+
+  for (const res of rawResList) {
+    if (!isRecord(res)) continue;
+    addUri(res.folderUri ?? res.folder_uri);
+    const gitFolder = isRecord(res.gitFolder)
+      ? res.gitFolder
+      : isRecord(res.git_folder)
+        ? res.git_folder
+        : null;
+    if (gitFolder) {
+      addUri(gitFolder.folderUri ?? gitFolder.folder_uri);
+    }
+    addUri(res.workspaceUri ?? res.workspace_uri);
+  }
+
+  addUri(rawProject.workspaceUri ?? rawProject.workspace_uri);
+  addUri(rawProject.folderUri ?? rawProject.folder_uri);
+  return uris;
+}
+
+function extractProjectConversationIds(rawProject: Record<string, unknown>): string[] {
+  const container = isRecord(rawProject.projectConversations)
+    ? rawProject.projectConversations
+    : isRecord(rawProject.project_conversations)
+      ? rawProject.project_conversations
+      : null;
+  const rawList = Array.isArray(container?.conversations)
+    ? container.conversations
+    : Array.isArray(rawProject.conversations)
+      ? rawProject.conversations
+      : [];
+
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of rawList) {
+    const rawId =
+      typeof entry === 'string'
+        ? entry
+        : isRecord(entry)
+          ? (entry.conversationId ?? entry.conversation_id ?? entry.cascadeId ?? entry.cascade_id)
+          : null;
+    if (typeof rawId === 'string' && SAFE_ID_PATTERN.test(rawId) && !seen.has(rawId)) {
+      seen.add(rawId);
+      ids.push(rawId);
+    }
+  }
+  return ids;
+}
+
+function parseServerProjectsForInstance(params: {
+  instanceUuid: string;
+  instanceName: string;
+  rawProjects: readonly Record<string, unknown>[] | null | undefined;
+  rawWorkspaceInfos: readonly Record<string, unknown>[] | null | undefined;
+}): InboxServerProject[] {
+  const { instanceUuid, instanceName, rawProjects, rawWorkspaceInfos } = params;
+  const parsed: InboxServerProject[] = [];
+  const seenProjectIds = new Set<string>();
+  const coveredWorkspaceUriKeys = new Set<string>();
+
+  if (Array.isArray(rawProjects)) {
+    for (const rawProj of rawProjects.slice(0, MAX_PROJECTS_PER_INSTANCE)) {
+      if (!isRecord(rawProj)) continue;
+      const rawId = rawProj.id ?? rawProj.projectId ?? rawProj.project_id;
+      const projectId =
+        typeof rawId === 'string' && rawId.trim() && SAFE_ID_PATTERN.test(rawId.trim())
+          ? rawId.trim()
+          : null;
+      if (!projectId || seenProjectIds.has(projectId)) continue;
+      if (projectId === 'outside-of-project') continue;
+      seenProjectIds.add(projectId);
+
+      const archived = Boolean(rawProj.archived);
+      const workspaceUris = extractProjectWorkspaceUris(rawProj);
+      for (const uri of workspaceUris) {
+        const key = normalizeWorkspaceUriKey(uri);
+        if (key) coveredWorkspaceUriKeys.add(key);
+      }
+
+      const rawName = rawProj.name ?? rawProj.title ?? rawProj.displayName ?? rawProj.display_name;
+      const fallbackName =
+        extractLastSegmentFromUri(workspaceUris[0]) ??
+        `Project ${projectId.slice(0, 8)}`;
+      const name =
+        typeof rawName === 'string' && rawName.trim()
+          ? truncateText(rawName.trim(), 72)
+          : truncateText(fallbackName, 72);
+
+      const updatedAtMs = parseProtoTimestampMs(
+        rawProj.updatedAt ?? rawProj.updated_at ?? rawProj.updateTimeMicros,
+      );
+
+      parsed.push({
+        id: `${instanceUuid}:project:${projectId}`,
+        projectId,
+        name,
+        workspaceUri: workspaceUris[0] ?? null,
+        workspaceUris,
+        instanceUuid,
+        instanceName,
+        updatedAtMs,
+        archived,
+        conversationIds: extractProjectConversationIds(rawProj),
+      });
+    }
+  }
+
+  if (Array.isArray(rawWorkspaceInfos)) {
+    for (const rawWs of rawWorkspaceInfos.slice(0, MAX_PROJECTS_PER_INSTANCE)) {
+      if (!isRecord(rawWs)) continue;
+      const rawUri =
+        rawWs.workspaceUri ??
+        rawWs.workspace_uri ??
+        rawWs.workspaceFolderAbsoluteUri ??
+        rawWs.workspace_folder_absolute_uri ??
+        rawWs.gitRootUri ??
+        rawWs.git_root_uri;
+      if (typeof rawUri !== 'string' || !rawUri.trim()) continue;
+      const cleanedUri = rawUri.trim().replace(/\/+$/, '').slice(0, 512);
+      const uriKey = normalizeWorkspaceUriKey(cleanedUri);
+      if (!uriKey || coveredWorkspaceUriKeys.has(uriKey)) continue;
+      coveredWorkspaceUriKeys.add(uriKey);
+
+      const folderName = extractLastSegmentFromUri(cleanedUri);
+      if (!folderName) continue;
+
+      parsed.push({
+        id: `${instanceUuid}:ws:${uriKey}`,
+        projectId: null,
+        name: truncateText(folderName, 72),
+        workspaceUri: cleanedUri,
+        workspaceUris: [cleanedUri],
+        instanceUuid,
+        instanceName,
+        updatedAtMs: 0,
+        archived: false,
+        conversationIds: [],
+      });
+    }
+  }
+
+  return parsed;
+}
+
 /**
  * Builds a sorted, deduplicated `InboxSnapshot` from a raw WebView bridge snapshot.
  */
@@ -1664,6 +1925,7 @@ export function buildInboxSnapshot(
 
   const instances: InboxInstanceSummary[] = [];
   const allThreads: InboxThreadItem[] = [];
+  const allProjects: InboxServerProject[] = [];
   const seenInstanceUuids = new Set<string>();
 
   for (const rawInst of message.instances.slice(0, MAX_INSTANCES_PER_SNAPSHOT)) {
@@ -1681,6 +1943,10 @@ export function buildInboxSnapshot(
         ? truncateText(rawInst.name, 64)
         : uuid;
     const status = normalizeInstanceStatus(rawInst.status);
+    const homeDirUri =
+      typeof rawInst.homeDirUri === 'string' && rawInst.homeDirUri.trim()
+        ? rawInst.homeDirUri.trim().replace(/\/+$/, '').slice(0, 512)
+        : undefined;
 
     instances.push({
       uuid,
@@ -1695,7 +1961,22 @@ export function buildInboxSnapshot(
         Number.isFinite(rawInst.updatedAtMs)
           ? rawInst.updatedAtMs
           : undefined,
+      homeDirUri,
     });
+
+    if (
+      (Array.isArray(rawInst.projects) && rawInst.projects.length > 0) ||
+      (Array.isArray(rawInst.workspaceInfos) && rawInst.workspaceInfos.length > 0)
+    ) {
+      allProjects.push(
+        ...parseServerProjectsForInstance({
+          instanceUuid: uuid,
+          instanceName: name,
+          rawProjects: rawInst.projects,
+          rawWorkspaceInfos: rawInst.workspaceInfos,
+        }),
+      );
+    }
 
     if (rawInst.trajectories && isRecord(rawInst.trajectories)) {
       allThreads.push(
@@ -1761,6 +2042,7 @@ export function buildInboxSnapshot(
   return {
     instances,
     threads: allThreads,
+    projects: allProjects,
     fetchedAtMs: resolvedFetchedAtMs,
     activeInstanceUuid,
     activeCascadeId,
@@ -1995,8 +2277,12 @@ export function applyLocalStateToSnapshot(
 }
 
 /**
- * Groups snapshot threads and connected workstations into collapsible project
- * groups for the drawer's `Projects` navigation tab.
+ * Groups all server projects, snapshot threads, and connected workstations into
+ * collapsible project groups for the drawer's `Projects` navigation tab.
+ *
+ * Always includes every non-archived project reported by connected servers
+ * (`ListProjects`/`ReadProjects` & `GetWorkspaceInfos`), even when a project
+ * currently has zero threads or no recent activity.
  */
 export function buildProjectGroups(
   snapshot: InboxSnapshot,
@@ -2033,43 +2319,151 @@ export function buildProjectGroups(
   };
 
   const groupsByKey = new Map<string, InboxProjectGroup>();
-  const instancesWithThreads = new Set<string>();
+  const groupByProjectId = new Map<string, InboxProjectGroup>();
+  const groupByConversationId = new Map<string, InboxProjectGroup>();
+  const groupByWorkspaceUri = new Map<string, InboxProjectGroup>();
+  const groupsByWorkspaceName = new Map<string, InboxProjectGroup[]>();
+  const instancesWithProjectsOrThreads = new Set<string>();
 
+  const indexProjectName = (
+    instanceUuid: string,
+    rawName: string | null | undefined,
+    group: InboxProjectGroup,
+  ) => {
+    if (!rawName || !rawName.trim()) return;
+    const key = `${instanceUuid}:${rawName.trim().toLowerCase()}`;
+    const list = groupsByWorkspaceName.get(key) ?? [];
+    if (!list.includes(group)) {
+      list.push(group);
+      groupsByWorkspaceName.set(key, list);
+    }
+  };
+
+  // 1. Seed all non-archived server projects FIRST so projects with zero recent
+  //    activity are always listed in the Projects tab.
+  const serverProjects = snapshot.projects ?? [];
+  for (const proj of serverProjects) {
+    if (proj.archived) {
+      continue;
+    }
+    instancesWithProjectsOrThreads.add(proj.instanceUuid);
+    const workspaceName =
+      extractLastSegmentFromUri(proj.workspaceUri) ?? proj.name;
+    const group: InboxProjectGroup = {
+      id: proj.id,
+      projectId: proj.projectId,
+      name: proj.name,
+      workspaceName,
+      workspaceUri: proj.workspaceUri,
+      instanceUuid: proj.instanceUuid,
+      instanceName: proj.instanceName,
+      source: 'remote-control',
+      threads: [],
+      latestModifiedAtMs: proj.updatedAtMs,
+      attentionCount: 0,
+      urgentCount: 0,
+      runningCount: 0,
+      hasActiveThread: false,
+      newChatUrl: buildOverviewUrl('remote-control', proj.instanceUuid),
+    };
+    groupsByKey.set(group.id, group);
+    if (proj.projectId) {
+      groupByProjectId.set(`${proj.instanceUuid}:${proj.projectId}`, group);
+    }
+    for (const cid of proj.conversationIds) {
+      groupByConversationId.set(`${proj.instanceUuid}:${cid}`, group);
+    }
+    for (const uri of proj.workspaceUris) {
+      const uriKey = normalizeWorkspaceUriKey(uri);
+      if (uriKey) {
+        groupByWorkspaceUri.set(`${proj.instanceUuid}:${uriKey}`, group);
+      }
+      indexProjectName(proj.instanceUuid, extractLastSegmentFromUri(uri), group);
+    }
+    indexProjectName(proj.instanceUuid, proj.name, group);
+  }
+
+  // 2. Attach all snapshot threads to their matching server project (or create a
+  //    workspace-derived group for standalone / legacy / cloud threads).
   for (const thread of snapshot.threads) {
-    instancesWithThreads.add(thread.instanceUuid);
-    const workspaceKey = (
-      thread.workspaceName ??
-      thread.workspaceUri ??
-      '__default__'
-    )
-      .trim()
-      .toLowerCase();
-    const groupKey = `${thread.instanceUuid}:${workspaceKey}`;
+    instancesWithProjectsOrThreads.add(thread.instanceUuid);
 
-    let group = groupsByKey.get(groupKey);
+    let group: InboxProjectGroup | undefined;
+    if (thread.projectId) {
+      group = groupByProjectId.get(`${thread.instanceUuid}:${thread.projectId}`);
+    }
     if (!group) {
-      const displayName =
+      group =
+        groupByConversationId.get(`${thread.instanceUuid}:${thread.cascadeId}`) ??
+        groupByConversationId.get(
+          `${thread.instanceUuid}:${thread.trajectoryId}`,
+        );
+    }
+    if (!group && thread.workspaceUri) {
+      const uriKey = normalizeWorkspaceUriKey(thread.workspaceUri);
+      if (uriKey) {
+        group = groupByWorkspaceUri.get(`${thread.instanceUuid}:${uriKey}`);
+      }
+    }
+    if (!group && thread.workspaceName) {
+      const nameCandidates = groupsByWorkspaceName.get(
+        `${thread.instanceUuid}:${thread.workspaceName.trim().toLowerCase()}`,
+      );
+      if (nameCandidates && nameCandidates.length === 1) {
+        group = nameCandidates[0];
+      }
+    }
+
+    if (!group) {
+      const workspaceKey = (
+        thread.projectId ??
         thread.workspaceName ??
-        (thread.source === 'cloud' ? 'Cloud Agent' : thread.instanceName);
-      group = {
-        id: groupKey,
-        name: displayName,
-        workspaceName: thread.workspaceName,
-        workspaceUri: thread.workspaceUri ?? null,
-        instanceUuid: thread.instanceUuid,
-        instanceName: thread.instanceName,
-        source: thread.source,
-        threads: [],
-        latestModifiedAtMs: 0,
-        attentionCount: 0,
-        urgentCount: 0,
-        runningCount: 0,
-        hasActiveThread: false,
-        newChatUrl: buildOverviewUrl(thread.source, thread.instanceUuid),
-      };
-      groupsByKey.set(groupKey, group);
-    } else if (!group.workspaceUri && thread.workspaceUri) {
+        thread.workspaceUri ??
+        '__default__'
+      )
+        .trim()
+        .toLowerCase();
+      const groupKey = `${thread.instanceUuid}:${workspaceKey}`;
+
+      group = groupsByKey.get(groupKey);
+      if (!group) {
+        const displayName =
+          thread.workspaceName ??
+          (thread.source === 'cloud' ? 'Cloud Agent' : thread.instanceName);
+        group = {
+          id: groupKey,
+          projectId: thread.projectId ?? null,
+          name: displayName,
+          workspaceName: thread.workspaceName,
+          workspaceUri: thread.workspaceUri ?? null,
+          instanceUuid: thread.instanceUuid,
+          instanceName: thread.instanceName,
+          source: thread.source,
+          threads: [],
+          latestModifiedAtMs: 0,
+          attentionCount: 0,
+          urgentCount: 0,
+          runningCount: 0,
+          hasActiveThread: false,
+          newChatUrl: buildOverviewUrl(thread.source, thread.instanceUuid),
+        };
+        groupsByKey.set(groupKey, group);
+        if (thread.projectId) {
+          groupByProjectId.set(`${thread.instanceUuid}:${thread.projectId}`, group);
+        }
+        const uriKey = normalizeWorkspaceUriKey(thread.workspaceUri);
+        if (uriKey) {
+          groupByWorkspaceUri.set(`${thread.instanceUuid}:${uriKey}`, group);
+        }
+        indexProjectName(thread.instanceUuid, thread.workspaceName, group);
+      }
+    }
+
+    if (!group.workspaceUri && thread.workspaceUri) {
       group.workspaceUri = thread.workspaceUri;
+    }
+    if (!group.projectId && thread.projectId) {
+      group.projectId = thread.projectId;
     }
 
     group.threads.push(thread);
@@ -2093,8 +2487,10 @@ export function buildProjectGroups(
     }
   }
 
+  // 3. Fallback workstation entry only when a connected workstation reported no
+  //    server projects AND no threads.
   for (const inst of snapshot.instances) {
-    if (instancesWithThreads.has(inst.uuid)) {
+    if (instancesWithProjectsOrThreads.has(inst.uuid)) {
       continue;
     }
     if (
@@ -2106,6 +2502,7 @@ export function buildProjectGroups(
     const groupKey = `${inst.uuid}:__default__`;
     groupsByKey.set(groupKey, {
       id: groupKey,
+      projectId: null,
       name: inst.name,
       workspaceName: null,
       workspaceUri: null,
@@ -2210,6 +2607,16 @@ export function parseInboxBridgeMessage(
       const instances: RawBridgeInstancePayload[] = [];
       for (const item of rawInstances.slice(0, MAX_INSTANCES_PER_SNAPSHOT)) {
         if (!isRecord(item) || typeof item.uuid !== 'string') continue;
+        const projects = Array.isArray(item.projects)
+          ? item.projects
+              .slice(0, MAX_PROJECTS_PER_INSTANCE)
+              .filter((p): p is Record<string, unknown> => isRecord(p))
+          : null;
+        const workspaceInfos = Array.isArray(item.workspaceInfos)
+          ? item.workspaceInfos
+              .slice(0, MAX_PROJECTS_PER_INSTANCE)
+              .filter((w): w is Record<string, unknown> => isRecord(w))
+          : null;
         instances.push({
           uuid: item.uuid,
           name: typeof item.name === 'string' ? item.name : undefined,
@@ -2220,7 +2627,11 @@ export function parseInboxBridgeMessage(
           version: typeof item.version === 'string' ? item.version : undefined,
           updatedAtMs:
             typeof item.updatedAtMs === 'number' ? item.updatedAtMs : undefined,
+          homeDirUri:
+            typeof item.homeDirUri === 'string' ? item.homeDirUri : null,
           trajectories: isRecord(item.trajectories) ? item.trajectories : null,
+          projects,
+          workspaceInfos,
           error: typeof item.error === 'string' ? item.error : undefined,
         });
       }
@@ -2362,6 +2773,96 @@ export function parseInboxBridgeMessage(
         type: 'AGY_INBOX_HOST_SETTINGS_RESULT',
         handled: parsed.handled,
       };
+
+    case 'AGY_INBOX_LIST_DIR_RESULT': {
+      if (
+        typeof parsed.requestId !== 'string' ||
+        typeof parsed.ok !== 'boolean'
+      ) {
+        return null;
+      }
+      const rawEntries = Array.isArray(parsed.entries) ? parsed.entries : [];
+      const entries: DirectoryEntry[] = [];
+      for (const entry of rawEntries.slice(0, MAX_DIR_ENTRIES)) {
+        if (
+          !isRecord(entry) ||
+          typeof entry.name !== 'string' ||
+          typeof entry.uri !== 'string'
+        ) {
+          continue;
+        }
+        const name = entry.name.trim();
+        const uri = entry.uri.trim();
+        if (name && uri) {
+          entries.push({
+            name: truncateText(name, 120),
+            uri: uri.slice(0, 512),
+          });
+        }
+      }
+      return {
+        type: 'AGY_INBOX_LIST_DIR_RESULT',
+        requestId: parsed.requestId,
+        ok: parsed.ok,
+        currentUri:
+          typeof parsed.currentUri === 'string'
+            ? parsed.currentUri.trim().slice(0, 512)
+            : '',
+        parentUri:
+          typeof parsed.parentUri === 'string' && parsed.parentUri.trim()
+            ? parsed.parentUri.trim().slice(0, 512)
+            : null,
+        entries,
+        error:
+          typeof parsed.error === 'string' && parsed.error.trim()
+            ? truncateText(parsed.error, 200)
+            : null,
+      };
+    }
+
+    case 'AGY_INBOX_CREATE_PROJECT_RESULT': {
+      if (
+        typeof parsed.requestId !== 'string' ||
+        typeof parsed.ok !== 'boolean'
+      ) {
+        return null;
+      }
+      return {
+        type: 'AGY_INBOX_CREATE_PROJECT_RESULT',
+        requestId: parsed.requestId,
+        ok: parsed.ok,
+        projectId:
+          typeof parsed.projectId === 'string' &&
+          SAFE_ID_PATTERN.test(parsed.projectId)
+            ? parsed.projectId
+            : null,
+        projectName:
+          typeof parsed.projectName === 'string' && parsed.projectName.trim()
+            ? truncateText(parsed.projectName, 80)
+            : null,
+        workspaceUri:
+          typeof parsed.workspaceUri === 'string' && parsed.workspaceUri.trim()
+            ? parsed.workspaceUri.trim().slice(0, 512)
+            : null,
+        error:
+          typeof parsed.error === 'string' && parsed.error.trim()
+            ? truncateText(parsed.error, 200)
+            : null,
+      };
+    }
+
+    case 'AGY_INBOX_OPEN_DRAWER_REQUEST': {
+      const mode =
+        parsed.mode === 'projects'
+          ? 'projects'
+          : parsed.mode === 'inbox'
+            ? 'inbox'
+            : undefined;
+      return {
+        type: 'AGY_INBOX_OPEN_DRAWER_REQUEST',
+        mode,
+      };
+    }
 
     default:
       return null;

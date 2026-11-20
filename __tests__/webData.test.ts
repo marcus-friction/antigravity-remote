@@ -56,6 +56,47 @@ it('forwards live action notifications and permission requests safely', async ()
     1,
     'antigravity-remote://r/workstation-1?p=c%2Fthread-1',
     true,
+    '[]',
+  );
+
+  mockSyncActionNotification.mockClear();
+  await syncNativeActionNotification({
+    title: '2 actions open',
+    body: 'Deploy service (+1 more) • Tap to open Inbox',
+    expandedBody: '🟠 NEEDS APPROVAL · workstation-1\nDeploy service — Waiting for approval',
+    count: 2,
+    deepLinkUrl: 'antigravity-remote://inbox',
+    shouldAlert: true,
+    items: [
+      {
+        id: 'workstation-1:thread-1',
+        title: 'Deploy service',
+        attentionKind: 'approval',
+        statusLabel: 'NEEDS APPROVAL',
+        attentionReason: 'Waiting for approval',
+        subtitle: 'workstation-1 • api',
+        deepLinkUrl: 'antigravity-remote://r/workstation-1?p=c%2Fthread-1',
+      },
+    ],
+  });
+  expect(mockSyncActionNotification).toHaveBeenCalledWith(
+    '2 actions open',
+    'Deploy service (+1 more) • Tap to open Inbox',
+    '🟠 NEEDS APPROVAL · workstation-1\nDeploy service — Waiting for approval',
+    2,
+    'antigravity-remote://inbox',
+    true,
+    JSON.stringify([
+      {
+        id: 'workstation-1:thread-1',
+        title: 'Deploy service',
+        attentionKind: 'approval',
+        statusLabel: 'NEEDS APPROVAL',
+        attentionReason: 'Waiting for approval',
+        subtitle: 'workstation-1 • api',
+        deepLinkUrl: 'antigravity-remote://r/workstation-1?p=c%2Fthread-1',
+      },
+    ]),
   );
 
   await clearNativeActionNotification();

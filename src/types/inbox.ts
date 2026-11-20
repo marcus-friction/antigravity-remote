@@ -19,6 +19,23 @@ export interface InboxInstanceSummary {
   status: InboxInstanceStatus;
   version?: string;
   updatedAtMs?: number;
+  homeDirUri?: string;
+}
+
+export interface InboxServerProject {
+  /** Stable composite key (`<instanceUuid>:<projectId-or-workspaceKey>`). */
+  id: string;
+  /** Antigravity server Project UUID when returned by `ListProjects`/`ReadProjects`. */
+  projectId: string | null;
+  name: string;
+  workspaceUri: string | null;
+  workspaceUris: string[];
+  instanceUuid: string;
+  instanceName: string;
+  updatedAtMs: number;
+  archived: boolean;
+  /** Conversation IDs explicitly associated with this project on the server. */
+  conversationIds: string[];
 }
 
 export interface InboxThreadItem {
@@ -27,6 +44,7 @@ export interface InboxThreadItem {
   cascadeId: string;
   trajectoryId: string;
   title: string;
+  projectId?: string | null;
   workspaceName: string | null;
   workspaceUri?: string | null;
   instanceUuid: string;
@@ -49,9 +67,11 @@ export interface InboxThreadItem {
 }
 
 export interface InboxProjectGroup {
-  /** Stable composite key (`<instanceUuid>:<workspaceKey>`). */
+  /** Stable composite key (`<instanceUuid>:<projectId-or-workspaceKey>`). */
   id: string;
-  /** Primary display name (workspace folder/repo name, or workstation name when workspace is unscoped). */
+  /** Server-side Antigravity Project UUID when known (`ListProjects`/`ReadProjects` or trajectory metadata). */
+  projectId: string | null;
+  /** Primary display name (project name, workspace folder/repo name, or workstation name when unscoped). */
   name: string;
   workspaceName: string | null;
   workspaceUri: string | null;
@@ -66,6 +86,34 @@ export interface InboxProjectGroup {
   hasActiveThread: boolean;
   /** Verified in-app URL to open the workstation overview / new chat for this project. */
   newChatUrl: string;
+}
+
+export interface DirectoryEntry {
+  name: string;
+  uri: string;
+}
+
+export interface DirectoryListingResult {
+  ok: boolean;
+  currentUri: string;
+  parentUri: string | null;
+  entries: DirectoryEntry[];
+  error?: string | null;
+}
+
+export interface CreateProjectRequestParams {
+  instanceUuid: string;
+  mode: 'existing' | 'scratch';
+  name: string;
+  folderPathOrUri?: string | null;
+}
+
+export interface CreateProjectResult {
+  ok: boolean;
+  projectId?: string | null;
+  projectName?: string | null;
+  workspaceUri?: string | null;
+  error?: string | null;
 }
 
 export interface UsageQuotaBucket {
@@ -131,6 +179,8 @@ export interface RawBridgeUsagePayload {
 export interface InboxSnapshot {
   instances: InboxInstanceSummary[];
   threads: InboxThreadItem[];
+  /** All projects/workspaces discovered from connected servers (including projects with no recent threads). */
+  projects?: InboxServerProject[];
   fetchedAtMs: number;
   activeInstanceUuid: string | null;
   activeCascadeId: string | null;
@@ -144,7 +194,10 @@ export interface RawBridgeInstancePayload {
   status?: number | string;
   version?: string;
   updatedAtMs?: number;
+  homeDirUri?: string | null;
   trajectories?: Record<string, unknown> | null;
+  projects?: Record<string, unknown>[] | null;
+  workspaceInfos?: Record<string, unknown>[] | null;
   error?: string;
 }
 
@@ -189,4 +242,26 @@ export type InboxBridgeMessage =
   | {
       type: 'AGY_INBOX_HOST_SETTINGS_RESULT';
       handled: boolean;
+    }
+  | {
+      type: 'AGY_INBOX_LIST_DIR_RESULT';
+      requestId: string;
+      ok: boolean;
+      currentUri: string;
+      parentUri: string | null;
+      entries: DirectoryEntry[];
+      error?: string | null;
+    }
+  | {
+      type: 'AGY_INBOX_CREATE_PROJECT_RESULT';
+      requestId: string;
+      ok: boolean;
+      projectId?: string | null;
+      projectName?: string | null;
+      workspaceUri?: string | null;
+      error?: string | null;
+    }
+  | {
+      type: 'AGY_INBOX_OPEN_DRAWER_REQUEST';
+      mode?: 'inbox' | 'projects';
     };

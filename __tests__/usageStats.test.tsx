@@ -285,18 +285,13 @@ describe('Usage Stats Parser & Workstation Bridge', () => {
     expect(usage!.accountEmail).toBe('dev@example.com');
     expect(usage!.lowestRemainingFraction).toBe(0);
 
+    // Prompt Credits and Flow Credits are intentionally hidden; AI Credits remain visible
     expect(usage!.credits).toEqual([
       {
         id: 'ai-credits',
         label: 'AI Credits',
         available: 25000,
         minimumForUsage: 5,
-      },
-      {
-        id: 'prompt-credits',
-        label: 'Prompt Credits',
-        available: 1500,
-        limit: 5000,
       },
     ]);
 
@@ -343,6 +338,117 @@ describe('Usage Stats Parser & Workstation Bridge', () => {
     expect(formatResetCountdown(nowMs + 30_000, nowMs)).toBe('Resets in <1m');
     expect(formatResetCountdown(nowMs - 5_000, nowMs)).toBe('Resetting soon');
     expect(formatResetCountdown(0, nowMs)).toBe('');
+  });
+
+  it('combines thinking-level variants per model and hides Prompt & Flow credits', () => {
+    const nowMs = Date.parse('2026-11-05T12:00:00Z');
+    const resetIso = '2026-11-05T16:00:00Z';
+    const usage = buildUsageSnapshot(
+      {
+        instanceUuid: 'box-think',
+        instanceName: 'Linux Box',
+        fetchedAtMs: nowMs,
+        userStatus: {
+          userStatus: {
+            planStatus: {
+              availablePromptCredits: 1200,
+              availableFlowCredits: 800,
+              planInfo: {
+                planName: 'Pro',
+                monthlyPromptCredits: 5000,
+                monthlyFlowCredits: 2000,
+              },
+            },
+            availableCredits: [
+              {
+                creditType: 'GOOGLE_ONE_AI',
+                creditAmount: '9000',
+              },
+              {
+                creditType: 'PROMPT_CREDITS',
+                creditAmount: '1200',
+              },
+              {
+                creditType: 'FLOW_CREDITS',
+                creditAmount: '800',
+              },
+            ],
+            cascadeModelConfigData: {
+              clientModelConfigs: [
+                {
+                  label: 'Gemini 3.1 Pro (Low)',
+                  modelOrAlias: { model: 'MODEL_G31_PRO_LOW' },
+                  quotaInfo: { remainingFraction: 0.8, resetTime: resetIso },
+                },
+                {
+                  label: 'Gemini 3.1 Pro (High)',
+                  modelOrAlias: { model: 'MODEL_G31_PRO_HIGH' },
+                  isRecommended: true,
+                  supportsImages: true,
+                  quotaInfo: { remainingFraction: 0.8, resetTime: resetIso },
+                },
+                {
+                  label: 'Gemini 4 Neon (Low)',
+                  modelOrAlias: { model: 'MODEL_G4_LOW' },
+                  quotaInfo: { remainingFraction: 0.65, resetTime: resetIso },
+                },
+                {
+                  label: 'Gemini 4 Neon (Medium)',
+                  modelOrAlias: { model: 'MODEL_G4_MED' },
+                  quotaInfo: { remainingFraction: 0.65, resetTime: resetIso },
+                },
+                {
+                  label: 'Gemini 4 Neon (High)',
+                  modelOrAlias: { model: 'MODEL_G4_HIGH' },
+                  quotaInfo: { remainingFraction: 0.65, resetTime: resetIso },
+                },
+                {
+                  label: 'Gemini 4 Neon (Extra)',
+                  modelOrAlias: { model: 'MODEL_G4_EXTRA' },
+                  quotaInfo: { remainingFraction: 0.65, resetTime: resetIso },
+                },
+                {
+                  label: 'Claude Opus 4.6 (Thinking)',
+                  modelOrAlias: { model: 'MODEL_CLAUDE_OPUS' },
+                  quotaInfo: { remainingFraction: 0.4, resetTime: resetIso },
+                },
+                {
+                  label: 'GPT-OSS 120B (Medium)',
+                  modelOrAlias: { model: 'MODEL_GPT_OSS' },
+                  quotaInfo: { remainingFraction: 1, resetTime: resetIso },
+                },
+              ],
+            },
+          },
+        },
+      },
+      nowMs,
+    );
+
+    expect(usage).not.toBeNull();
+    expect(usage!.credits).toEqual([
+      {
+        id: 'ai-credits',
+        label: 'AI Credits',
+        available: 9000,
+      },
+    ]);
+    expect(usage!.models.map((m) => m.label)).toEqual([
+      'Gemini 3.1 Pro',
+      'Gemini 4 Neon',
+      'Claude Opus 4.6 (Thinking)',
+      'GPT-OSS 120B (Medium)',
+    ]);
+    expect(usage!.models[0]).toMatchObject({
+      label: 'Gemini 3.1 Pro',
+      remainingPercent: 80,
+      isRecommended: true,
+      supportsImages: true,
+    });
+    expect(usage!.models[1]).toMatchObject({
+      label: 'Gemini 4 Neon',
+      remainingPercent: 65,
+    });
   });
 
   it('falls back to GetCommandModelConfigs when GetUserStatus omits model configs and wires into buildInboxSnapshot', () => {
@@ -945,15 +1051,8 @@ describe('LeftNavigationDrawer Usage Tab & RemoteWebView E2E', () => {
       });
     });
 
-    // Open drawer and switch to Usage before any workstation reports -> empty state shortcut works
-    const openHandle = tree.root.findAll(
-      (n) =>
-        n.type === ('TouchableOpacity' as any) &&
-        n.props.accessibilityLabel === 'Open Antigravity drawer',
-    )[0];
-    await act(async () => {
-      openHandle.props.onPress();
-    });
+    // Cold-booting authenticated onto non-thread route `/r/workstation-z` auto-opens the Inbox drawer!
+    expect(tree.root.findByType(LeftNavigationDrawer).props.visible).toBe(true);
 
     const usageTab = tree.root.findAll(
       (n) =>

@@ -28,10 +28,13 @@ import {
   DEFAULT_ACTION_NOTIFICATION_MODE,
   DEFAULT_KEEP_ALIVE_MINUTES,
 } from '../constants/config';
+import { ANTIGRAVITY_THEME } from '../constants/theme';
 import {
   INBOX_BRIDGE_SCRIPT,
+  buildCreateProjectScript,
   buildFastThreadSwitchScript,
   buildInboxRefreshScript,
+  buildListDirectoryScript,
   buildMarkThreadReadScript,
   buildOpenHostSettingsScript,
   buildStartProjectChatScript,
@@ -64,6 +67,9 @@ import {
   syncNativeActionNotification,
 } from '../services/webData';
 import {
+  CreateProjectRequestParams,
+  CreateProjectResult,
+  DirectoryListingResult,
   InboxBridgeMessage,
   InboxProjectGroup,
   InboxSnapshot,
@@ -289,7 +295,9 @@ function buildKeepAliveWebLockScript(acquire: boolean): string {
 const MAX_RENDER_RECOVERY_ATTEMPTS = 3;
 const RENDER_RECOVERY_WINDOW_MS = 30_000;
 const FAST_THREAD_NAV_FALLBACK_MS = 750;
-const START_PROJECT_CHAT_FALLBACK_MS = 2_400;
+const START_PROJECT_CHAT_FALLBACK_MS = 6_500;
+const LIST_DIR_TIMEOUT_MS = 10_000;
+const CREATE_PROJECT_TIMEOUT_MS = 12_000;
 const HOST_SETTINGS_FALLBACK_MS = 500;
 const INBOX_REFRESH_TIMEOUT_MS = 9_000;
 const MAX_LOCALLY_READ_ENTRIES = 500;
@@ -422,6 +430,24 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const pendingFastNavRef = useRef<
     Map<string, { timer: ReturnType<typeof setTimeout>; targetUrl: string }>
   >(new Map());
+  const pendingDirRequestsRef = useRef<
+    Map<
+      string,
+      {
+        timer: ReturnType<typeof setTimeout>;
+        resolve: (result: DirectoryListingResult) => void;
+      }
+    >
+  >(new Map());
+  const pendingCreateProjectRequestsRef = useRef<
+    Map<
+      string,
+      {
+        timer: ReturnType<typeof setTimeout>;
+        resolve: (result: CreateProjectResult) => void;
+      }
+    >
+  >(new Map());
   const hostSettingsFallbackTimerRef = useRef<ReturnType<
     typeof setTimeout
   > | null>(null);
@@ -429,6 +455,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     null,
   );
   const isDrawerOpenRef = useRef<boolean>(false);
+  const isComposingNewThreadRef = useRef<boolean>(false);
+  const wasAuthenticatedRef = useRef<boolean>(false);
   const drawerBackInterceptorRef = useRef<(() => boolean) | null>(null);
 
   const [isHydrated, setIsHydrated] = useState<boolean>(false);
@@ -562,11 +590,22 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       if (incomingDeepLinkUrl) {
         onDeepLinkConsumed();
       }
-      setStage(
-        restoredCount > 0 && sessionSignature.length > 0
-          ? 'authenticated'
-          : 'authenticating',
-      );
+      const isAuthenticatedAtLaunch =
+        restoredCount > 0 && sessionSignature.length > 0;
+      wasAuthenticatedRef.current = isAuthenticatedAtLaunch;
+      setStage(isAuthenticatedAtLaunch ? 'authenticated' : 'authenticating');
+      // Antigravity's native web sidebar is hidden inside the WebView: when opening
+      // the app authenticated on a non-thread route (no cascadeId), open our native
+      // Inbox sidebar automatically so the user is either in a thread or in Inbox.
+      if (
+        isAuthenticatedAtLaunch &&
+        !initialRoute.cascadeId &&
+        !pendingOpenInbox
+      ) {
+        setDrawerInitialMode('inbox');
+        isDrawerOpenRef.current = true;
+        setIsDrawerOpen(true);
+      }
       hydratedRef.current = true;
       setIsHydrated(true);
     }
@@ -692,6 +731,25 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       clearTimeout(pending.timer);
     }
     pendingFastNavRef.current.clear();
+    for (const pending of pendingDirRequestsRef.current.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve({
+        ok: false,
+        currentUri: '',
+        parentUri: null,
+        entries: [],
+        error: 'Session interrupted',
+      });
+    }
+    pendingDirRequestsRef.current.clear();
+    for (const pending of pendingCreateProjectRequestsRef.current.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve({
+        ok: false,
+        error: 'Session interrupted',
+      });
+    }
+    pendingCreateProjectRequestsRef.current.clear();
     if (inboxRefreshTimeoutRef.current) {
       clearTimeout(inboxRefreshTimeoutRef.current);
       inboxRefreshTimeoutRef.current = null;
@@ -927,6 +985,21 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             }
             if (stageRef.current === 'authenticated') {
               webViewRef.current?.injectJavaScript(buildInboxRefreshScript());
+              if (
+                returningFromBackground &&
+                !isDrawerOpenRef.current &&
+                !isComposingNewThreadRef.current
+              ) {
+                const resumeRoute = extractActiveRouteFromUrl(
+                  currentNavUrlRef.current,
+                );
+                if (!resumeRoute.cascadeId) {
+                  setDrawerInitialMode('inbox');
+                  isDrawerOpenRef.current = true;
+                  setIsDrawerOpen(true);
+                  recomputeSnapshotWithLocalState({ isDrawerOpen: true });
+                }
+              }
             }
           }
           void syncCookiesToVault();
@@ -1087,6 +1160,12 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       if (canReturnToOverviewRef.current && webViewRef.current) {
         canReturnToOverviewRef.current = false;
         webViewRef.current.injectJavaScript(buildReturnToOverviewScript());
+        // Because Antigravity's native sidebar is hidden, returning from a thread
+        // to the overview automatically opens our native Inbox sidebar.
+        setDrawerInitialMode('inbox');
+        isDrawerOpenRef.current = true;
+        setIsDrawerOpen(true);
+        recomputeSnapshotWithLocalState({ isDrawerOpen: true });
         return true;
       }
       return false;
@@ -1135,6 +1214,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       stageRef.current = 'hydrating';
       setStage('hydrating');
       isDrawerOpenRef.current = false;
+      isComposingNewThreadRef.current = false;
+      wasAuthenticatedRef.current = false;
       setIsDrawerOpen(false);
       setIsInboxRefreshing(false);
       setInboxSnapshot(EMPTY_INBOX_SNAPSHOT);
@@ -1252,6 +1333,9 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         setActiveHostUrl(validation.normalizedUrl);
         void saveLastActiveUrl(validation.normalizedUrl);
         const route = extractActiveRouteFromUrl(validation.normalizedUrl);
+        if (route.cascadeId) {
+          isComposingNewThreadRef.current = false;
+        }
         activeInstanceUuidRef.current = route.instanceUuid;
         recordActiveRouteForBackNavigation(route.instanceUuid, route.cascadeId);
         if (
@@ -1283,11 +1367,24 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
               !isResettingSessionRef.current &&
               currentNavUrlRef.current === validation.normalizedUrl
             ) {
+              const becameAuthenticated = !wasAuthenticatedRef.current;
+              wasAuthenticatedRef.current = true;
               cookieRecoveryAttemptsRef.current = 0;
               renderRecoveryTimestampsRef.current = [];
               renderProcessDeadRef.current = false;
               setStage('authenticated');
               webViewRef.current?.injectJavaScript(INBOX_BRIDGE_SCRIPT);
+              if (
+                becameAuthenticated &&
+                !route.cascadeId &&
+                !isComposingNewThreadRef.current &&
+                !isDrawerOpenRef.current
+              ) {
+                setDrawerInitialMode('inbox');
+                isDrawerOpenRef.current = true;
+                setIsDrawerOpen(true);
+                recomputeSnapshotWithLocalState({ isDrawerOpen: true });
+              }
             }
           });
         }
@@ -1434,6 +1531,9 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         setActiveHostUrl(validation.normalizedUrl);
       }
       const targetRoute = extractActiveRouteFromUrl(validation.normalizedUrl);
+      if (targetRoute.cascadeId) {
+        isComposingNewThreadRef.current = false;
+      }
       activeInstanceUuidRef.current = targetRoute.instanceUuid;
       lastObservedOverviewInstanceRef.current = targetRoute.cascadeId
         ? null
@@ -1514,6 +1614,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         clearTimeout(resumeReadSettleTimerRef.current);
         resumeReadSettleTimerRef.current = null;
       }
+      isComposingNewThreadRef.current = false;
       handleDismissDrawerGuidance();
       Keyboard.dismiss?.();
       const resolvedMode: DrawerMode =
@@ -1584,6 +1685,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         resumeReadSettleTimerRef.current = null;
       }
       isDrawerOpenRef.current = false;
+      isComposingNewThreadRef.current = false;
       setIsDrawerOpen(false);
 
       markThreadReadInWorkstationClock(thread, 'unread_only');
@@ -1641,6 +1743,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         resumeReadSettleTimerRef.current = null;
       }
       isDrawerOpenRef.current = false;
+      isComposingNewThreadRef.current = true;
       setIsDrawerOpen(false);
       recomputeSnapshotWithLocalState({
         activeInstanceUuid: project.instanceUuid,
@@ -1672,6 +1775,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             instanceUuid: project.instanceUuid,
             workspaceUri: project.workspaceUri,
             targetUrl: project.newChatUrl,
+            projectId: project.projectId,
           }),
         );
         return;
@@ -1680,6 +1784,96 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       handleNavigateToUrl(project.newChatUrl);
     },
     [handleNavigateToUrl, recomputeSnapshotWithLocalState],
+  );
+
+  const handleListDirectory = useCallback(
+    (
+      instanceUuid: string,
+      uri?: string | null,
+    ): Promise<DirectoryListingResult> => {
+      if (
+        isResettingSessionRef.current ||
+        stageRef.current !== 'authenticated' ||
+        renderProcessDeadRef.current ||
+        !webViewRef.current
+      ) {
+        return Promise.resolve({
+          ok: false,
+          currentUri: '',
+          parentUri: null,
+          entries: [],
+          error: 'Workstation is not connected.',
+        });
+      }
+      return new Promise((resolve) => {
+        const requestId = `list-dir-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const timer = setTimeout(() => {
+          pendingDirRequestsRef.current.delete(requestId);
+          resolve({
+            ok: false,
+            currentUri: uri ?? '',
+            parentUri: null,
+            entries: [],
+            error: 'Timed out waiting for workstation directory listing.',
+          });
+        }, LIST_DIR_TIMEOUT_MS);
+        (timer as { unref?: () => void })?.unref?.();
+        pendingDirRequestsRef.current.set(requestId, { timer, resolve });
+
+        webViewRef.current?.injectJavaScript(INBOX_BRIDGE_SCRIPT);
+        webViewRef.current?.injectJavaScript(
+          buildListDirectoryScript({
+            requestId,
+            instanceUuid,
+            uri: uri ?? null,
+          }),
+        );
+      });
+    },
+    [],
+  );
+
+  const handleCreateProject = useCallback(
+    (params: CreateProjectRequestParams): Promise<CreateProjectResult> => {
+      if (
+        isResettingSessionRef.current ||
+        stageRef.current !== 'authenticated' ||
+        renderProcessDeadRef.current ||
+        !webViewRef.current
+      ) {
+        return Promise.resolve({
+          ok: false,
+          error: 'Workstation is not connected.',
+        });
+      }
+      return new Promise((resolve) => {
+        const requestId = `create-proj-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const timer = setTimeout(() => {
+          pendingCreateProjectRequestsRef.current.delete(requestId);
+          resolve({
+            ok: false,
+            error: 'Timed out waiting for workstation response.',
+          });
+        }, CREATE_PROJECT_TIMEOUT_MS);
+        (timer as { unref?: () => void })?.unref?.();
+        pendingCreateProjectRequestsRef.current.set(requestId, {
+          timer,
+          resolve,
+        });
+
+        webViewRef.current?.injectJavaScript(INBOX_BRIDGE_SCRIPT);
+        webViewRef.current?.injectJavaScript(
+          buildCreateProjectScript({
+            requestId,
+            instanceUuid: params.instanceUuid,
+            mode: params.mode,
+            name: params.name,
+            folderPathOrUri: params.folderPathOrUri ?? null,
+          }),
+        );
+      });
+    },
+    [],
   );
 
   // Step 2: Handle incoming deep links and multi-action Inbox opens when mounted
@@ -1899,6 +2093,9 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             message,
             currentNavUrlRef.current,
           );
+          if (activeCascadeId) {
+            isComposingNewThreadRef.current = false;
+          }
           activeInstanceUuidRef.current = activeInstanceUuid;
           recordActiveRouteForBackNavigation(
             activeInstanceUuid,
@@ -2002,12 +2199,54 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           }
           break;
         }
+
+        case 'AGY_INBOX_LIST_DIR_RESULT': {
+          const pending = pendingDirRequestsRef.current.get(message.requestId);
+          if (!pending) {
+            break;
+          }
+          clearTimeout(pending.timer);
+          pendingDirRequestsRef.current.delete(message.requestId);
+          pending.resolve({
+            ok: message.ok,
+            currentUri: message.currentUri,
+            parentUri: message.parentUri,
+            entries: message.entries,
+            error: message.error,
+          });
+          break;
+        }
+
+        case 'AGY_INBOX_CREATE_PROJECT_RESULT': {
+          const pending = pendingCreateProjectRequestsRef.current.get(
+            message.requestId,
+          );
+          if (!pending) {
+            break;
+          }
+          clearTimeout(pending.timer);
+          pendingCreateProjectRequestsRef.current.delete(message.requestId);
+          pending.resolve({
+            ok: message.ok,
+            projectId: message.projectId,
+            projectName: message.projectName,
+            workspaceUri: message.workspaceUri,
+            error: message.error,
+          });
+          break;
+        }
+
+        case 'AGY_INBOX_OPEN_DRAWER_REQUEST': {
+          handleOpenDrawer(message.mode ?? 'inbox');
+          break;
+        }
       }
     },
     [
       armInboxRefreshTimeout,
       getDashboardUrlForCurrentAccount,
       handleNavigateToUrl,
+      handleOpenDrawer,
       markThreadReadInWorkstationClock,
       recomputeSnapshotWithLocalState,
       recordActiveRouteForBackNavigation,
@@ -2059,7 +2298,10 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             </TouchableOpacity>
           </>
         ) : (
-          <ActivityIndicator size="large" color="#60A5FA" />
+          <ActivityIndicator
+            size="large"
+            color={ANTIGRAVITY_THEME.colors.primaryText}
+          />
         )}
       </View>
     );
@@ -2068,7 +2310,10 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   if (!isHydrated) {
     return (
       <View style={styles.loadingScreen}>
-        <ActivityIndicator size="large" color="#60A5FA" />
+        <ActivityIndicator
+          size="large"
+          color={ANTIGRAVITY_THEME.colors.primaryText}
+        />
         <Text style={styles.loadingTitle}>Antigravity Remote</Text>
         <Text style={styles.loadingSubtitle}>
           {initializationError
@@ -2175,6 +2420,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         onRefreshInbox={handleRefreshInbox}
         onSelectThread={handleSelectInboxThread}
         onStartProjectThread={handleStartProjectThread}
+        onListDirectory={handleListDirectory}
+        onCreateProject={handleCreateProject}
         onMarkThreadRead={handleMarkThreadRead}
         onMarkAllRead={handleMarkAllRead}
         onChangeKeepAliveMinutes={handleChangeKeepAliveMinutes}
@@ -2191,36 +2438,36 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
 const styles = StyleSheet.create({
   root: {
     flex: 1,
-    backgroundColor: '#0B0F17',
+    backgroundColor: ANTIGRAVITY_THEME.colors.canvas,
   },
   webViewWrapper: {
     flex: 1,
-    backgroundColor: '#0B0F17',
+    backgroundColor: ANTIGRAVITY_THEME.colors.canvas,
   },
   webViewContainer: {
     flex: 1,
-    backgroundColor: '#0B0F17',
+    backgroundColor: ANTIGRAVITY_THEME.colors.canvas,
   },
   webView: {
     flex: 1,
-    backgroundColor: '#0B0F17',
+    backgroundColor: ANTIGRAVITY_THEME.colors.canvas,
   },
   loadingScreen: {
     flex: 1,
-    backgroundColor: '#0B0F17',
+    backgroundColor: ANTIGRAVITY_THEME.colors.canvas,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 28,
   },
   loadingTitle: {
     marginTop: 16,
-    color: '#F8FAFC',
+    color: ANTIGRAVITY_THEME.colors.textPrimary,
     fontSize: 18,
     fontWeight: '700',
   },
   loadingSubtitle: {
     marginTop: 6,
-    color: '#94A3B8',
+    color: ANTIGRAVITY_THEME.colors.textMuted,
     fontSize: 13,
     textAlign: 'center',
   },
@@ -2230,33 +2477,33 @@ const styles = StyleSheet.create({
   },
   errorContainer: {
     flex: 1,
-    backgroundColor: '#0B0F17',
+    backgroundColor: ANTIGRAVITY_THEME.colors.canvas,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 32,
   },
   errorHeading: {
-    color: '#F8FAFC',
+    color: ANTIGRAVITY_THEME.colors.textPrimary,
     fontSize: 18,
     fontWeight: '700',
     marginBottom: 8,
     textAlign: 'center',
   },
   errorBody: {
-    color: '#94A3B8',
+    color: ANTIGRAVITY_THEME.colors.textMuted,
     fontSize: 14,
     lineHeight: 20,
     textAlign: 'center',
     marginBottom: 22,
   },
   primaryRetryButton: {
-    backgroundColor: '#2563EB',
+    backgroundColor: ANTIGRAVITY_THEME.colors.primary,
     paddingHorizontal: 24,
     paddingVertical: 12,
     borderRadius: 10,
   },
   primaryRetryText: {
-    color: '#FFFFFF',
+    color: ANTIGRAVITY_THEME.colors.white,
     fontSize: 14,
     fontWeight: '700',
   },

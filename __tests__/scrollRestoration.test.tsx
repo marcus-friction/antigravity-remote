@@ -785,12 +785,23 @@ describe('Android & iOS WebView scroll-restoration wiring and Inbox drawer scrol
       PROJECT_OVERVIEW_SCROLL_SCRIPT,
     );
 
-    // Cold-booted onto Project Overview `/r/machine-1` with canGoBack=false:
-    // pressing Back on overview should NOT be intercepted (`false`).
+    // Cold-booted authenticated onto Project Overview `/r/machine-1` (no thread):
+    // our native Inbox drawer opens automatically because Antigravity's sidebar is hidden.
+    // First hardware Back closes the drawer (`true`); second press on overview returns `false`.
+    let backClosedDrawer = false;
+    await act(async () => {
+      for (const listener of mockBackPressListeners) {
+        backClosedDrawer = listener() || backClosedDrawer;
+      }
+    });
+    expect(backClosedDrawer).toBe(true);
+
     let backHandledOnOverview = false;
-    for (const listener of mockBackPressListeners) {
-      backHandledOnOverview = listener() || backHandledOnOverview;
-    }
+    await act(async () => {
+      for (const listener of mockBackPressListeners) {
+        backHandledOnOverview = listener() || backHandledOnOverview;
+      }
+    });
     expect(backHandledOnOverview).toBe(false);
 
     // User dives into a thread inside the workstation iframe (`AGY_INBOX_ACTIVE_ROUTE`),
@@ -822,16 +833,16 @@ describe('Android & iOS WebView scroll-restoration wiring and Inbox drawer scrol
       "JSON.stringify([null, ['/']])",
     );
 
-    // Verify Drawer Inbox ScrollView preserves scroll position across Inbox <-> Settings mode switches
-    const openDrawerBtn = tree.root.findAll(
-      (n) =>
-        n.type === ('TouchableOpacity' as any) &&
-        typeof n.props.accessibilityLabel === 'string' &&
-        n.props.accessibilityLabel.startsWith('Open Antigravity drawer'),
-    )[0];
-    await act(async () => {
-      openDrawerBtn.props.onPress();
-    });
+    // Pressing Back from a thread automatically opens our native Inbox drawer
+    // (because Antigravity's native sidebar is hidden). Verify Drawer Inbox ScrollView
+    // preserves scroll position across Inbox <-> Settings mode switches:
+    expect(
+      tree.root.findAll(
+        (n) =>
+          n.type === ('TouchableOpacity' as any) &&
+          n.props.accessibilityLabel === 'Drawer mode Settings',
+      ),
+    ).toHaveLength(1);
 
     const inboxScrollView = () =>
       tree.root.findAll((n) => n.type === ('ScrollView' as any))[0];
@@ -938,5 +949,145 @@ describe('Android & iOS WebView scroll-restoration wiring and Inbox drawer scrol
     await expect(
       actualWebData.installNativeDocumentStartScript('/* retry */'),
     ).resolves.toBeUndefined();
+  });
+
+  it('injects Antigravity sidebar-hiding CSS and intercepts mobile back-to-home clicks to open our native Inbox drawer', () => {
+    const appendedStyles: Array<{ id: string; textContent: string }> = [];
+    const parentPosts: Array<{ msg: any; targetOrigin: string }> = [];
+    const docClickListeners: Array<(evt: any) => void> = [];
+    const styleProps: Record<string, Record<string, string>> = {
+      sidebarNav: {},
+      sidebarWrapper: {},
+      resizer: {},
+    };
+
+    const resizer = {
+      getAttribute: (k: string) => (k === 'role' ? 'separator' : null),
+      className: 'cursor-col-resize',
+      style: {
+        setProperty: (k: string, v: string) => {
+          styleProps.resizer[k] = v;
+        },
+      },
+    };
+    const sidebarWrapper = {
+      parentElement: null as any,
+      nextElementSibling: resizer,
+      querySelector: () => null,
+      style: {
+        setProperty: (k: string, v: string) => {
+          styleProps.sidebarWrapper[k] = v;
+        },
+      },
+    };
+    const sidebarNav = {
+      parentElement: sidebarWrapper,
+      style: {
+        setProperty: (k: string, v: string) => {
+          styleProps.sidebarNav[k] = v;
+        },
+      },
+    };
+
+    const docEl = {
+      appendChild: (node: any) => appendedStyles.push(node),
+    };
+    const windowObj: any = {
+      location: {
+        protocol: 'https:',
+        hostname: 'antigravity.static.usercontent.goog',
+        pathname: '/web/2.33.0/',
+        search: '?iframe=true',
+        href: 'https://antigravity.static.usercontent.goog/web/2.33.0/?iframe=true',
+      },
+      history: {
+        pushState: () => {},
+        replaceState: () => {},
+      },
+      parent: {
+        postMessage: (msg: any, targetOrigin: string) => {
+          parentPosts.push({ msg, targetOrigin });
+        },
+      },
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      sessionStorage: {
+        getItem: () => null,
+        setItem: () => {},
+      },
+    };
+    const documentObj: any = {
+      head: docEl,
+      documentElement: docEl,
+      body: { parentElement: docEl },
+      getElementById: (id: string) =>
+        appendedStyles.find((s) => s.id === id) ?? null,
+      createElement: () => ({ id: '', textContent: '' }),
+      querySelectorAll: (sel: string) =>
+        sel === '[role="navigation"][aria-label="Sidebar"]' ? [sidebarNav] : [],
+      addEventListener: (type: string, fn: (evt: any) => void) => {
+        if (type === 'click') {
+          docClickListeners.push(fn);
+        }
+      },
+      removeEventListener: () => {},
+    };
+
+    const sandbox = vm.createContext({
+      window: windowObj,
+      document: documentObj,
+      URL,
+      URLSearchParams,
+      setTimeout: () => 1,
+      clearTimeout: () => {},
+    });
+    vm.runInContext(PROJECT_OVERVIEW_SCROLL_SCRIPT, sandbox);
+
+    // 1. Style tag injected hiding Antigravity sidebars without breaking settings dialogs
+    expect(appendedStyles).toHaveLength(1);
+    expect(appendedStyles[0].id).toBe('__agy_remote_hide_antigravity_sidebar');
+    expect(appendedStyles[0].textContent).toContain(
+      '[role="navigation"][aria-label="Sidebar"]',
+    );
+    expect(appendedStyles[0].textContent).toContain(
+      '[data-testid="sidebar-popover-backdrop"]',
+    );
+    expect(appendedStyles[0].textContent).toContain(
+      '--sidebar-width: 0px !important;',
+    );
+    expect(appendedStyles[0].textContent).toContain(
+      '[data-sidebar-scroll-container="true"]',
+    );
+    expect(appendedStyles[0].textContent).toContain(
+      ':not([data-testid="settings-sidebar"] *)',
+    );
+    expect(styleProps.sidebarNav.display).toBe('none');
+    expect(styleProps.sidebarWrapper.display).toBe('none');
+    expect(styleProps.resizer.display).toBe('none');
+
+    // 2. Clicking Antigravity's mobile back-to-home button intercepts click and opens our Inbox drawer
+    let prevented = false;
+    let stopped = false;
+    for (const listener of docClickListeners) {
+      listener({
+        target: {
+          closest: (sel: string) =>
+            sel.includes('mobile-back-to-home') ? { tagName: 'BUTTON' } : null,
+        },
+        preventDefault: () => {
+          prevented = true;
+        },
+        stopPropagation: () => {
+          stopped = true;
+        },
+        stopImmediatePropagation: () => {},
+      });
+    }
+    expect(prevented).toBe(true);
+    expect(stopped).toBe(true);
+    expect(parentPosts).toContainEqual({
+      msg: { type: 'AGY_REMOTE_OPEN_DRAWER', mode: 'inbox' },
+      targetOrigin: 'https://antigravity.google.com',
+    });
   });
 });
