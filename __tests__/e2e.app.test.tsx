@@ -4260,5 +4260,146 @@ describe('Session and navigation regressions', () => {
         tree.unmount();
       });
     });
+
+    it('switches docked tablet sidebar mode on header tap, keeps docked open on reload, mutes foreground heads-up alerts while visible, and auto-closes on fold for iframe-navigated threads', async () => {
+      mockWindowDimensions = { width: 1024, height: 768 };
+
+      mockCookieStore.set('https://antigravity.google.com', {
+        SID: { name: 'SID', value: 'tablet-edge-sid', domain: '.google.com' },
+      });
+      await backupCookiesFromWebView();
+      await saveLastActiveUrl('https://antigravity.google.com/r/workstation-1');
+      mockCookieStore.clear();
+
+      let tree!: ReactTestRenderer;
+      await act(async () => {
+        tree = renderer.create(<App />);
+      });
+
+      const webView = () => tree.root.findByType('WebView' as any);
+      const controls = () => tree.root.findByType(LeftNavigationDrawer);
+      expect(controls().props.visible).toBe(true);
+      expect(controls().props.docked).toBe(true);
+
+      // 1. Tapping the thread header project button while docked sidebar is ALREADY open switches mode to Projects
+      await act(async () => {
+        webView().props.onMessage({
+          nativeEvent: {
+            url: 'https://antigravity.google.com/r/workstation-1',
+            data: JSON.stringify({
+              type: 'AGY_INBOX_OPEN_DRAWER_REQUEST',
+              mode: 'projects',
+            }),
+          },
+        });
+      });
+      expect(
+        tree.root.find(
+          (n) => n.props.accessibilityLabel === 'Drawer mode Projects',
+        ).props.accessibilityState?.selected,
+      ).toBe(true);
+
+      // Sending mode: 'inbox' switches docked sidebar right back to Inbox
+      await act(async () => {
+        webView().props.onMessage({
+          nativeEvent: {
+            url: 'https://antigravity.google.com/r/workstation-1',
+            data: JSON.stringify({
+              type: 'AGY_INBOX_OPEN_DRAWER_REQUEST',
+              mode: 'inbox',
+            }),
+          },
+        });
+      });
+      expect(
+        tree.root.find(
+          (n) => n.props.accessibilityLabel === 'Drawer mode Inbox',
+        ).props.accessibilityState?.selected,
+      ).toBe(true);
+
+      // 2. Foreground attention snapshot while docked sidebar is visible updates tray silently (shouldAlert: false)
+      (syncNativeActionNotification as jest.Mock).mockClear();
+      await act(async () => {
+        webView().props.onMessage({
+          nativeEvent: {
+            url: 'https://antigravity.google.com/r/workstation-1',
+            data: JSON.stringify({
+              type: 'AGY_INBOX_SNAPSHOT',
+              fetchedAtMs: Date.now(),
+              activeUrl: 'https://antigravity.google.com/r/workstation-1',
+              activeInstanceUuid: 'workstation-1',
+              activeCascadeId: null,
+              instances: [
+                {
+                  uuid: 'workstation-1',
+                  name: 'Primary Box',
+                  status: 1,
+                  trajectories: {
+                    trajectorySummaries: {
+                      'thread-bg-alert': {
+                        summary: 'Pending approval',
+                        status: 'CASCADE_RUN_STATUS_WAITING_FOR_USER',
+                        waitingSteps: [
+                          { step: { runCommand: { commandLine: 'npm test' } } },
+                        ],
+                        lastModifiedTime: new Date().toISOString(),
+                      },
+                    },
+                  },
+                },
+              ],
+            }),
+          },
+        });
+      });
+      expect(syncNativeActionNotification).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          count: 1,
+          shouldAlert: false,
+        }),
+      );
+
+      // 3. Reloading current page from Settings keeps docked tablet sidebar open
+      const settingsModeBtn = tree.root.find(
+        (n) => n.props.accessibilityLabel === 'Drawer mode Settings',
+      );
+      await act(async () => {
+        settingsModeBtn.props.onPress();
+      });
+      const reloadBtn = tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find((n) => n.props.accessibilityLabel === 'Reload current page')!;
+      mockWebViewReload.mockClear();
+      await act(async () => {
+        reloadBtn.props.onPress();
+      });
+      expect(mockWebViewReload).toHaveBeenCalledTimes(1);
+      expect(controls().props.visible).toBe(true);
+
+      // 4. Iframe-navigated thread (no `?p=c%2F` on host URL) auto-closes drawer when folding tablet -> phone
+      await act(async () => {
+        webView().props.onMessage({
+          nativeEvent: {
+            url: 'https://antigravity.google.com/r/workstation-1',
+            data: JSON.stringify({
+              type: 'AGY_INBOX_ACTIVE_ROUTE',
+              activeUrl: 'https://antigravity.google.com/r/workstation-1',
+              activeInstanceUuid: 'workstation-1',
+              activeCascadeId: 'iframe-thread-99',
+            }),
+          },
+        });
+      });
+      mockWindowDimensions = { width: 390, height: 844 };
+      await act(async () => {
+        tree.update(<App />);
+      });
+      expect(controls().props.docked).toBe(false);
+      expect(controls().props.visible).toBe(false);
+
+      await act(async () => {
+        tree.unmount();
+      });
+    });
   });
 });

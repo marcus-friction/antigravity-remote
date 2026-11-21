@@ -121,7 +121,10 @@ export function buildActionNotificationSyncState(params: {
   mode: ActionNotificationMode;
   threads: readonly InboxThreadItem[];
   isAppForeground: boolean;
+  /** True when the drawer overlays/occludes the foreground WebView (false for docked side-by-side tablet mode). */
   isDrawerOpen: boolean;
+  /** True when the navigation drawer (including a docked tablet sidebar) is visible on screen. Defaults to `isDrawerOpen`. */
+  isDrawerVisible?: boolean;
   previousOpenThreadIds: ReadonlySet<string>;
 }): ActionNotificationSyncResult {
   const {
@@ -130,6 +133,7 @@ export function buildActionNotificationSyncState(params: {
     threads,
     isAppForeground,
     isDrawerOpen,
+    isDrawerVisible,
     previousOpenThreadIds,
   } = params;
 
@@ -169,7 +173,8 @@ export function buildActionNotificationSyncState(params: {
 
   const count = openThreads.length;
   const hasNewThread = openThreads.some((t) => !previousOpenThreadIds.has(t.id));
-  const shouldAlert = hasNewThread && !(isAppForeground && isDrawerOpen);
+  const effectiveDrawerVisible = isDrawerVisible ?? isDrawerOpen;
+  const shouldAlert = hasNewThread && !(isAppForeground && effectiveDrawerVisible);
   const items = openThreads.slice(0, MAX_NOTIFICATION_CARDS).map(buildThreadCardItem);
   const itemsSig = items
     .map(

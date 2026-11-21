@@ -745,11 +745,61 @@ export const INBOX_BRIDGE_SCRIPT = `
       if (st === 2 || st === 3 || st === 4) return true;
       if (typeof st === 'string') {
         var u = st.toUpperCase();
-        if (u.indexOf('RUNNING') !== -1 || u.indexOf('BUSY') !== -1 || u.indexOf('CANCELING') !== -1) {
+        if (
+          u.indexOf('RUNNING') !== -1 ||
+          u.indexOf('BUSY') !== -1 ||
+          u.indexOf('CANCELING') !== -1 ||
+          u.indexOf('WAITING') !== -1
+        ) {
           return true;
         }
       }
       return false;
+    }
+
+    function getJetboxBackendKey(backend) {
+      return backend ? String(backend) : 'local';
+    }
+
+    function parseTimestampForComparison(ts) {
+      if (!ts) return 0;
+      if (typeof ts === 'number') return ts > 1e11 ? ts : ts * 1000;
+      if (typeof ts === 'string') {
+        var parsed = Date.parse(ts);
+        return isNaN(parsed) ? 0 : parsed;
+      }
+      if (typeof ts === 'object') {
+        var sec = Number(ts.seconds || ts.secs || 0);
+        if (sec > 0) return sec * 1000;
+      }
+      return 0;
+    }
+
+    function hasPresentScalar(obj, camelKey, snakeKey) {
+      if (!obj || typeof obj !== 'object') return false;
+      var cv = obj[camelKey];
+      if (cv !== undefined && cv !== null && cv !== '') return true;
+      if (snakeKey) {
+        var sv = obj[snakeKey];
+        if (sv !== undefined && sv !== null && sv !== '') return true;
+      }
+      return false;
+    }
+
+    function backfillScalarField(target, source, camelKey, snakeKey) {
+      if (!source || typeof source !== 'object') return;
+      if (hasPresentScalar(target, camelKey, snakeKey)) return;
+      var val = source[camelKey];
+      if (val !== undefined && val !== null && val !== '') {
+        target[camelKey] = val;
+        return;
+      }
+      if (snakeKey) {
+        var sval = source[snakeKey];
+        if (sval !== undefined && sval !== null && sval !== '') {
+          target[snakeKey] = sval;
+        }
+      }
     }
 
     function mergeStringArraysUnique(primary, secondary) {
@@ -792,10 +842,11 @@ export const INBOX_BRIDGE_SCRIPT = `
       return out;
     }
 
-    function mergeSingleTrajectorySummary(jetboxItem, cascadeItem) {
+    function mergeSingleTrajectorySummary(jetboxItem, cascadeItem, jetboxIsFresh) {
       if (!jetboxItem || typeof jetboxItem !== 'object') return cascadeItem;
       if (!cascadeItem || typeof cascadeItem !== 'object') return jetboxItem;
 
+      var isJetboxFresh = jetboxIsFresh !== false;
       var jetboxTs = getSummaryTimestampScore(jetboxItem);
       var cascadeTs = getSummaryTimestampScore(cascadeItem);
       var jetboxSteps = Number(jetboxItem.stepCount || jetboxItem.step_count || 0) || 0;
@@ -803,24 +854,56 @@ export const INBOX_BRIDGE_SCRIPT = `
       var jetboxLive = isSummaryLiveActive(jetboxItem);
       var cascadeLive = isSummaryLiveActive(cascadeItem);
 
-      var preferCascade =
-        (cascadeLive && !jetboxLive) ||
-        (cascadeLive === jetboxLive &&
-          (cascadeTs > jetboxTs || (cascadeTs === jetboxTs && cascadeSteps >= jetboxSteps)));
+      // Cached Jetbox entries must never override fresh live Cascade summaries.
+      // Between two live sources, freshness (timestamp -> stepCount) decides first,
+      // with liveness used only as a tie-breaker so a stale live snapshot never masks
+      // a newer IDLE/finished state.
+      var preferCascade;
+      if (!isJetboxFresh) {
+        preferCascade = true;
+      } else if (cascadeTs !== jetboxTs) {
+        preferCascade = cascadeTs > jetboxTs;
+      } else if (cascadeSteps !== jetboxSteps) {
+        preferCascade = cascadeSteps > jetboxSteps;
+      } else if (cascadeLive !== jetboxLive) {
+        preferCascade = cascadeLive;
+      } else {
+        preferCascade = true;
+      }
 
       var primary = preferCascade ? cascadeItem : jetboxItem;
       var secondary = preferCascade ? jetboxItem : cascadeItem;
 
+      // Start strictly from primary so proto3-omitted transient runtime fields
+      // (waitingSteps, notFullyIdle, hasRunningSubagents, backgroundTaskCount,
+      // killed, interrupted, latestExecutorTerminationReason, markedAsUnread)
+      // never leak from a stale secondary snapshot.
       var merged = Object.create(null);
-      var secKeys = Object.keys(secondary);
-      for (var s = 0; s < secKeys.length; s++) {
-        merged[secKeys[s]] = secondary[secKeys[s]];
-      }
       var priKeys = Object.keys(primary);
       for (var p = 0; p < priKeys.length; p++) {
-        var pk = priKeys[p];
-        if (primary[pk] !== undefined && primary[pk] !== null && primary[pk] !== '') {
-          merged[pk] = primary[pk];
+        merged[priKeys[p]] = primary[priKeys[p]];
+      }
+
+      // Selectively backfill only structural/identity fields from secondary.
+      backfillScalarField(merged, secondary, 'summary', null);
+      backfillScalarField(merged, secondary, 'createdTime', 'created_time');
+      backfillScalarField(merged, secondary, 'trajectoryId', 'trajectory_id');
+      backfillScalarField(merged, secondary, 'source', null);
+      backfillScalarField(merged, secondary, 'projectId', 'project_id');
+      backfillScalarField(merged, secondary, 'workspaceFolderAbsoluteUri', 'workspace_folder_absolute_uri');
+      backfillScalarField(merged, secondary, 'gitRootAbsoluteUri', 'git_root_absolute_uri');
+      backfillScalarField(merged, secondary, 'workspaceUri', 'workspace_uri');
+      backfillScalarField(merged, secondary, 'trajectoryType', 'trajectory_type');
+      backfillScalarField(merged, secondary, 'cloud', null);
+      backfillScalarField(merged, secondary, 'lastUserInputTime', 'last_user_input_time');
+      if (
+        merged.lastUserInputStepIndex === undefined &&
+        merged.last_user_input_step_index === undefined
+      ) {
+        if (secondary.lastUserInputStepIndex !== undefined) {
+          merged.lastUserInputStepIndex = secondary.lastUserInputStepIndex;
+        } else if (secondary.last_user_input_step_index !== undefined) {
+          merged.last_user_input_step_index = secondary.last_user_input_step_index;
         }
       }
 
@@ -829,20 +912,21 @@ export const INBOX_BRIDGE_SCRIPT = `
       var secMeta = secondary.trajectoryMetadata || secondary.trajectory_metadata || null;
       if (priMeta || secMeta) {
         var mergedMeta = Object.create(null);
-        if (secMeta && typeof secMeta === 'object') {
-          var smKeys = Object.keys(secMeta);
-          for (var a = 0; a < smKeys.length; a++) {
-            mergedMeta[smKeys[a]] = secMeta[smKeys[a]];
-          }
-        }
         if (priMeta && typeof priMeta === 'object') {
           var pmKeys = Object.keys(priMeta);
           for (var b = 0; b < pmKeys.length; b++) {
-            var pmk = pmKeys[b];
-            if (priMeta[pmk] !== undefined && priMeta[pmk] !== null && priMeta[pmk] !== '') {
-              mergedMeta[pmk] = priMeta[pmk];
-            }
+            mergedMeta[pmKeys[b]] = priMeta[pmKeys[b]];
           }
+        }
+        if (secMeta && typeof secMeta === 'object') {
+          backfillScalarField(mergedMeta, secMeta, 'projectId', 'project_id');
+          backfillScalarField(mergedMeta, secMeta, 'environmentId', 'environment_id');
+          backfillScalarField(mergedMeta, secMeta, 'parentConversationId', 'parent_conversation_id');
+          backfillScalarField(mergedMeta, secMeta, 'rootConversationId', 'root_conversation_id');
+          backfillScalarField(mergedMeta, secMeta, 'isBattleModeFork', 'is_battle_mode_fork');
+          backfillScalarField(mergedMeta, secMeta, 'subagentSpec', 'subagent_spec');
+          backfillScalarField(mergedMeta, secMeta, 'sourceMetadata', 'source_metadata');
+          backfillScalarField(mergedMeta, secMeta, 'createdAt', 'created_at');
         }
         var mergedMetaUris = mergeStringArraysUnique(
           priMeta && (priMeta.workspaceUris || priMeta.workspace_uris),
@@ -866,32 +950,38 @@ export const INBOX_BRIDGE_SCRIPT = `
         merged.workspaces = mergedWorkspaces;
       }
 
+      // For annotations, keep primary's transient flags (markedAsUnread, archived, pinned, starred)
+      // authoritative; only backfill missing title and strictly newer monotonic lastUserViewTime.
       var priAnn = primary.annotations && typeof primary.annotations === 'object' ? primary.annotations : null;
       var secAnn = secondary.annotations && typeof secondary.annotations === 'object' ? secondary.annotations : null;
       if (priAnn || secAnn) {
         var mergedAnn = Object.create(null);
-        if (secAnn) {
-          var saKeys = Object.keys(secAnn);
-          for (var c = 0; c < saKeys.length; c++) {
-            mergedAnn[saKeys[c]] = secAnn[saKeys[c]];
-          }
-        }
         if (priAnn) {
           var paKeys = Object.keys(priAnn);
           for (var d = 0; d < paKeys.length; d++) {
-            var pak = paKeys[d];
-            if (priAnn[pak] !== undefined && priAnn[pak] !== null && priAnn[pak] !== '') {
-              mergedAnn[pak] = priAnn[pak];
-            }
+            mergedAnn[paKeys[d]] = priAnn[paKeys[d]];
           }
         }
-        merged.annotations = mergedAnn;
+        if (secAnn) {
+          backfillScalarField(mergedAnn, secAnn, 'title', null);
+          var priViewTs = parseTimestampForComparison(
+            mergedAnn.lastUserViewTime || mergedAnn.last_user_view_time
+          );
+          var secViewRaw = secAnn.lastUserViewTime || secAnn.last_user_view_time;
+          var secViewTs = parseTimestampForComparison(secViewRaw);
+          if (secViewTs > priViewTs && secViewRaw !== undefined) {
+            mergedAnn.lastUserViewTime = secViewRaw;
+          }
+        }
+        if (Object.keys(mergedAnn).length > 0) {
+          merged.annotations = mergedAnn;
+        }
       }
 
       return merged;
     }
 
-    function mergeTrajectorySummaryMaps(jetboxMap, cascadeMap) {
+    function mergeTrajectorySummaryMaps(jetboxMap, cascadeMap, jetboxIsFresh) {
       var out = Object.create(null);
       if (jetboxMap && typeof jetboxMap === 'object') {
         var jKeys = Object.keys(jetboxMap);
@@ -910,13 +1000,27 @@ export const INBOX_BRIDGE_SCRIPT = `
             continue;
           }
           if (out[ck]) {
-            out[ck] = mergeSingleTrajectorySummary(out[ck], cascadeMap[ck]);
+            out[ck] = mergeSingleTrajectorySummary(out[ck], cascadeMap[ck], jetboxIsFresh);
           } else {
             out[ck] = cascadeMap[ck];
           }
         }
       }
       return out;
+    }
+
+    function getCachedJetboxSummariesForInstance(uuid) {
+      var keys = ['local', '2', '3'];
+      var combined = null;
+      for (var i = 0; i < keys.length; i++) {
+        var entry = lastJetboxSummariesCache[uuid + ':' + keys[i]];
+        if (entry && typeof entry === 'object') {
+          combined = combined
+            ? mergeTrajectorySummaryMaps(combined, entry, true)
+            : entry;
+        }
+      }
+      return combined;
     }
 
     function compactWaitingStepEntry(entry) {
@@ -1580,7 +1684,7 @@ export const INBOX_BRIDGE_SCRIPT = `
             }
           }
           if (cleanIds.length === 0) {
-            var resolvedEmpty = inlineProjects || [];
+            var resolvedEmpty = inlineProjects ? compactProjectsList(inlineProjects) : [];
             lastProjectsCache[uuid] = resolvedEmpty;
             return resolvedEmpty;
           }
@@ -1589,9 +1693,11 @@ export const INBOX_BRIDGE_SCRIPT = `
             lastProjectsCache[uuid] = compactedInline;
             return compactedInline;
           }
+          var batchIdLists = [];
           var batchPromises = [];
           for (var offset = 0; offset < cleanIds.length; offset += READ_PROJECTS_BATCH_SIZE) {
             var batchIds = cleanIds.slice(offset, offset + READ_PROJECTS_BATCH_SIZE);
+            batchIdLists.push(batchIds);
             batchPromises.push(
               callProxyJson(
                 ctx,
@@ -1611,6 +1717,17 @@ export const INBOX_BRIDGE_SCRIPT = `
             );
           }
           return Promise.all(batchPromises).then(function(batches) {
+            var cachedById = Object.create(null);
+            var prevCached = lastProjectsCache[uuid];
+            if (Array.isArray(prevCached)) {
+              for (var cIdx = 0; cIdx < prevCached.length; cIdx++) {
+                var cp = prevCached[cIdx];
+                var cid = cp && (cp.id || cp.projectId || cp.project_id);
+                if (typeof cid === 'string' && cid) {
+                  cachedById[cid] = cp;
+                }
+              }
+            }
             var combined = [];
             var anyBatchSucceeded = false;
             for (var b = 0; b < batches.length; b++) {
@@ -1618,6 +1735,13 @@ export const INBOX_BRIDGE_SCRIPT = `
                 anyBatchSucceeded = true;
                 for (var p = 0; p < batches[b].length; p++) {
                   combined.push(batches[b][p]);
+                }
+              } else {
+                var failedIds = batchIdLists[b] || [];
+                for (var f = 0; f < failedIds.length; f++) {
+                  if (cachedById[failedIds[f]]) {
+                    combined.push(cachedById[failedIds[f]]);
+                  }
                 }
               }
             }
@@ -1825,7 +1949,9 @@ export const INBOX_BRIDGE_SCRIPT = `
 
                 if (!shouldQuery) {
                   delete lastTrajectoryCache[uuid];
-                  delete lastJetboxSummariesCache[uuid];
+                  delete lastJetboxSummariesCache[uuid + ':local'];
+                  delete lastJetboxSummariesCache[uuid + ':2'];
+                  delete lastJetboxSummariesCache[uuid + ':3'];
                   delete unsupportedJetboxSummariesCache[uuid + ':local'];
                   delete unsupportedJetboxSummariesCache[uuid + ':2'];
                   delete unsupportedJetboxSummariesCache[uuid + ':3'];
@@ -1890,19 +2016,26 @@ export const INBOX_BRIDGE_SCRIPT = `
                 // Antigravity's native sidebar populates all persisted conversations (and
                 // project associations) via JetboxSubscribeToSummaries; GetAllCascadeTrajectories
                 // alone can miss historical/disk-stored chats across projects.
+                var localJetboxCacheKey = uuid + ':local';
                 var jetboxTrajJob = isHiddenBackgroundPoll
                   ? Promise.resolve({
-                      ok: Boolean(lastJetboxSummariesCache[uuid]),
-                      summaries: lastJetboxSummariesCache[uuid] || null
+                      ok: false,
+                      cachedSummaries: getCachedJetboxSummariesForInstance(uuid),
+                      liveSummaries: null
                     })
                   : fetchJetboxSummariesStream(ctx, uuid, 0, version).then(function(res) {
                       if (res && res.ok && res.summaries) {
-                        lastJetboxSummariesCache[uuid] = res.summaries;
-                        return res;
+                        lastJetboxSummariesCache[localJetboxCacheKey] = res.summaries;
+                        return {
+                          ok: true,
+                          liveSummaries: res.summaries,
+                          cachedSummaries: null
+                        };
                       }
                       return {
                         ok: false,
-                        summaries: lastJetboxSummariesCache[uuid] || null
+                        liveSummaries: null,
+                        cachedSummaries: lastJetboxSummariesCache[localJetboxCacheKey] || null
                       };
                     });
 
@@ -1942,46 +2075,78 @@ export const INBOX_BRIDGE_SCRIPT = `
                         if (bt === 2 || bt === 'BACKEND_TYPE_REMOTE_AICODE') hasCloudProj = true;
                         if (bt === 3 || bt === 'BACKEND_TYPE_REMOTE_ENTERPRISE') hasEntProj = true;
                       }
-                      if (hasCloudProj) extraBackends.push(2);
-                      if (hasEntProj) extraBackends.push(3);
+                      if (hasCloudProj) {
+                        extraBackends.push(2);
+                      } else {
+                        delete lastJetboxSummariesCache[uuid + ':2'];
+                      }
+                      if (hasEntProj) {
+                        extraBackends.push(3);
+                      } else {
+                        delete lastJetboxSummariesCache[uuid + ':3'];
+                      }
                     }
 
                     var extraJetboxJob =
                       extraBackends.length > 0
                         ? Promise.all(
                             extraBackends.map(function(b) {
-                              return fetchJetboxSummariesStream(ctx, uuid, b, version);
+                              var bCacheKey = uuid + ':' + getJetboxBackendKey(b);
+                              return fetchJetboxSummariesStream(ctx, uuid, b, version).then(function(res) {
+                                if (res && res.ok && res.summaries) {
+                                  lastJetboxSummariesCache[bCacheKey] = res.summaries;
+                                  return {
+                                    ok: true,
+                                    liveSummaries: res.summaries,
+                                    cachedSummaries: null
+                                  };
+                                }
+                                return {
+                                  ok: false,
+                                  liveSummaries: null,
+                                  cachedSummaries: lastJetboxSummariesCache[bCacheKey] || null
+                                };
+                              });
                             })
                           )
                         : Promise.resolve([]);
 
                     return extraJetboxJob.then(function(extraResults) {
-                      var combinedJetbox = jetboxResult && jetboxResult.summaries
-                        ? jetboxResult.summaries
+                      var liveJetboxMap = jetboxResult && jetboxResult.liveSummaries
+                        ? jetboxResult.liveSummaries
                         : null;
-                      var anyJetboxOk = Boolean(jetboxResult && jetboxResult.ok);
+                      var cachedJetboxMap = jetboxResult && jetboxResult.cachedSummaries
+                        ? jetboxResult.cachedSummaries
+                        : null;
+                      var anyLiveJetboxOk = Boolean(jetboxResult && jetboxResult.ok);
+
                       for (var eIdx = 0; eIdx < extraResults.length; eIdx++) {
-                        if (extraResults[eIdx] && extraResults[eIdx].ok && extraResults[eIdx].summaries) {
-                          anyJetboxOk = true;
-                          combinedJetbox = mergeTrajectorySummaryMaps(
-                            combinedJetbox,
-                            extraResults[eIdx].summaries
-                          );
+                        var extra = extraResults[eIdx];
+                        if (!extra) continue;
+                        if (extra.ok && extra.liveSummaries) {
+                          anyLiveJetboxOk = true;
+                          liveJetboxMap = liveJetboxMap
+                            ? mergeTrajectorySummaryMaps(liveJetboxMap, extra.liveSummaries, true)
+                            : extra.liveSummaries;
+                        } else if (extra.cachedSummaries) {
+                          cachedJetboxMap = cachedJetboxMap
+                            ? mergeTrajectorySummaryMaps(cachedJetboxMap, extra.cachedSummaries, true)
+                            : extra.cachedSummaries;
                         }
                       }
-                      if (anyJetboxOk && combinedJetbox) {
-                        lastJetboxSummariesCache[uuid] = combinedJetbox;
-                      }
 
-                      var anyTrajOk = Boolean(cascadeResult.ok || anyJetboxOk);
+                      var anyTrajOk = Boolean(cascadeResult.ok || anyLiveJetboxOk);
                       var finalTrajectories = null;
                       if (anyTrajOk) {
-                        finalTrajectories = compactTrajectorySummaries(
-                          mergeTrajectorySummaryMaps(
-                            combinedJetbox,
-                            cascadeResult.ok ? cascadeResult.trajectories : null
-                          )
+                        var liveMerged = mergeTrajectorySummaryMaps(
+                          liveJetboxMap,
+                          cascadeResult.ok ? cascadeResult.trajectories : null,
+                          true
                         );
+                        var withCachedFallback = cachedJetboxMap
+                          ? mergeTrajectorySummaryMaps(cachedJetboxMap, liveMerged, false)
+                          : liveMerged;
+                        finalTrajectories = compactTrajectorySummaries(withCachedFallback);
                         lastTrajectoryCache[uuid] = finalTrajectories;
                       } else {
                         finalTrajectories = lastTrajectoryCache[uuid] || null;

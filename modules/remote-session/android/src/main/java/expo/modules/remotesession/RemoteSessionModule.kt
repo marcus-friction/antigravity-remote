@@ -500,7 +500,15 @@ class RemoteSessionModule : Module() {
     val container = RemoteViews(context.packageName, R.layout.notification_action_expanded)
     container.removeAllViews(R.id.notif_cards_container)
 
-    val renderedItems = items.take(MAX_RENDERED_NOTIFICATION_CARDS)
+    val hasProjectRows = items
+      .take(MAX_RENDERED_NOTIFICATION_CARDS)
+      .any { it.projectName.isNotEmpty() }
+    val maxCards = if (hasProjectRows && totalCount > MAX_RENDERED_NOTIFICATION_CARDS) {
+      MAX_RENDERED_NOTIFICATION_CARDS_WITH_OVERFLOW
+    } else {
+      MAX_RENDERED_NOTIFICATION_CARDS
+    }
+    val renderedItems = items.take(maxCards)
     renderedItems.forEachIndexed { index, item ->
       val style = resolveActionCardStyle(item.attentionKind)
       val cardView = RemoteViews(context.packageName, R.layout.notification_action_card_item).apply {
@@ -807,6 +815,7 @@ class RemoteSessionModule : Module() {
     private const val ACTION_NOTIFICATION_CARD_BASE_ID = 4210
     private const val MAX_PARSED_NOTIFICATION_CARDS = 4
     private const val MAX_RENDERED_NOTIFICATION_CARDS = 3
+    private const val MAX_RENDERED_NOTIFICATION_CARDS_WITH_OVERFLOW = 2
     private const val CUSTOM_DEEP_LINK_PREFIX = "antigravity-remote://"
     private val ALLOWED_DOCUMENT_START_ORIGINS = setOf(
       "https://antigravity.google.com",

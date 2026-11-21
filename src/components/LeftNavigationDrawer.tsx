@@ -89,6 +89,8 @@ export interface LeftNavigationDrawerProps {
   /** When true (tablet viewports), renders as a docked side-by-side sidebar without a dimming backdrop. */
   docked?: boolean;
   initialMode?: DrawerMode;
+  /** Monotonic counter incremented when a caller explicitly requests switching to `initialMode` (including while docked & already visible). */
+  drawerModeRequestKey?: number;
   focusInboxRequestKey?: number;
   isKeyboardVisible?: boolean;
   keyboardBottomPadding?: number;
@@ -324,6 +326,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   visible,
   docked = false,
   initialMode,
+  drawerModeRequestKey = 0,
   focusInboxRequestKey = 0,
   isKeyboardVisible = false,
   keyboardBottomPadding = 0,
@@ -362,6 +365,8 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   const drawerWidth = computeDrawerWidth(safeWindowWidth, docked);
   const drawerWidthRef = useRef<number>(drawerWidth);
   drawerWidthRef.current = drawerWidth;
+  const dockedRef = useRef<boolean>(docked);
+  dockedRef.current = docked;
 
   const lastPrimaryNavModeRef = useRef<'inbox' | 'projects'>(
     initialMode === 'projects' ? 'projects' : 'inbox',
@@ -646,6 +651,22 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     }
   }, [initialMode, resetTransientInputs, stage, visible]);
 
+  const lastHandledModeRequestKeyRef = useRef<number>(drawerModeRequestKey);
+  useEffect(() => {
+    if (drawerModeRequestKey <= lastHandledModeRequestKeyRef.current) {
+      return;
+    }
+    lastHandledModeRequestKeyRef.current = drawerModeRequestKey;
+    if (!initialMode) {
+      return;
+    }
+    if (initialMode === 'inbox' || initialMode === 'projects') {
+      lastPrimaryNavModeRef.current = initialMode;
+    }
+    setActiveMode(initialMode);
+    setIsMachineMenuOpen(false);
+  }, [drawerModeRequestKey, initialMode]);
+
   useEffect(() => {
     if (focusInboxRequestKey > 0) {
       lastPrimaryNavModeRef.current = 'inbox';
@@ -737,7 +758,9 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   }, [onClose, resetTransientInputs]);
 
   const handleTapOpen = useCallback(() => {
-    Keyboard.dismiss?.();
+    if (!dockedRef.current) {
+      Keyboard.dismiss?.();
+    }
     dismissGuidancePermanently();
     setActiveMode(defaultModeRef.current);
     const startOffset = -drawerWidthRef.current + HANDLE_ALIGNMENT_OFFSET;
@@ -766,7 +789,9 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
       onPanResponderTerminationRequest: () => false,
       onPanResponderGrant: () => {
         if (visibleRef.current) return;
-        Keyboard.dismiss?.();
+        if (!dockedRef.current) {
+          Keyboard.dismiss?.();
+        }
         isDraggingOpenRef.current = true;
         translateX.stopAnimation?.();
         setActiveMode(defaultModeRef.current);
@@ -1079,6 +1104,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
           thread.title.toLowerCase().includes(query) ||
           thread.attentionReason.toLowerCase().includes(query) ||
           thread.instanceName.toLowerCase().includes(query) ||
+          (thread.projectName?.toLowerCase().includes(query) ?? false) ||
           (thread.workspaceName?.toLowerCase().includes(query) ?? false),
       );
       if (groupMatches || matchingThreads.length > 0) {
@@ -1485,7 +1511,6 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     isDraggingOpenRef.current = false;
     setIsDraggingOpen(false);
     onSignOut();
-    onClose();
   };
 
   const accountStatusDotColor =
@@ -3386,7 +3411,9 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                     style={styles.settingActionRow}
                     onPress={() => {
                       onReloadSession();
-                      handleClose();
+                      if (!docked) {
+                        handleClose();
+                      }
                     }}
                     accessibilityRole="button"
                     accessibilityLabel="Reload current page"
@@ -3713,7 +3740,9 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                       onPress={() => {
                         setIsMachineMenuOpen(false);
                         onReloadSession();
-                        handleClose();
+                        if (!docked) {
+                          handleClose();
+                        }
                       }}
                       accessibilityRole="button"
                       accessibilityLabel="Reload workstation page"

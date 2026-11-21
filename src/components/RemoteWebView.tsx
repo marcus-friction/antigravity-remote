@@ -483,6 +483,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const [isAppForeground, setIsAppForeground] =
     useState<boolean>(initialIsForeground);
   const [focusInboxRequestKey, setFocusInboxRequestKey] = useState<number>(0);
+  const [drawerModeRequestKey, setDrawerModeRequestKey] = useState<number>(0);
   const [currentSourceUrl, setCurrentSourceUrl] = useState<string>(
     ANTIGRAVITY_DASHBOARD_URL,
   );
@@ -957,7 +958,10 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       return;
     }
     const route = extractActiveRouteFromUrl(currentNavUrlRef.current);
-    if (isDrawerOpenRef.current && route.cascadeId) {
+    const hasActiveThread = Boolean(
+      inboxSnapshotRef.current.activeCascadeId ?? route.cascadeId,
+    );
+    if (isDrawerOpenRef.current && hasActiveThread) {
       isDrawerOpenRef.current = false;
       setIsDrawerOpen(false);
       recomputeSnapshotWithLocalState({ isDrawerOpen: false });
@@ -1722,6 +1726,9 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         preferredMode ??
         (stageRef.current === 'authenticated' ? 'inbox' : 'settings');
       setDrawerInitialMode(resolvedMode);
+      if (preferredMode) {
+        setDrawerModeRequestKey((prev) => prev + 1);
+      }
       isDrawerOpenRef.current = true;
       setIsDrawerOpen(true);
       recomputeSnapshotWithLocalState({ isDrawerOpen: true });
@@ -2104,6 +2111,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       threads: inboxSnapshot.threads,
       isAppForeground,
       isDrawerOpen: isDrawerBlockingWebView,
+      isDrawerVisible: isDrawerOpen,
       previousOpenThreadIds: previousOpenActionIdsRef.current,
     });
     previousOpenActionIdsRef.current = syncResult.openThreadIds;
@@ -2588,6 +2596,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           visible={isDrawerOpen}
           docked={isTabletLayout}
           initialMode={drawerInitialMode}
+          drawerModeRequestKey={drawerModeRequestKey}
           focusInboxRequestKey={focusInboxRequestKey}
           isKeyboardVisible={isKeyboardVisible}
           keyboardBottomPadding={keyboardBottomPadding}

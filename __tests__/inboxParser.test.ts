@@ -4056,4 +4056,442 @@ describe('inboxParser', () => {
       '🟠 NEEDS APPROVAL · Mac Studio\n📁 Antigravity Remote\nShip tablet layout — Approve command: npm test',
     );
   });
+
+  it('prevents stale cached Jetbox summaries from overriding fresh Cascade state, avoids proto3 transient field leakage, preserves offline backgroundTasks, and keeps partial ReadProjects caches', async () => {
+    const postedToNative: string[] = [];
+    let pollPhase: 'foreground-initial' | 'background-finished' | 'background-offline' | 'foreground-partial-batch' =
+      'foreground-initial';
+
+    const encodeConnectJsonFrame = (flags: number, obj: unknown): Uint8Array => {
+      const jsonBytes = new TextEncoder().encode(JSON.stringify(obj));
+      const frame = new Uint8Array(5 + jsonBytes.length);
+      frame[0] = flags;
+      const len = jsonBytes.length;
+      frame[1] = (len >>> 24) & 255;
+      frame[2] = (len >>> 16) & 255;
+      frame[3] = (len >>> 8) & 255;
+      frame[4] = len & 255;
+      frame.set(jsonBytes, 5);
+      return frame;
+    };
+
+    class MockListInstancesRequest {}
+    class MockProxyCommandRequest {
+      targetUuid = '';
+      rpcPath = '';
+      payload: Uint8Array = new Uint8Array(0);
+      setTargetInstanceUuid(uuid: string) {
+        this.targetUuid = uuid;
+      }
+      setRpcPath(path: string) {
+        this.rpcPath = path;
+      }
+      setPayload(bytes: Uint8Array) {
+        this.payload = bytes;
+      }
+      putHeaders() {}
+    }
+
+    const totalIds = Array.from({ length: 70 }, (_, idx) =>
+      idx === 0 ? 'proj-alpha' : `proj-batch-${idx}`,
+    );
+
+    class MockApiServicePromiseClient {
+      listInstances() {
+        return Promise.resolve({
+          getInstancesList: () => [
+            {
+              getUuid: () => 'box-sync',
+              getStatus: () => 1,
+              getMetadata: () => ({
+                getName: () => 'Dev Box',
+                getVersion: () => '2.2.0',
+              }),
+              getStatusLastUpdatedAt: () => ({ getSeconds: () => 1774000000 }),
+            },
+          ],
+        });
+      }
+
+      proxyCommand(req: MockProxyCommandRequest) {
+        if (pollPhase === 'background-offline') {
+          return Promise.reject(new Error('Workstation unreachable'));
+        }
+        let body: Record<string, unknown> = {};
+        if (req.rpcPath.endsWith('/GetAllCascadeTrajectories')) {
+          if (pollPhase === 'foreground-initial') {
+            body = {
+              trajectorySummaries: {
+                'chat-finishing': {
+                  summary: 'Ship Release',
+                  status: 'CASCADE_RUN_STATUS_WAITING_FOR_USER',
+                  notFullyIdle: true,
+                  hasRunningSubagents: true,
+                  waitingSteps: [{ step: { runCommand: { commandLine: 'npm test' } } }],
+                  annotations: { markedAsUnread: true, title: 'Ship Release' },
+                  stepCount: 8,
+                  lastModifiedTime: '2026-11-21T08:00:00Z',
+                },
+                'chat-bg-task': {
+                  summary: 'Build artifacts',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  stepCount: 5,
+                  lastModifiedTime: '2026-11-21T08:00:00Z',
+                },
+              },
+            };
+          } else {
+            // Live Cascade reports `chat-finishing` has finished & been read; proto3 omits
+            // cleared waitingSteps, notFullyIdle, hasRunningSubagents, and markedAsUnread.
+            body = {
+              trajectorySummaries: {
+                'chat-finishing': {
+                  summary: 'Ship Release',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  stepCount: 12,
+                  lastModifiedTime: '2026-11-21T08:05:00Z',
+                  annotations: { lastUserViewTime: '2026-11-21T08:05:01Z' },
+                },
+                'chat-bg-task': {
+                  summary: 'Build artifacts',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  stepCount: 5,
+                  lastModifiedTime: '2026-11-21T08:00:00Z',
+                },
+              },
+            };
+          }
+        } else if (req.rpcPath.endsWith('/ListBackgroundTasks')) {
+          body = {
+            tasks: [
+              {
+                conversationId: 'chat-bg-task',
+                task: {
+                  taskId: 'bg-1',
+                  toolSummary: 'Gradle assembleRelease',
+                  isDaemon: false,
+                },
+              },
+            ],
+          };
+        } else if (req.rpcPath.endsWith('/ListProjects')) {
+          body = { projectIds: totalIds };
+        } else if (req.rpcPath.endsWith('/ReadProjects')) {
+          const parsedReq = JSON.parse(new TextDecoder().decode(req.payload));
+          const batchIds: string[] = Array.isArray(parsedReq.ids) ? parsedReq.ids : [];
+          if (pollPhase === 'foreground-partial-batch' && batchIds.includes('proj-batch-69')) {
+            return Promise.reject(new Error('Second ReadProjects batch timed out'));
+          }
+          body = {
+            projects: batchIds.map((id) => ({
+              id,
+              name: id === 'proj-alpha' ? 'Alpha' : id,
+              projectResources: {
+                resources: [{ folderUri: `file:///home/marcus/projects/${id}` }],
+              },
+            })),
+          };
+        } else if (req.rpcPath.endsWith('/GetWorkspaceInfos')) {
+          body = { workspaceInfos: [] };
+        }
+        return Promise.resolve({
+          getPayload_asU8: () => new TextEncoder().encode(JSON.stringify(body)),
+        });
+      }
+
+      streamProxyCommand() {
+        const handlers: Record<string, Array<(arg?: any) => void>> = {
+          data: [],
+          end: [],
+          error: [],
+        };
+        const stream = {
+          on(event: string, cb: (arg?: any) => void) {
+            if (handlers[event]) handlers[event].push(cb);
+            return stream;
+          },
+          cancel() {},
+        };
+        const frame = encodeConnectJsonFrame(0, {
+          updates: {
+            'chat-finishing': {
+              summary: 'Ship Release',
+              status: 'CASCADE_RUN_STATUS_WAITING_FOR_USER',
+              notFullyIdle: true,
+              hasRunningSubagents: true,
+              waitingSteps: [{ step: { runCommand: { commandLine: 'npm test' } } }],
+              annotations: { markedAsUnread: true, title: 'Ship Release Custom Title' },
+              stepCount: 8,
+              lastModifiedTime: '2026-11-21T08:00:00Z',
+              trajectoryMetadata: { projectId: 'proj-alpha' },
+            },
+            'chat-historical': {
+              summary: 'Older Jetbox chat',
+              status: 'CASCADE_RUN_STATUS_IDLE',
+              stepCount: 4,
+              lastModifiedTime: '2026-11-20T08:00:00Z',
+              trajectoryMetadata: { projectId: 'proj-alpha' },
+            },
+          },
+        });
+        const trailer = encodeConnectJsonFrame(2, {});
+        Promise.resolve().then(() => {
+          for (const cb of handlers.data) {
+            cb({ getPayload_asU8: () => frame });
+            cb({ getPayload_asU8: () => trailer });
+          }
+        });
+        return stream;
+      }
+    }
+
+    const sandboxWindow: any = {
+      location: {
+        hostname: 'antigravity.google.com',
+        origin: 'https://antigravity.google.com',
+        pathname: '/r/box-sync',
+        search: '',
+        href: 'https://antigravity.google.com/r/box-sync',
+      },
+      history: { state: null, replaceState: () => {} },
+      navigator: { onLine: true },
+      document: {
+        cookie: 'SAPISID=test',
+        visibilityState: 'visible',
+        querySelectorAll: () => [],
+      },
+      default_GoogleAntigravity: {
+        K: {
+          devtools_jetski_boq_api_proto: {
+            ApiServicePromiseClient: MockApiServicePromiseClient,
+            ListInstancesRequest: MockListInstancesRequest,
+            ProxyCommandRequest: MockProxyCommandRequest,
+          },
+        },
+        pj: {
+          auth_firstparty: {
+            getAuthHeaderValueForFirstParty: () => 'SAPISIDHASH 1_a',
+          },
+        },
+      },
+      ReactNativeWebView: {
+        postMessage: (raw: string) => postedToNative.push(raw),
+      },
+      addEventListener: () => {},
+      TextEncoder,
+      TextDecoder,
+      URL,
+      URLSearchParams,
+      setTimeout: (fn: (...a: any[]) => void, ms?: number) => {
+        const t = setTimeout(fn, ms);
+        (t as { unref?: () => void }).unref?.();
+        return t;
+      },
+      clearTimeout,
+      setInterval: () => 1,
+      clearInterval: () => {},
+    };
+    sandboxWindow.window = sandboxWindow;
+
+    const context = vm.createContext(sandboxWindow);
+    vm.runInContext(INBOX_BRIDGE_SCRIPT, context);
+
+    // 1. Initial foreground poll populates Jetbox cache, backgroundTasks cache, and 70 projects
+    await sandboxWindow.__agyInboxBridge.refresh(false);
+    const snap1Msg = parseInboxBridgeMessage(postedToNative.pop()!);
+    expect(snap1Msg?.type).toBe('AGY_INBOX_SNAPSHOT');
+    if (snap1Msg?.type !== 'AGY_INBOX_SNAPSHOT') return;
+    expect(snap1Msg.instances[0].projects).toHaveLength(70);
+
+    // 2. Hidden background poll: live Cascade reports `chat-finishing` is IDLE & viewed.
+    //    Stale cached Jetbox MUST NOT override live Cascade or leak waitingSteps/notFullyIdle/markedAsUnread,
+    //    while structural projectId, custom annotation title, and historical chats are still preserved.
+    pollPhase = 'background-finished';
+    sandboxWindow.document.visibilityState = 'hidden';
+    await sandboxWindow.__agyInboxBridge.refresh(false);
+    const snap2Msg = parseInboxBridgeMessage(postedToNative.pop()!);
+    expect(snap2Msg?.type).toBe('AGY_INBOX_SNAPSHOT');
+    if (snap2Msg?.type !== 'AGY_INBOX_SNAPSHOT') return;
+    const rawFinished = (snap2Msg.instances[0].trajectories as any)['chat-finishing'];
+    expect(rawFinished.status).toBe('CASCADE_RUN_STATUS_IDLE');
+    expect(rawFinished.waitingSteps).toBeUndefined();
+    expect(rawFinished.notFullyIdle).toBeUndefined();
+    expect(rawFinished.hasRunningSubagents).toBeUndefined();
+    expect(rawFinished.annotations?.markedAsUnread).toBeUndefined();
+    expect(rawFinished.annotations?.title).toBe('Ship Release Custom Title');
+    expect(rawFinished.trajectoryMetadata?.projectId).toBe('proj-alpha');
+    expect((snap2Msg.instances[0].trajectories as any)['chat-historical']).toBeDefined();
+
+    // 3. Hidden background poll while workstation is unreachable:
+    //    Cached Jetbox must NOT report `ok: true`, so `backgroundTasks` fallback is preserved
+    //    (preventing false FINISHED alerts) and error is surfaced.
+    pollPhase = 'background-offline';
+    await sandboxWindow.__agyInboxBridge.refresh(false);
+    const snap3Msg = parseInboxBridgeMessage(postedToNative.pop()!);
+    expect(snap3Msg?.type).toBe('AGY_INBOX_SNAPSHOT');
+    if (snap3Msg?.type !== 'AGY_INBOX_SNAPSHOT') return;
+    expect(snap3Msg.instances[0].error).toBe('Workstation unreachable');
+    expect(snap3Msg.instances[0].backgroundTasks).toHaveLength(1);
+    const offlineSnap = buildInboxSnapshot(snap3Msg);
+    expect(offlineSnap.threads.find((t) => t.cascadeId === 'chat-bg-task')).toMatchObject({
+      attentionKind: 'running',
+      needsAttention: false,
+    });
+
+    // 4. Foreground poll where second ReadProjects batch fails:
+    //    Previously cached projects from the failed batch (proj-batch-69) are preserved!
+    pollPhase = 'foreground-partial-batch';
+    sandboxWindow.document.visibilityState = 'visible';
+    await sandboxWindow.__agyInboxBridge.refresh(false);
+    sandboxWindow.__agyInboxBridge.stop();
+    const snap4Msg = parseInboxBridgeMessage(postedToNative.pop()!);
+    expect(snap4Msg?.type).toBe('AGY_INBOX_SNAPSHOT');
+    if (snap4Msg?.type !== 'AGY_INBOX_SNAPSHOT') return;
+    expect(snap4Msg.instances[0].projects).toHaveLength(70);
+    expect(
+      snap4Msg.instances[0].projects?.some((p: any) => p.id === 'proj-batch-69'),
+    ).toBe(true);
+  });
+
+  it('respects tiered archived project matching, Dev Container vscode-remote URIs, Unicode slugs, and tablet foreground notification muting', () => {
+    const rawMsg = parseInboxBridgeMessage(
+      JSON.stringify({
+        type: 'AGY_INBOX_SNAPSHOT',
+        fetchedAtMs: 1_774_000_000_000,
+        activeUrl: 'https://antigravity.google.com/r/dev-box?p=c%2Fchat-active',
+        activeInstanceUuid: 'dev-box',
+        activeCascadeId: 'chat-active',
+        instances: [
+          {
+            uuid: 'dev-box',
+            name: 'Workstation',
+            status: 1,
+            projects: [
+              {
+                id: 'proj-monorepo',
+                name: 'Monorepo',
+                projectResources: {
+                  resources: [{ folderUri: 'file:///home/marcus/monorepo' }],
+                },
+              },
+              {
+                id: 'proj-archived-legacy',
+                name: 'Legacy Archived Service',
+                archived: true,
+                projectResources: {
+                  resources: [{ folderUri: 'file:///home/marcus/monorepo/legacy' }],
+                },
+              },
+              {
+                id: 'proj-devcontainer',
+                name: 'Container App',
+                projectResources: {
+                  resources: [{ folderUri: 'file:///workspaces/app' }],
+                },
+              },
+              {
+                id: 'proj-jp-1',
+                name: 'プロジェクト-v2',
+                projectResources: {
+                  resources: [{ folderUri: 'file:///home/marcus/jp-a' }],
+                },
+              },
+              {
+                id: 'proj-jp-2',
+                name: 'テスト-v2',
+                projectResources: {
+                  resources: [{ folderUri: 'file:///home/marcus/jp-b' }],
+                },
+              },
+            ],
+            trajectories: {
+              trajectorySummaries: {
+                'chat-active': {
+                  summary: 'Active foreground prompt',
+                  status: 'CASCADE_RUN_STATUS_WAITING_FOR_USER',
+                  waitingSteps: [{ step: { runCommand: { commandLine: 'echo hi' } } }],
+                  trajectoryMetadata: { projectId: 'proj-monorepo' },
+                },
+                'chat-archived': {
+                  summary: 'Archived subproject chat',
+                  status: 'CASCADE_RUN_STATUS_WAITING_FOR_USER',
+                  waitingSteps: [{ step: { runCommand: { commandLine: 'echo old' } } }],
+                  trajectoryMetadata: { projectId: 'proj-archived-legacy' },
+                  workspaces: [
+                    { workspaceFolderAbsoluteUri: 'file:///home/marcus/monorepo/legacy' },
+                  ],
+                },
+                'chat-devcontainer': {
+                  summary: 'Dev container fix',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  workspaces: [
+                    {
+                      workspaceFolderAbsoluteUri:
+                        'vscode-remote://dev-container%2B%7B%22hostPath%22%3A%22%2Fhome%2Fuser%2Fapp%22%7D/workspaces/app',
+                    },
+                  ],
+                },
+                'chat-jp': {
+                  summary: 'Japanese workspace task',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  workspaces: [
+                    { workspaceFolderAbsoluteUri: 'file:///home/marcus/other/テスト-v2' },
+                  ],
+                },
+              },
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(rawMsg?.type).toBe('AGY_INBOX_SNAPSHOT');
+    if (rawMsg?.type !== 'AGY_INBOX_SNAPSHOT') return;
+
+    const snapshot = buildInboxSnapshot(rawMsg);
+    const byId = (id: string) => snapshot.threads.find((t) => t.cascadeId === id)!;
+
+    // 1. Exact archived projectId beats active ancestor workspace match, and fallback Project group keeps its resolved name
+    expect(byId('chat-archived').projectName).toBe('Legacy Archived Service');
+    const groups = buildProjectGroups(snapshot);
+    const archivedFallbackGroup = groups.find(
+      (g) => g.projectId === 'proj-archived-legacy',
+    );
+    expect(archivedFallbackGroup?.name).toBe('Legacy Archived Service');
+
+    // 2. Dev Container vscode-remote URI with percent-encoded slashes in authority matches `/workspaces/app`
+    expect(byId('chat-devcontainer').projectName).toBe('Container App');
+    expect(byId('chat-devcontainer').projectId).toBe('proj-devcontainer');
+
+    // 3. Non-ASCII Unicode slugs preserve full script so `テスト-v2` matches ONLY `proj-jp-2` (never colliding with `プロジェクト-v2`)
+    expect(byId('chat-jp').projectName).toBe('テスト-v2');
+    expect(byId('chat-jp').projectId).toBe('proj-jp-2');
+
+    // 4. Docked tablet foreground notification: WebView is NOT occluded (`isDrawerOpen: false`),
+    //    so active thread is suppressed, while `isDrawerVisible: true` suppresses heads-up chiming over the open Inbox!
+    const dockedNotif = buildActionNotificationSyncState({
+      stage: 'authenticated',
+      mode: 'all_attention',
+      threads: snapshot.threads,
+      isAppForeground: true,
+      isDrawerOpen: false,
+      isDrawerVisible: true,
+      previousOpenThreadIds: new Set(),
+    });
+    expect(dockedNotif.notification?.count).toBe(1);
+    expect(dockedNotif.notification?.items?.[0].id).toBe('dev-box:chat-archived');
+    expect(dockedNotif.notification?.shouldAlert).toBe(false);
+
+    // When the user collapses the docked tablet sidebar (`isDrawerVisible: false`), background actions DO alert!
+    const collapsedTabletNotif = buildActionNotificationSyncState({
+      stage: 'authenticated',
+      mode: 'all_attention',
+      threads: snapshot.threads,
+      isAppForeground: true,
+      isDrawerOpen: false,
+      isDrawerVisible: false,
+      previousOpenThreadIds: new Set(),
+    });
+    expect(collapsedTabletNotif.notification?.shouldAlert).toBe(true);
+  });
 });

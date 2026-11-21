@@ -108,8 +108,9 @@
                     android:layout_marginStart="3.5dp"
                     android:ellipsize="end"
                     android:includeFontPadding="false"
-                    android:maxEms="12"
+                    android:maxEms="9"
                     android:maxLines="1"
+                    android:maxWidth="112dp"
                     android:textColor="#BCBDC6"
                     android:textSize="10.5sp"
                     android:textStyle="bold" />

@@ -52,22 +52,23 @@ function normalizeWorkspaceUriKey(uri: string | null | undefined): string | null
   if (!uri || typeof uri !== 'string') return null;
   let value = uri.trim();
   if (!value) return null;
-  try {
-    value = decodeURIComponent(value);
-  } catch {
-    // Keep original string if malformed percent-escape is present.
-  }
-  value = value.replace(/\\/g, '/');
 
-  // Normalize Antigravity / VS Code local & remote file URIs and bare paths to a single
-  // canonical lowercase POSIX-style path so `file:///home/a`, `file://localhost/home/a`,
-  // `vscode-remote://ssh-remote+box/home/a`, `/home/a`, `file:///C%3A/a`, and `C:\a` all match.
+  // Strip URI scheme/authority BEFORE percent-decoding so percent-encoded slashes
+  // inside Dev Container authorities (`vscode-remote://dev-container%2B...%2F.../workspaces/app`)
+  // do not split the authority mid-host.
   const vscodeRemoteMatch = /^vscode-remote:\/\/[^/]+(\/.*)$/i.exec(value);
   if (vscodeRemoteMatch) {
     value = vscodeRemoteMatch[1];
   } else if (/^file:\/\//i.test(value)) {
     value = value.replace(/^file:\/\/(?:localhost)?/i, '');
   }
+
+  try {
+    value = decodeURIComponent(value);
+  } catch {
+    // Keep original string if malformed percent-escape is present.
+  }
+  value = value.replace(/\\/g, '/');
 
   if (/^[a-zA-Z]:\//.test(value)) {
     value = `/${value}`;
@@ -90,7 +91,7 @@ function normalizeProjectSlugKey(name: string | null | undefined): string | null
   const slug = name
     .trim()
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '');
+    .replace(/[^\p{L}\p{N}]+/gu, '');
   return slug.length >= 2 ? slug : null;
 }
 
@@ -2630,8 +2631,12 @@ export function buildInboxSnapshot(
       const instBucket = projectsByInstance.get(thread.instanceUuid);
       const lookupIds = new Set<string>([thread.cascadeId, thread.trajectoryId]);
       const matchedServerProject = instBucket
-        ? (matchServerProjectForThread(thread, instBucket.nonArchived, lookupIds) ??
-          matchServerProjectForThread(thread, instBucket.archived, lookupIds))
+        ? matchServerProjectForThreadTiered(
+            thread,
+            instBucket.nonArchived,
+            instBucket.archived,
+            lookupIds,
+          )
         : undefined;
       if (matchedServerProject) {
         thread.projectName = truncateText(matchedServerProject.name, 72);
@@ -3024,10 +3029,16 @@ export function buildProjectGroups(
   };
 
   // 1. Seed all non-archived server projects FIRST so projects with zero recent
-  //    activity are always listed in the Projects tab.
+  //    activity are always listed in the Projects tab. Track archived project IDs
+  //    so threads explicitly tied to an archived project are never misattributed
+  //    to an unrelated active project via workspace/ancestor/name heuristics.
+  const archivedProjectKeys = new Set<string>();
   const serverProjects = snapshot.projects ?? [];
   for (const proj of serverProjects) {
     if (proj.archived) {
+      if (proj.projectId) {
+        archivedProjectKeys.add(`${proj.instanceUuid}:${proj.projectId}`);
+      }
       continue;
     }
     instancesWithProjectsOrThreads.add(proj.instanceUuid);
@@ -3093,17 +3104,21 @@ export function buildProjectGroups(
     }
 
     let group: InboxProjectGroup | undefined;
+    const isExplicitArchivedProject = Boolean(
+      thread.projectId &&
+        archivedProjectKeys.has(`${thread.instanceUuid}:${thread.projectId}`),
+    );
     if (thread.projectId) {
       group = groupByProjectId.get(`${thread.instanceUuid}:${thread.projectId}`);
     }
-    if (!group) {
+    if (!group && !isExplicitArchivedProject) {
       group =
         groupByConversationId.get(`${thread.instanceUuid}:${thread.cascadeId}`) ??
         groupByConversationId.get(
           `${thread.instanceUuid}:${thread.trajectoryId}`,
         );
     }
-    if (!group && threadUriKeys.length > 0) {
+    if (!group && !isExplicitArchivedProject && threadUriKeys.length > 0) {
       for (const uriKey of threadUriKeys) {
         const exactMatch = groupByWorkspaceUri.get(
           `${thread.instanceUuid}:${uriKey}`,
@@ -3114,13 +3129,13 @@ export function buildProjectGroups(
         }
       }
     }
-    if (!group && threadUriKeys.length > 0) {
+    if (!group && !isExplicitArchivedProject && threadUriKeys.length > 0) {
       group = findDeepestAncestorProjectGroup(
         thread.instanceUuid,
         threadUriKeys,
       );
     }
-    if (!group) {
+    if (!group && !isExplicitArchivedProject) {
       const candidateNames: string[] = [];
       if (thread.workspaceName && thread.workspaceName.trim()) {
         candidateNames.push(thread.workspaceName.trim());
@@ -3169,6 +3184,7 @@ export function buildProjectGroups(
       group = groupsByKey.get(groupKey);
       if (!group) {
         const displayName =
+          thread.projectName ??
           thread.workspaceName ??
           (thread.source === 'cloud' ? 'Cloud Agent' : thread.instanceName);
         group = {
@@ -3332,28 +3348,44 @@ export function resolveThreadProjectName(
   return fromUri ? truncateText(fromUri, 72) : null;
 }
 
-function matchServerProjectForThread(
+function matchServerProjectForThreadTiered(
   resolvedThread: InboxThreadItem | undefined,
-  projects: readonly InboxServerProject[],
+  nonArchivedProjects: readonly InboxServerProject[],
+  archivedProjects: readonly InboxServerProject[],
   lookupIds: ReadonlySet<string>,
 ): InboxServerProject | undefined {
-  if (projects.length === 0) {
+  if (nonArchivedProjects.length === 0 && archivedProjects.length === 0) {
     return undefined;
   }
+
+  const orderedPools: readonly (readonly InboxServerProject[])[] = [
+    nonArchivedProjects,
+    archivedProjects,
+  ];
+
+  // Tier 1: Exact projectId match (prefers active over archived, but exact archived
+  // projectId always beats weak workspace/name heuristics on active projects).
   if (resolvedThread?.projectId) {
-    const byProjectId = projects.find(
-      (proj) => proj.projectId === resolvedThread.projectId,
-    );
-    if (byProjectId) {
-      return byProjectId;
+    for (const pool of orderedPools) {
+      const byProjectId = pool.find(
+        (proj) => proj.projectId === resolvedThread.projectId,
+      );
+      if (byProjectId) {
+        return byProjectId;
+      }
     }
   }
-  const byConversationId = projects.find((proj) =>
-    proj.conversationIds.some((cid) => lookupIds.has(cid)),
-  );
-  if (byConversationId) {
-    return byConversationId;
+
+  // Tier 2: Explicit conversationIds membership.
+  for (const pool of orderedPools) {
+    const byConversationId = pool.find((proj) =>
+      proj.conversationIds.some((cid) => lookupIds.has(cid)),
+    );
+    if (byConversationId) {
+      return byConversationId;
+    }
   }
+
   const threadUriKeys: string[] = [];
   const candidateThreadUris =
     resolvedThread?.workspaceUris && resolvedThread.workspaceUris.length > 0
@@ -3367,52 +3399,61 @@ function matchServerProjectForThread(
       threadUriKeys.push(key);
     }
   }
+
+  // Tier 3: Exact canonical workspace URI match.
   if (threadUriKeys.length > 0) {
-    for (const targetUriKey of threadUriKeys) {
-      const byWorkspaceUri = projects.find((proj) =>
-        proj.workspaceUris.some(
-          (uri) => normalizeWorkspaceUriKey(uri) === targetUriKey,
-        ),
-      );
-      if (byWorkspaceUri) {
-        return byWorkspaceUri;
+    for (const pool of orderedPools) {
+      for (const targetUriKey of threadUriKeys) {
+        const byWorkspaceUri = pool.find((proj) =>
+          proj.workspaceUris.some(
+            (uri) => normalizeWorkspaceUriKey(uri) === targetUriKey,
+          ),
+        );
+        if (byWorkspaceUri) {
+          return byWorkspaceUri;
+        }
       }
     }
-    let bestLength = 0;
-    let bestMatches: InboxServerProject[] = [];
-    for (const targetUriKey of threadUriKeys) {
-      if (!targetUriKey.startsWith('/')) continue;
-      for (const proj of projects) {
-        for (const uri of proj.workspaceUris) {
-          const projKey = normalizeWorkspaceUriKey(uri);
-          if (
-            !projKey ||
-            !projKey.startsWith('/') ||
-            getCanonicalPathSegmentCount(projKey) < 2
-          ) {
-            continue;
-          }
-          if (
-            targetUriKey.length > projKey.length &&
-            targetUriKey.startsWith(`${projKey}/`)
-          ) {
-            if (projKey.length > bestLength) {
-              bestLength = projKey.length;
-              bestMatches = [proj];
-            } else if (
-              projKey.length === bestLength &&
-              !bestMatches.includes(proj)
+
+    // Tier 4: Deepest unambiguous ancestor workspace URI match.
+    for (const pool of orderedPools) {
+      let bestLength = 0;
+      let bestMatches: InboxServerProject[] = [];
+      for (const targetUriKey of threadUriKeys) {
+        if (!targetUriKey.startsWith('/')) continue;
+        for (const proj of pool) {
+          for (const uri of proj.workspaceUris) {
+            const projKey = normalizeWorkspaceUriKey(uri);
+            if (
+              !projKey ||
+              !projKey.startsWith('/') ||
+              getCanonicalPathSegmentCount(projKey) < 2
             ) {
-              bestMatches.push(proj);
+              continue;
+            }
+            if (
+              targetUriKey.length > projKey.length &&
+              targetUriKey.startsWith(`${projKey}/`)
+            ) {
+              if (projKey.length > bestLength) {
+                bestLength = projKey.length;
+                bestMatches = [proj];
+              } else if (
+                projKey.length === bestLength &&
+                !bestMatches.includes(proj)
+              ) {
+                bestMatches.push(proj);
+              }
             }
           }
         }
       }
-    }
-    if (bestMatches.length === 1) {
-      return bestMatches[0];
+      if (bestMatches.length === 1) {
+        return bestMatches[0];
+      }
     }
   }
+
   const candidateNames: string[] = [];
   if (resolvedThread?.workspaceName && resolvedThread.workspaceName.trim()) {
     candidateNames.push(resolvedThread.workspaceName.trim());
@@ -3423,37 +3464,46 @@ function matchServerProjectForThread(
       candidateNames.push(seg);
     }
   }
-  for (const candName of candidateNames) {
-    const targetName = candName.toLowerCase();
-    const nameMatches = projects.filter((proj) => {
-      if (proj.name.trim().toLowerCase() === targetName) {
-        return true;
-      }
-      return proj.workspaceUris.some((uri) => {
-        const seg = extractLastSegmentFromUri(uri);
-        return seg ? seg.trim().toLowerCase() === targetName : false;
+
+  // Tier 5: Unambiguous exact project name or workspace folder basename match.
+  for (const pool of orderedPools) {
+    for (const candName of candidateNames) {
+      const targetName = candName.toLowerCase();
+      const nameMatches = pool.filter((proj) => {
+        if (proj.name.trim().toLowerCase() === targetName) {
+          return true;
+        }
+        return proj.workspaceUris.some((uri) => {
+          const seg = extractLastSegmentFromUri(uri);
+          return seg ? seg.trim().toLowerCase() === targetName : false;
+        });
       });
-    });
-    if (nameMatches.length === 1) {
-      return nameMatches[0];
+      if (nameMatches.length === 1) {
+        return nameMatches[0];
+      }
     }
   }
-  for (const candName of candidateNames) {
-    const targetSlug = normalizeProjectSlugKey(candName);
-    if (!targetSlug) continue;
-    const slugMatches = projects.filter((proj) => {
-      if (normalizeProjectSlugKey(proj.name) === targetSlug) {
-        return true;
-      }
-      return proj.workspaceUris.some((uri) => {
-        const seg = extractLastSegmentFromUri(uri);
-        return seg ? normalizeProjectSlugKey(seg) === targetSlug : false;
+
+  // Tier 6: Unambiguous Unicode-aware normalized slug match.
+  for (const pool of orderedPools) {
+    for (const candName of candidateNames) {
+      const targetSlug = normalizeProjectSlugKey(candName);
+      if (!targetSlug) continue;
+      const slugMatches = pool.filter((proj) => {
+        if (normalizeProjectSlugKey(proj.name) === targetSlug) {
+          return true;
+        }
+        return proj.workspaceUris.some((uri) => {
+          const seg = extractLastSegmentFromUri(uri);
+          return seg ? normalizeProjectSlugKey(seg) === targetSlug : false;
+        });
       });
-    });
-    if (slugMatches.length === 1) {
-      return slugMatches[0];
+      if (slugMatches.length === 1) {
+        return slugMatches[0];
+      }
     }
   }
+
   return undefined;
 }
 
@@ -3523,9 +3573,12 @@ export function resolveActiveThreadProject(
   const nonArchivedProjects = instanceProjects.filter((proj) => !proj.archived);
   const archivedProjects = instanceProjects.filter((proj) => proj.archived);
 
-  let matchedServerProject =
-    matchServerProjectForThread(resolvedThread, nonArchivedProjects, lookupIds) ??
-    matchServerProjectForThread(resolvedThread, archivedProjects, lookupIds);
+  let matchedServerProject = matchServerProjectForThreadTiered(
+    resolvedThread,
+    nonArchivedProjects,
+    archivedProjects,
+    lookupIds,
+  );
 
   if (!matchedServerProject && options?.activeUrl) {
     const urlProjectId = extractProjectIdFromUrl(options.activeUrl);
