@@ -102,9 +102,13 @@ function checkNative(root, options = {}) {
       `Play Store feature graphic must be 1024x500 (found ${featureDim.width}x${featureDim.height})`,
     );
 
+    assert(
+      !fs.existsSync(path.join(graphicsDir, 'seven-inch-tablet-screenshots')),
+      'Use tablet-screenshots/ (not seven-inch-tablet-screenshots/) for Gradle Play Publisher 7-inch tablet uploads',
+    );
     for (const [folder, minCount, expectedMinSide] of [
       ['phone-screenshots', 2, 1080],
-      ['seven-inch-tablet-screenshots', 2, 1080],
+      ['tablet-screenshots', 2, 1080],
       ['large-tablet-screenshots', 2, 1080],
     ]) {
       const dirPath = path.join(graphicsDir, folder);

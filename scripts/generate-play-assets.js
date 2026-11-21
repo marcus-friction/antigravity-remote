@@ -8,8 +8,8 @@
  *   - icon/play-icon-512.png                      (512x512)
  *   - feature-graphic/feature-graphic-1024x500.png (1024x500)
  *   - phone-screenshots/1.png .. 6.png            (1080x1920)
- *   - seven-inch-tablet-screenshots/1.png .. 3.png (1728x1080)
- *   - large-tablet-screenshots/1.png .. 3.png     (1920x1200)
+ *   - tablet-screenshots/1.png .. 3.png           (1728x1080, 7-inch tablet)
+ *   - large-tablet-screenshots/1.png .. 3.png     (1920x1200, 10-inch tablet)
  */
 'use strict';
 
@@ -2099,7 +2099,7 @@ function buildAssetSpecs() {
       ),
     },
     {
-      relPath: 'seven-inch-tablet-screenshots/1.png',
+      relPath: 'tablet-screenshots/1.png',
       width: 1728,
       height: 1080,
       html: tabletShell(
@@ -2110,7 +2110,7 @@ function buildAssetSpecs() {
       ),
     },
     {
-      relPath: 'seven-inch-tablet-screenshots/2.png',
+      relPath: 'tablet-screenshots/2.png',
       width: 1728,
       height: 1080,
       html: tabletShell(
@@ -2121,7 +2121,7 @@ function buildAssetSpecs() {
       ),
     },
     {
-      relPath: 'seven-inch-tablet-screenshots/3.png',
+      relPath: 'tablet-screenshots/3.png',
       width: 1728,
       height: 1080,
       html: tabletShell(
