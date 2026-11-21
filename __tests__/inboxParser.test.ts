@@ -20,8 +20,11 @@ import {
   extractActiveRouteFromUrl,
   extractProjectIdFromUrl,
   extractWorkspaceName,
+  extractWorkspaceSubPathFromUrl,
   extractWorkspaceUri,
   formatRelativeTime,
+  isEmptyWorkspaceRoute,
+  isTrajectoryMarkedArchivedInMessage,
   parseInboxBridgeMessage,
   parseProtoTimestampMs,
   reconcileRunningThreadTransitions,
@@ -4494,4 +4497,309 @@ describe('inboxParser', () => {
     });
     expect(collapsedTabletNotif.notification?.shouldAlert).toBe(true);
   });
+
+  it('classifies empty workspace routes, parses AGY_INBOX_EMPTY_SCREEN, detects archived active trajectories, and forwards iframe empty-screen signals securely', async () => {
+    // 1. Sub-path extraction & empty workspace route classification
+    expect(
+      extractWorkspaceSubPathFromUrl('https://antigravity.google.com/r/box-1'),
+    ).toBe('/');
+    expect(
+      extractWorkspaceSubPathFromUrl(
+        'https://antigravity.google.com/u/2/r/box-1?p=%2F%3Fproject%3Dp1',
+      ),
+    ).toBe('/');
+    expect(
+      extractWorkspaceSubPathFromUrl(
+        'https://antigravity.google.com/r/box-1?p=c%2Fthread-1',
+      ),
+    ).toBe('/c/thread-1');
+    expect(
+      extractWorkspaceSubPathFromUrl(
+        'https://antigravity.google.com/r/box-1?p=battle%2F99',
+      ),
+    ).toBe('/battle/99');
+    expect(
+      extractWorkspaceSubPathFromUrl('https://antigravity.google.com/remote/'),
+    ).toBe('/');
+    expect(
+      extractWorkspaceSubPathFromUrl(
+        'https://antigravity.google.com/u/1/remote/history',
+      ),
+    ).toBe('/history');
+    expect(
+      extractWorkspaceSubPathFromUrl('https://antigravity.google.com/'),
+    ).toBeNull();
+
+    expect(
+      isEmptyWorkspaceRoute({
+        activeUrl: 'https://antigravity.google.com/r/box-1',
+        activeInstanceUuid: 'box-1',
+        activeCascadeId: null,
+      }),
+    ).toBe(true);
+    expect(
+      isEmptyWorkspaceRoute({
+        activeUrl: 'https://antigravity.google.com/r/box-1?p=c%2Fstale-thread',
+        activeInstanceUuid: 'box-1',
+        activeCascadeId: null,
+      }),
+    ).toBe(true);
+    expect(
+      isEmptyWorkspaceRoute({
+        activeUrl: 'https://antigravity.google.com/remote',
+        activeInstanceUuid: '__cloud__',
+        activeCascadeId: null,
+      }),
+    ).toBe(true);
+    expect(
+      isEmptyWorkspaceRoute({
+        activeUrl: 'https://antigravity.google.com/r/box-1?p=c%2Fthread-1',
+        activeInstanceUuid: 'box-1',
+        activeCascadeId: 'thread-1',
+      }),
+    ).toBe(false);
+    expect(
+      isEmptyWorkspaceRoute({
+        activeUrl: 'https://antigravity.google.com/r/box-1?p=battle%2F99',
+        activeInstanceUuid: 'box-1',
+        activeCascadeId: null,
+      }),
+    ).toBe(false);
+    expect(
+      isEmptyWorkspaceRoute({
+        activeUrl: 'https://antigravity.google.com/r/box-1',
+        activeInstanceUuid: 'box-1',
+        activeCascadeId: null,
+        isEmptyRouteHint: false,
+      }),
+    ).toBe(false);
+    expect(
+      isEmptyWorkspaceRoute({
+        activeUrl: 'https://antigravity.google.com/',
+        activeInstanceUuid: null,
+        activeCascadeId: null,
+      }),
+    ).toBe(false);
+
+    // 2. Parsing AGY_INBOX_EMPTY_SCREEN and AGY_INBOX_ACTIVE_ROUTE with isEmptyRoute
+    expect(
+      parseInboxBridgeMessage(
+        JSON.stringify({
+          type: 'AGY_INBOX_EMPTY_SCREEN',
+          reason: 'route_overview',
+          activeUrl: 'https://antigravity.google.com/r/box-1',
+          activeInstanceUuid: 'box-1',
+          activeCascadeId: null,
+        }),
+      ),
+    ).toEqual({
+      type: 'AGY_INBOX_EMPTY_SCREEN',
+      reason: 'route_overview',
+      activeUrl: 'https://antigravity.google.com/r/box-1',
+      activeInstanceUuid: 'box-1',
+      activeCascadeId: null,
+    });
+    expect(
+      parseInboxBridgeMessage(
+        JSON.stringify({
+          type: 'AGY_INBOX_ACTIVE_ROUTE',
+          activeUrl: 'https://antigravity.google.com/r/box-1',
+          activeInstanceUuid: 'box-1',
+          activeCascadeId: null,
+          isEmptyRoute: false,
+        }),
+      ),
+    ).toEqual({
+      type: 'AGY_INBOX_ACTIVE_ROUTE',
+      activeUrl: 'https://antigravity.google.com/r/box-1',
+      activeInstanceUuid: 'box-1',
+      activeCascadeId: null,
+      isEmptyRoute: false,
+    });
+
+    // 3. Explicit archived trajectory detection
+    const snapMsg: Extract<InboxBridgeMessage, { type: 'AGY_INBOX_SNAPSHOT' }> =
+      {
+        type: 'AGY_INBOX_SNAPSHOT',
+        fetchedAtMs: Date.now(),
+        instances: [
+          {
+            uuid: 'box-1',
+            name: 'Dev Box',
+            status: 1,
+            trajectories: {
+              trajectorySummaries: {
+                'thread-archived': {
+                  summary: 'Archived chat',
+                  annotations: { archived: true },
+                },
+                'thread-live': {
+                  summary: 'Live chat',
+                  annotations: { archived: false },
+                },
+              },
+            },
+          },
+        ],
+      };
+    expect(
+      isTrajectoryMarkedArchivedInMessage(snapMsg, 'box-1', 'thread-archived'),
+    ).toBe(true);
+    expect(
+      isTrajectoryMarkedArchivedInMessage(snapMsg, 'box-1', 'thread-live'),
+    ).toBe(false);
+    expect(
+      isTrajectoryMarkedArchivedInMessage(snapMsg, 'box-1', 'thread-missing'),
+    ).toBe(false);
+
+    // 4. Host bridge forwards trusted AGY_REMOTE_EMPTY_SCREEN (clearing stale `?p=`),
+    //    ignores untrusted origins, marks `/battle/99` as `isEmptyRoute: false`, and
+    //    schedules refresh when host `proxyCommand` archives/deletes a thread.
+    const postedToNative: any[] = [];
+    const windowListeners = new Map<string, Array<(e: any) => void>>();
+    const scheduledDelays: number[] = [];
+    let currentHref = 'https://antigravity.google.com/r/box-1?p=c%2Fthread-1';
+    const currentUrlObj = () => new URL(currentHref);
+
+    class MockApiServicePromiseClient {
+      listInstances() {
+        return Promise.resolve({ getInstancesList: () => [] });
+      }
+      proxyCommand() {
+        return Promise.resolve({ getPayload: () => '{}' });
+      }
+    }
+
+    const mockIframe = {
+      src: 'https://antigravity.static.usercontent.goog/web/2.33.0/?iframe=true',
+      getAttribute: (k: string) =>
+        k === 'src'
+          ? 'https://antigravity.static.usercontent.goog/web/2.33.0/?iframe=true'
+          : null,
+      contentWindow: { postMessage: () => {} },
+    };
+
+    const sandboxWin: any = {
+      location: {
+        get href() {
+          return currentHref;
+        },
+        get origin() {
+          return currentUrlObj().origin;
+        },
+        get hostname() {
+          return currentUrlObj().hostname;
+        },
+        get pathname() {
+          return currentUrlObj().pathname;
+        },
+        get search() {
+          return currentUrlObj().search;
+        },
+      },
+      history: {
+        state: null,
+        replaceState: (_s: any, _t: string, nextRel: string) => {
+          currentHref = new URL(nextRel, currentHref).href;
+        },
+      },
+      devtools_jetski_boq_api_proto: {
+        ApiServicePromiseClient: MockApiServicePromiseClient,
+        ListInstancesRequest: class {},
+        ProxyCommandRequest: class {},
+      },
+      ReactNativeWebView: {
+        postMessage: (raw: string) => postedToNative.push(JSON.parse(raw)),
+      },
+      addEventListener: (type: string, fn: (e: any) => void) => {
+        if (!windowListeners.has(type)) windowListeners.set(type, []);
+        windowListeners.get(type)!.push(fn);
+      },
+      removeEventListener: () => {},
+    };
+
+    const sandboxDoc: any = {
+      cookie: '',
+      visibilityState: 'visible',
+      body: { style: {} },
+      querySelectorAll: (sel: string) => (sel === 'iframe' ? [mockIframe] : []),
+    };
+
+    vm.runInContext(
+      INBOX_BRIDGE_SCRIPT,
+      vm.createContext({
+        window: sandboxWin,
+        document: sandboxDoc,
+        URL,
+        URLSearchParams,
+        TextEncoder,
+        TextDecoder,
+        setTimeout: (_fn: () => void, ms: number) => {
+          scheduledDelays.push(ms);
+          return scheduledDelays.length;
+        },
+        clearTimeout: () => {},
+        setInterval: () => 1,
+        clearInterval: () => {},
+      }),
+    );
+
+    // Untrusted origin is rejected
+    for (const fn of windowListeners.get('message') ?? []) {
+      fn({
+        origin: 'https://evil.example',
+        data: { type: 'AGY_REMOTE_EMPTY_SCREEN', reason: 'route_overview', subPath: '/' },
+      });
+    }
+    expect(postedToNative).toHaveLength(0);
+
+    // Navigating to non-empty `/battle/99` preserves `?p=` and emits `isEmptyRoute: false`
+    for (const fn of windowListeners.get('message') ?? []) {
+      fn({
+        origin: 'https://antigravity.static.usercontent.goog',
+        data: { type: 'URL_CHANGED', path: '/web/2.33.0/battle/99' },
+      });
+    }
+    expect(postedToNative[postedToNative.length - 1]).toEqual({
+      type: 'AGY_INBOX_ACTIVE_ROUTE',
+      activeUrl: 'https://antigravity.google.com/r/box-1?p=c%2Fthread-1',
+      activeInstanceUuid: 'box-1',
+      activeCascadeId: null,
+      isEmptyRoute: false,
+    });
+
+    // Trusted AGY_REMOTE_EMPTY_SCREEN clears stale `?p=` and forwards AGY_INBOX_EMPTY_SCREEN
+    scheduledDelays.length = 0;
+    for (const fn of windowListeners.get('message') ?? []) {
+      fn({
+        origin: 'https://antigravity.static.usercontent.goog',
+        data: {
+          type: 'AGY_REMOTE_EMPTY_SCREEN',
+          reason: 'route_overview',
+          subPath: '/',
+          cascadeId: null,
+        },
+      });
+    }
+    expect(currentHref).toBe('https://antigravity.google.com/r/box-1');
+    expect(postedToNative[postedToNative.length - 1]).toEqual({
+      type: 'AGY_INBOX_EMPTY_SCREEN',
+      reason: 'route_overview',
+      activeUrl: 'https://antigravity.google.com/r/box-1',
+      activeInstanceUuid: 'box-1',
+      activeCascadeId: null,
+    });
+    expect(scheduledDelays).toContain(250);
+
+    // Hooking `proxyCommand` schedules refresh after `UpdateConversationAnnotations` (archiving)
+    sandboxWin.__agyInboxBridge.installHooks();
+    scheduledDelays.length = 0;
+    const client = new MockApiServicePromiseClient();
+    await (client as any).proxyCommand({
+      getRpcPath: () =>
+        '/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations',
+    });
+    expect(scheduledDelays).toContain(350);
+  });
+
 });

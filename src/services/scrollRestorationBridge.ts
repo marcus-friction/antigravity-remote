@@ -633,6 +633,9 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
           scheduleThreadHeaderSync(60);
         }
       }
+      if (typeof handleEmptyScreenOnRouteChange === 'function') {
+        handleEmptyScreenOnRouteChange(prevRoute, nextRoute);
+      }
     }
 
     function onPreInteractionCapture() {
@@ -1200,6 +1203,307 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
       }
     }
 
+    var EMPTY_SCREEN_SETTLE_MS = 250;
+    var emptyScreenCheckTimer = null;
+    var hasSeenConversationViewOnRoute = false;
+    var lastNotifiedEmptyRouteSignature = null;
+    var lastObservedFrameCascadeId = null;
+
+    function isNodeVisiblyRendered(el) {
+      if (!el || el.isConnected === false) return false;
+      if (el.hidden === true) return false;
+      if (typeof el.getAttribute === 'function') {
+        if (el.getAttribute('aria-hidden') === 'true') return false;
+      }
+      if (el.style) {
+        var inlineDisplay =
+          typeof el.style.getPropertyValue === 'function'
+            ? el.style.getPropertyValue('display')
+            : el.style.display || '';
+        var inlineVis =
+          typeof el.style.getPropertyValue === 'function'
+            ? el.style.getPropertyValue('visibility')
+            : el.style.visibility || '';
+        if (inlineDisplay === 'none' || inlineVis === 'hidden') {
+          return false;
+        }
+      }
+      if (typeof window.getComputedStyle === 'function') {
+        try {
+          var cs = window.getComputedStyle(el);
+          if (cs && (cs.display === 'none' || cs.visibility === 'hidden')) {
+            return false;
+          }
+        } catch (_) {}
+      }
+      if (typeof el.getBoundingClientRect === 'function') {
+        try {
+          var rect = el.getBoundingClientRect();
+          if (rect && rect.width === 0 && rect.height === 0) {
+            return false;
+          }
+        } catch (_) {}
+      }
+      return true;
+    }
+
+    function hasAnyVisibleSelector(selector) {
+      if (!document || typeof document.querySelectorAll !== 'function') {
+        return false;
+      }
+      try {
+        var nodes = document.querySelectorAll(selector);
+        for (var i = 0; i < nodes.length; i++) {
+          if (isNodeVisiblyRendered(nodes[i])) {
+            return true;
+          }
+        }
+      } catch (_) {}
+      return false;
+    }
+
+    function hasVisibleNonSidebarDialog() {
+      if (!document || typeof document.querySelectorAll !== 'function') {
+        return false;
+      }
+      try {
+        var dialogs = document.querySelectorAll(
+          '[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open], [data-testid="settings-sidebar"]'
+        );
+        for (var i = 0; i < dialogs.length; i++) {
+          var dlg = dialogs[i];
+          if (!isNodeVisiblyRendered(dlg)) continue;
+          if (
+            typeof dlg.querySelector === 'function' &&
+            dlg.querySelector('[role="navigation"][aria-label="Sidebar"]')
+          ) {
+            continue;
+          }
+          return true;
+        }
+      } catch (_) {}
+      return false;
+    }
+
+    function extractCurrentFrameSubPath() {
+      var pathname = (window.location && window.location.pathname) || '/';
+      if (isWorkstationFrame) {
+        var webMatch = /^(\\/web\\/[^/]+)(\\/.*)?$/.exec(pathname);
+        if (!webMatch) return null;
+        return normalizeSubPath(webMatch[2] || '/');
+      }
+      var stripped = pathname.replace(/^\\/u\\/\\d+(?=\\/|$)/, '') || '/';
+      if (stripped === '/remote' || stripped === '/remote/' || stripped.indexOf('/remote/') === 0) {
+        return normalizeSubPath(stripped.slice('/remote'.length) || '/');
+      }
+      return null;
+    }
+
+    function isNonEmptySpecialSubPath(subPath) {
+      if (!subPath) return false;
+      return (
+        subPath === '/history' ||
+        subPath.indexOf('/history/') === 0 ||
+        subPath === '/settings' ||
+        subPath.indexOf('/settings/') === 0 ||
+        subPath === '/battle' ||
+        subPath.indexOf('/battle/') === 0 ||
+        subPath === '/forked' ||
+        subPath.indexOf('/forked/') === 0 ||
+        subPath.indexOf('/multi') === 0
+      );
+    }
+
+    function notifyEmptyScreenFromFrame(reason, subPath, cascadeId) {
+      if (!shouldHideAntigravitySidebarInFrame()) return;
+      var effectiveReason = reason === 'route_overview' ? 'route_overview' : 'dom_empty';
+      var sig = effectiveReason + '|' + String(subPath || '/') + '|' + String(cascadeId || '');
+      if (lastNotifiedEmptyRouteSignature === sig) {
+        return;
+      }
+      lastNotifiedEmptyRouteSignature = sig;
+      try {
+        if (isWorkstationFrame && window.parent && window.parent !== window) {
+          window.parent.postMessage(
+            {
+              type: 'AGY_REMOTE_EMPTY_SCREEN',
+              reason: effectiveReason,
+              subPath: subPath || '/',
+              cascadeId: cascadeId || null
+            },
+            'https://antigravity.google.com'
+          );
+          return;
+        }
+        if (
+          window.ReactNativeWebView &&
+          typeof window.ReactNativeWebView.postMessage === 'function'
+        ) {
+          window.ReactNativeWebView.postMessage(
+            JSON.stringify({
+              type: 'AGY_INBOX_EMPTY_SCREEN',
+              reason: effectiveReason,
+              activeUrl: (window.location && window.location.href) || undefined,
+              activeInstanceUuid: isWorkstationFrame ? undefined : '__cloud__',
+              activeCascadeId: cascadeId || null
+            })
+          );
+        }
+      } catch (_) {}
+    }
+
+    function cancelEmptyScreenCheck() {
+      if (emptyScreenCheckTimer) {
+        clearTimeout(emptyScreenCheckTimer);
+        emptyScreenCheckTimer = null;
+      }
+    }
+
+    function hasVisiblePrimaryContent() {
+      if (
+        hasAnyVisibleSelector(
+          '[data-testid="conversation-view"], [data-testid="mobile-plugin-view-title"], [data-testid="conversation-list-history"]'
+        )
+      ) {
+        return true;
+      }
+      if (hasVisibleNonSidebarDialog()) {
+        return true;
+      }
+      return false;
+    }
+
+    function hasMobileHomeSidebarNodes() {
+      if (!document || typeof document.querySelector !== 'function') {
+        return false;
+      }
+      try {
+        return Boolean(
+          document.querySelector(
+            '[data-testid="conversation-list-sidebar"], [data-testid="mobile-home-concierge"], [data-sidebar-scroll-container="true"]'
+          )
+        );
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function hasAnyHiddenSidebarShellNodes() {
+      if (hasMobileHomeSidebarNodes()) {
+        return true;
+      }
+      if (!document || typeof document.querySelector !== 'function') {
+        return false;
+      }
+      try {
+        return Boolean(
+          document.querySelector('[role="navigation"][aria-label="Sidebar"]')
+        );
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function evaluateEmptyScreenDom() {
+      if (!shouldHideAntigravitySidebarInFrame()) return false;
+      var subPath = extractCurrentFrameSubPath();
+      if (!subPath || isNonEmptySpecialSubPath(subPath)) {
+        return false;
+      }
+      var frameCascadeId = extractCurrentFrameCascadeId();
+
+      if (hasAnyVisibleSelector('[data-testid="conversation-view"]')) {
+        hasSeenConversationViewOnRoute = true;
+        lastNotifiedEmptyRouteSignature = null;
+        return false;
+      }
+
+      if (hasVisiblePrimaryContent()) {
+        return false;
+      }
+
+      // Case 1: Root overview "/" once Antigravity's shell (with our hidden sidebar) has mounted
+      // and no conversation, plugin view, or dialog is visible.
+      if (subPath === '/' && hasAnyHiddenSidebarShellNodes()) {
+        notifyEmptyScreenFromFrame('route_overview', '/', null);
+        return true;
+      }
+
+      // Case 2: A previously mounted conversation view disappeared (e.g. archived/deleted in place
+      // or navigated to an empty view) leaving either hidden mobile home nodes or no visible composer.
+      if (
+        hasSeenConversationViewOnRoute &&
+        (hasMobileHomeSidebarNodes() ||
+          !hasAnyVisibleSelector('textarea, [contenteditable="true"], [role="textbox"]'))
+      ) {
+        notifyEmptyScreenFromFrame('dom_empty', subPath, frameCascadeId);
+        return true;
+      }
+      return false;
+    }
+
+    function scheduleEmptyScreenCheck(delayMs) {
+      if (!shouldHideAntigravitySidebarInFrame()) return;
+      var wait =
+        typeof delayMs === 'number' && delayMs >= 0
+          ? delayMs
+          : EMPTY_SCREEN_SETTLE_MS;
+      cancelEmptyScreenCheck();
+      emptyScreenCheckTimer = setTimeout(function() {
+        emptyScreenCheckTimer = null;
+        evaluateEmptyScreenDom();
+      }, wait);
+    }
+
+    function observeConversationEmptyState() {
+      if (!shouldHideAntigravitySidebarInFrame()) return;
+      if (hasAnyVisibleSelector('[data-testid="conversation-view"]')) {
+        hasSeenConversationViewOnRoute = true;
+        lastNotifiedEmptyRouteSignature = null;
+        cancelEmptyScreenCheck();
+        return;
+      }
+      if (hasSeenConversationViewOnRoute) {
+        scheduleEmptyScreenCheck(EMPTY_SCREEN_SETTLE_MS);
+      }
+    }
+
+    function handleEmptyScreenOnRouteChange(prevRoute, nextRoute) {
+      if (!shouldHideAntigravitySidebarInFrame()) return;
+      var prevCascadeId = lastObservedFrameCascadeId;
+      var nextCascadeId = extractCurrentFrameCascadeId();
+      var nextSubPath = extractCurrentFrameSubPath();
+      lastObservedFrameCascadeId = nextCascadeId;
+
+      if (prevCascadeId !== nextCascadeId) {
+        lastNotifiedEmptyRouteSignature = null;
+        cancelEmptyScreenCheck();
+        if (nextCascadeId) {
+          hasSeenConversationViewOnRoute = false;
+        }
+      }
+
+      var leftDetailRoute =
+        Boolean(prevCascadeId) ||
+        Boolean(prevRoute && prevRoute.kind === 'detail');
+
+      if (nextSubPath === '/' && leftDetailRoute) {
+        hasSeenConversationViewOnRoute = false;
+        notifyEmptyScreenFromFrame('route_overview', '/', null);
+        return;
+      }
+
+      if (
+        prevCascadeId &&
+        !nextCascadeId &&
+        nextSubPath &&
+        !isNonEmptySpecialSubPath(nextSubPath)
+      ) {
+        hasSeenConversationViewOnRoute = true;
+        scheduleEmptyScreenCheck(EMPTY_SCREEN_SETTLE_MS);
+      }
+    }
+
     function syncThreadProjectHeader() {
       if (!shouldHideAntigravitySidebarInFrame() || isSyncingThreadHeader) return;
       isSyncingThreadHeader = true;
@@ -1212,6 +1516,7 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
           return;
         }
         ensureHeaderMutationObserver();
+        observeConversationEmptyState();
         if (!activeThreadContext || activeThreadContext.cascadeId !== frameCascadeId) {
           clearThreadProjectHeader();
           if (lastRequestedContextCascadeId !== frameCascadeId) {
@@ -1397,11 +1702,16 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
       document.addEventListener('DOMContentLoaded', function() {
         hideAntigravitySidebarNodes();
         syncThreadProjectHeader();
+        evaluateEmptyScreenDom();
       });
     }
     window.addEventListener('load', function() {
       hideAntigravitySidebarNodes();
       syncThreadProjectHeader();
+      evaluateEmptyScreenDom();
+      if (extractCurrentFrameSubPath() === '/') {
+        scheduleEmptyScreenCheck(450);
+      }
       var loadedCascadeId = extractCurrentFrameCascadeId();
       if (loadedCascadeId && (!activeThreadContext || activeThreadContext.cascadeId !== loadedCascadeId)) {
         requestThreadContextFromHost(loadedCascadeId);
@@ -1417,7 +1727,8 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
       cancelActiveRestore: cancelActiveRestore,
       hideAntigravitySidebarNodes: hideAntigravitySidebarNodes,
       setThreadContext: setThreadContext,
-      syncThreadProjectHeader: syncThreadProjectHeader
+      syncThreadProjectHeader: syncThreadProjectHeader,
+      evaluateEmptyScreenDom: evaluateEmptyScreenDom
     };
   } catch (_) {}
   return true;

@@ -891,7 +891,9 @@ describe('Android & iOS WebView scroll-restoration wiring and Inbox drawer scrol
     expect(mockScrollTo).toHaveBeenCalledWith({ y: 120, animated: false });
 
     // Entering a thread and exiting via in-iframe Back (`activeCascadeId: null` while `activeUrl` still has `?p=`)
-    // clears `canReturnToOverviewRef` so Android hardware Back does not fire a redundant Overview return
+    // automatically opens our native Inbox drawer for the empty screen AND clears `canReturnToOverviewRef`:
+    // first hardware Back closes the drawer without firing a redundant Overview return, and second press returns `false`.
+    mockWebViewInjectJavaScript.mockClear();
     await act(async () => {
       tree.root
         .findAll(
@@ -924,10 +926,24 @@ describe('Android & iOS WebView scroll-restoration wiring and Inbox drawer scrol
       });
     });
 
+    mockWebViewInjectJavaScript.mockClear();
+    let firstBackClosesAutoOpenedDrawer = false;
+    await act(async () => {
+      for (const listener of mockBackPressListeners) {
+        firstBackClosesAutoOpenedDrawer =
+          listener() || firstBackClosesAutoOpenedDrawer;
+      }
+    });
+    expect(firstBackClosesAutoOpenedDrawer).toBe(true);
+    expect(mockWebViewInjectJavaScript).not.toHaveBeenCalled();
+
     let backHandledAfterIframeReturn = false;
-    for (const listener of mockBackPressListeners) {
-      backHandledAfterIframeReturn = listener() || backHandledAfterIframeReturn;
-    }
+    await act(async () => {
+      for (const listener of mockBackPressListeners) {
+        backHandledAfterIframeReturn =
+          listener() || backHandledAfterIframeReturn;
+      }
+    });
     expect(backHandledAfterIframeReturn).toBe(false);
 
     await act(async () => {
@@ -1505,5 +1521,324 @@ describe('Android & iOS WebView scroll-restoration wiring and Inbox drawer scrol
       inlineBtn!.querySelector('[data-agy-remote-project-name="true"]')
         ?.textContent,
     ).toBe('Backend API');
+  });
+
+  it('notifies host/native when archiving leaves an empty route or unmounts the conversation view without false-firing on thread load, switch, dialogs, or special sub-routes', () => {
+    type SimpleNode = {
+      tagName: string;
+      nodeType: number;
+      attributes: Record<string, string>;
+      children: SimpleNode[];
+      parentElement: SimpleNode | null;
+      isConnected: boolean;
+      style: Record<string, string>;
+      setAttribute: (k: string, v: string) => void;
+      getAttribute: (k: string) => string | null;
+      removeAttribute: (k: string) => void;
+      appendChild: (c: SimpleNode) => SimpleNode;
+      removeChild: (c: SimpleNode) => SimpleNode;
+      querySelector: (sel: string) => SimpleNode | null;
+      querySelectorAll: (sel: string) => SimpleNode[];
+    };
+
+    const matchesPart = (node: SimpleNode, rawPart: string): boolean => {
+      const part = rawPart.trim();
+      const attrEq = /^\[([^=\]]+)="([^"]*)"\]$/.exec(part);
+      if (attrEq) return node.attributes[attrEq[1]] === attrEq[2];
+      const tagAttr = /^([a-z]+)\[([^=\]]+)(?:="([^"]*)")?\]$/i.exec(part);
+      if (tagAttr) {
+        if (node.tagName.toLowerCase() !== tagAttr[1].toLowerCase()) return false;
+        return tagAttr[3] !== undefined
+          ? node.attributes[tagAttr[2]] === tagAttr[3]
+          : Object.prototype.hasOwnProperty.call(node.attributes, tagAttr[2]);
+      }
+      if (/^[a-z]+$/i.test(part)) {
+        return node.tagName.toLowerCase() === part.toLowerCase();
+      }
+      return false;
+    };
+
+    const makeNode = (
+      tag: string,
+      attrs: Record<string, string> = {},
+    ): SimpleNode => {
+      const node: SimpleNode = {
+        tagName: tag.toUpperCase(),
+        nodeType: 1,
+        attributes: { ...attrs },
+        children: [],
+        parentElement: null,
+        isConnected: true,
+        style: {},
+        setAttribute(k, v) {
+          this.attributes[k] = String(v);
+        },
+        getAttribute(k) {
+          return Object.prototype.hasOwnProperty.call(this.attributes, k)
+            ? this.attributes[k]
+            : null;
+        },
+        removeAttribute(k) {
+          delete this.attributes[k];
+        },
+        appendChild(c) {
+          this.children.push(c);
+          c.parentElement = this;
+          c.isConnected = true;
+          return c;
+        },
+        removeChild(c) {
+          const idx = this.children.indexOf(c);
+          if (idx >= 0) {
+            this.children.splice(idx, 1);
+            c.parentElement = null;
+            c.isConnected = false;
+          }
+          return c;
+        },
+        querySelector(sel) {
+          return this.querySelectorAll(sel)[0] ?? null;
+        },
+        querySelectorAll(sel) {
+          const parts = sel.split(',');
+          const out: SimpleNode[] = [];
+          const walk = (cur: SimpleNode) => {
+            for (const c of cur.children) {
+              if (parts.some((p) => matchesPart(c, p))) out.push(c);
+              walk(c);
+            }
+          };
+          walk(this);
+          return out;
+        },
+      };
+      return node;
+    };
+
+    const docEl = makeNode('html');
+    const head = makeNode('head');
+    const body = makeNode('body');
+    docEl.appendChild(head);
+    docEl.appendChild(body);
+
+    const parentPosts: Array<{ msg: any; targetOrigin: string }> = [];
+    const mutationCallbacks: Array<() => void> = [];
+    const timers = new Map<number, () => void>();
+    let nextTimerId = 1;
+
+    class MockMO {
+      private cb: () => void;
+      constructor(cb: () => void) {
+        this.cb = cb;
+      }
+      observe() {
+        mutationCallbacks.push(this.cb);
+      }
+      disconnect() {
+        const idx = mutationCallbacks.indexOf(this.cb);
+        if (idx >= 0) mutationCallbacks.splice(idx, 1);
+      }
+    }
+
+    const flushTimers = () => {
+      const batch = Array.from(timers.entries());
+      timers.clear();
+      for (const [, fn] of batch) fn();
+    };
+
+    const windowObj: any = {
+      location: {
+        protocol: 'https:',
+        hostname: 'antigravity.static.usercontent.goog',
+        pathname: '/web/2.33.0/c/thread-1',
+        search: '?iframe=true',
+        href: 'https://antigravity.static.usercontent.goog/web/2.33.0/c/thread-1?iframe=true',
+      },
+      history: {
+        pushState: (_s: any, _t: string, url: string) => {
+          const parsed = new URL(url, 'https://antigravity.static.usercontent.goog');
+          windowObj.location.pathname = parsed.pathname;
+          windowObj.location.search = parsed.search;
+          windowObj.location.href = parsed.href;
+        },
+        replaceState: (_s: any, _t: string, url: string) => {
+          const parsed = new URL(url, 'https://antigravity.static.usercontent.goog');
+          windowObj.location.pathname = parsed.pathname;
+          windowObj.location.search = parsed.search;
+          windowObj.location.href = parsed.href;
+        },
+      },
+      parent: {
+        postMessage: (msg: any, targetOrigin: string) => {
+          parentPosts.push({ msg, targetOrigin });
+        },
+      },
+      MutationObserver: MockMO,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      sessionStorage: { getItem: () => null, setItem: () => {} },
+    };
+
+    const documentObj: any = {
+      head,
+      documentElement: docEl,
+      body,
+      getElementById: (id: string) =>
+        head.children.find((n) => n.attributes.id === id) ?? null,
+      createElement: (tag: string) => makeNode(tag),
+      querySelector: (sel: string) => docEl.querySelector(sel),
+      querySelectorAll: (sel: string) => docEl.querySelectorAll(sel),
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    };
+
+    vm.runInContext(
+      PROJECT_OVERVIEW_SCROLL_SCRIPT,
+      vm.createContext({
+        window: windowObj,
+        document: documentObj,
+        URL,
+        URLSearchParams,
+        setTimeout: (fn: () => void) => {
+          const id = nextTimerId++;
+          timers.set(id, fn);
+          return id;
+        },
+        clearTimeout: (id: number) => {
+          timers.delete(id);
+        },
+      }),
+    );
+
+    // 1. Initial load on `/c/thread-1` before conversation mounts must NOT false-fire empty screen
+    flushTimers();
+    expect(
+      parentPosts.filter((p) => p.msg.type === 'AGY_REMOTE_EMPTY_SCREEN'),
+    ).toHaveLength(0);
+
+    // 2. Mount live conversation view, then unmount it in place (e.g. archived without URL change)
+    const convView = makeNode('div', { 'data-testid': 'conversation-view' });
+    body.appendChild(convView);
+    for (const cb of [...mutationCallbacks]) cb();
+    flushTimers();
+    expect(
+      parentPosts.filter((p) => p.msg.type === 'AGY_REMOTE_EMPTY_SCREEN'),
+    ).toHaveLength(0);
+
+    // If a modal dialog opens when conversation unmounts, screen is NOT empty
+    body.removeChild(convView);
+    const modal = makeNode('div', { role: 'dialog' });
+    body.appendChild(modal);
+    for (const cb of [...mutationCallbacks]) cb();
+    flushTimers();
+    expect(
+      parentPosts.filter((p) => p.msg.type === 'AGY_REMOTE_EMPTY_SCREEN'),
+    ).toHaveLength(0);
+
+    // Once modal closes and nothing remains visible -> emits `dom_empty`
+    body.removeChild(modal);
+    for (const cb of [...mutationCallbacks]) cb();
+    flushTimers();
+    expect(parentPosts).toContainEqual({
+      msg: {
+        type: 'AGY_REMOTE_EMPTY_SCREEN',
+        reason: 'dom_empty',
+        subPath: '/c/thread-1',
+        cascadeId: 'thread-1',
+      },
+      targetOrigin: 'https://antigravity.google.com',
+    });
+
+    // 3. Switching to `/c/thread-2` does NOT false-fire while thread-2 is still mounting
+    parentPosts.length = 0;
+    windowObj.history.pushState(null, '', '/web/2.33.0/c/thread-2?iframe=true');
+    flushTimers();
+    expect(
+      parentPosts.filter((p) => p.msg.type === 'AGY_REMOTE_EMPTY_SCREEN'),
+    ).toHaveLength(0);
+
+    // 4. Navigating from `/c/thread-2` to `/battle/battle-1` or `/history` does NOT fire empty screen
+    windowObj.history.pushState(null, '', '/web/2.33.0/battle/battle-1');
+    flushTimers();
+    windowObj.history.pushState(null, '', '/web/2.33.0/history');
+    flushTimers();
+    expect(
+      parentPosts.filter((p) => p.msg.type === 'AGY_REMOTE_EMPTY_SCREEN'),
+    ).toHaveLength(0);
+
+    // 5. Archiving `/c/thread-2` and navigating back to `/` immediately emits `route_overview`
+    windowObj.history.pushState(null, '', '/web/2.33.0/c/thread-2?iframe=true');
+    parentPosts.length = 0;
+    windowObj.history.pushState(null, '', '/web/2.33.0/?iframe=true');
+    expect(parentPosts).toContainEqual({
+      msg: {
+        type: 'AGY_REMOTE_EMPTY_SCREEN',
+        reason: 'route_overview',
+        subPath: '/',
+        cascadeId: null,
+      },
+      targetOrigin: 'https://antigravity.google.com',
+    });
+
+    // 6. Standalone `/remote/c/cloud-1` -> `/remote` posts `AGY_INBOX_EMPTY_SCREEN` directly to native
+    const nativePosts: any[] = [];
+    const remoteWin: any = {
+      location: {
+        protocol: 'https:',
+        hostname: 'antigravity.google.com',
+        pathname: '/remote/c/cloud-1',
+        search: '',
+        href: 'https://antigravity.google.com/remote/c/cloud-1',
+      },
+      history: {
+        pushState: (_s: any, _t: string, url: string) => {
+          const parsed = new URL(url, 'https://antigravity.google.com');
+          remoteWin.location.pathname = parsed.pathname;
+          remoteWin.location.search = parsed.search;
+          remoteWin.location.href = parsed.href;
+        },
+        replaceState: () => {},
+      },
+      ReactNativeWebView: {
+        postMessage: (raw: string) => nativePosts.push(JSON.parse(raw)),
+      },
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      sessionStorage: { getItem: () => null, setItem: () => {} },
+    };
+    const remoteRoot = makeNode('html');
+    const remoteHead = makeNode('head');
+    const remoteBody = makeNode('body');
+    remoteRoot.appendChild(remoteHead);
+    remoteRoot.appendChild(remoteBody);
+    vm.runInContext(
+      PROJECT_OVERVIEW_SCROLL_SCRIPT,
+      vm.createContext({
+        window: remoteWin,
+        document: {
+          head: remoteHead,
+          documentElement: remoteRoot,
+          body: remoteBody,
+          getElementById: () => null,
+          createElement: (tag: string) => makeNode(tag),
+          querySelector: () => null,
+          querySelectorAll: () => [],
+          addEventListener: () => {},
+          removeEventListener: () => {},
+        },
+        URL,
+        URLSearchParams,
+        setTimeout: () => 1,
+        clearTimeout: () => {},
+      }),
+    );
+    remoteWin.history.pushState(null, '', '/remote');
+    expect(nativePosts).toContainEqual({
+      type: 'AGY_INBOX_EMPTY_SCREEN',
+      reason: 'route_overview',
+      activeUrl: 'https://antigravity.google.com/remote',
+      activeInstanceUuid: '__cloud__',
+      activeCascadeId: null,
+    });
   });
 });

@@ -263,6 +263,122 @@ export function extractActiveRouteFromUrl(rawUrl?: string | null): {
 }
 
 /**
+ * Extracts the normalized child sub-path (e.g. `/`, `/c/<id>`, `/battle/<id>`, `/history`)
+ * from a workspace URL on `https://antigravity.google.com` (`/r/<uuid>` or `/remote`).
+ * Returns `null` for non-workspace host pages such as the All Machines dashboard (`/`) or auth URLs.
+ */
+export function extractWorkspaceSubPathFromUrl(
+  rawUrl?: string | null,
+): string | null {
+  if (!rawUrl || typeof rawUrl !== 'string') {
+    return null;
+  }
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.hostname.toLowerCase() !== 'antigravity.google.com') {
+      return null;
+    }
+    const strippedPath = parsed.pathname.replace(/^\/u\/\d+(?=\/|$)/, '');
+
+    if (/^\/r\/[^/?#]+/.test(strippedPath)) {
+      const rawChild = (parsed.searchParams.get('p') ?? '').trim();
+      const childPathOnly = rawChild.split(/[?#]/)[0] ?? '';
+      const normalized = `/${childPathOnly.replace(/^\/+/, '').replace(/\/+$/, '')}`;
+      return normalized === '//' ? '/' : normalized || '/';
+    }
+
+    if (
+      strippedPath === '/remote' ||
+      strippedPath === '/remote/' ||
+      strippedPath.startsWith('/remote/')
+    ) {
+      const rest = strippedPath.slice('/remote'.length);
+      const normalized = `/${rest.replace(/^\/+/, '').replace(/\/+$/, '')}`;
+      return normalized === '//' ? '/' : normalized || '/';
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Returns true when a workspace route has no active conversation or detail view open
+ * (e.g. root `/` inside a workstation `/r/<uuid>` or standalone `/remote`, where
+ * Antigravity's native sidebar is hidden and the screen is empty).
+ */
+export function isEmptyWorkspaceRoute(params: {
+  activeUrl?: string | null;
+  activeInstanceUuid?: string | null;
+  activeCascadeId?: string | null;
+  isEmptyRouteHint?: boolean;
+}): boolean {
+  if (
+    typeof params.activeCascadeId === 'string' &&
+    params.activeCascadeId.trim().length > 0
+  ) {
+    return false;
+  }
+  if (typeof params.isEmptyRouteHint === 'boolean') {
+    return params.isEmptyRouteHint;
+  }
+  const subPath = extractWorkspaceSubPathFromUrl(params.activeUrl);
+  if (subPath === '/') {
+    return true;
+  }
+  if (subPath !== null) {
+    // Explicit `activeCascadeId: null` overrides a stale `?p=c/<id>` or `/remote/c/<id>` URL
+    // after the iframe returned to the empty overview before the host URL updated.
+    if (
+      params.activeCascadeId === null &&
+      (subPath === '/c' || subPath.startsWith('/c/'))
+    ) {
+      return true;
+    }
+    return false;
+  }
+  return Boolean(
+    params.activeInstanceUuid && params.activeCascadeId === null,
+  );
+}
+
+/**
+ * Returns true when the raw `AGY_INBOX_SNAPSHOT` payload explicitly marks the
+ * given `(instanceUuid, cascadeId)` trajectory as `annotations.archived === true`.
+ */
+export function isTrajectoryMarkedArchivedInMessage(
+  message: Extract<InboxBridgeMessage, { type: 'AGY_INBOX_SNAPSHOT' }>,
+  instanceUuid: string | null,
+  cascadeId: string | null,
+): boolean {
+  if (!instanceUuid || !cascadeId) {
+    return false;
+  }
+  const rawContainer =
+    instanceUuid === '__cloud__'
+      ? message.cloudTrajectories
+      : message.instances.find((inst) => inst.uuid === instanceUuid)
+          ?.trajectories;
+  const unwrapped = unwrapTrajectoryMap(rawContainer);
+  const direct = unwrapped[cascadeId];
+  if (direct && isRecord(direct.annotations) && direct.annotations.archived === true) {
+    return true;
+  }
+  for (const raw of Object.values(unwrapped)) {
+    const tid = raw.trajectoryId ?? raw.trajectory_id;
+    if (
+      tid === cascadeId &&
+      isRecord(raw.annotations) &&
+      raw.annotations.archived === true
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Extracts an explicit `project` query parameter from an `https://antigravity.google.com`
  * host URL or its nested `p` child path (e.g. `?p=c%2F<cascadeId>%3Fproject%3D<projectId>`).
  */
@@ -3790,8 +3906,11 @@ export function parseInboxBridgeMessage(
       };
     }
 
-    case 'AGY_INBOX_ACTIVE_ROUTE':
-      return {
+    case 'AGY_INBOX_ACTIVE_ROUTE': {
+      const routeMessage: Extract<
+        InboxBridgeMessage,
+        { type: 'AGY_INBOX_ACTIVE_ROUTE' }
+      > = {
         type: 'AGY_INBOX_ACTIVE_ROUTE',
         activeUrl:
           typeof parsed.activeUrl === 'string' ? parsed.activeUrl : undefined,
@@ -3808,6 +3927,11 @@ export function parseInboxBridgeMessage(
               ? null
               : undefined,
       };
+      if (typeof parsed.isEmptyRoute === 'boolean') {
+        routeMessage.isEmptyRoute = parsed.isEmptyRoute;
+      }
+      return routeMessage;
+    }
 
     case 'AGY_INBOX_REALTIME_HINT': {
       const reason = parsed.reason;
@@ -3959,6 +4083,31 @@ export function parseInboxBridgeMessage(
       return {
         type: 'AGY_INBOX_OPEN_DRAWER_REQUEST',
         mode,
+      };
+    }
+
+    case 'AGY_INBOX_EMPTY_SCREEN': {
+      const reason =
+        parsed.reason === 'route_overview' || parsed.reason === 'dom_empty'
+          ? parsed.reason
+          : 'dom_empty';
+      return {
+        type: 'AGY_INBOX_EMPTY_SCREEN',
+        reason,
+        activeUrl:
+          typeof parsed.activeUrl === 'string' ? parsed.activeUrl : undefined,
+        activeInstanceUuid:
+          typeof parsed.activeInstanceUuid === 'string'
+            ? parsed.activeInstanceUuid
+            : parsed.activeInstanceUuid === null
+              ? null
+              : undefined,
+        activeCascadeId:
+          typeof parsed.activeCascadeId === 'string'
+            ? parsed.activeCascadeId
+            : parsed.activeCascadeId === null
+              ? null
+              : undefined,
       };
     }
 

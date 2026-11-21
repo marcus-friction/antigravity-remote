@@ -253,6 +253,7 @@ export type InboxBridgeMessage =
       activeUrl?: string;
       activeInstanceUuid?: string | null;
       activeCascadeId?: string | null;
+      isEmptyRoute?: boolean;
     }
   | {
       type: 'AGY_INBOX_REALTIME_HINT';
@@ -299,4 +300,11 @@ export type InboxBridgeMessage =
   | {
       type: 'AGY_INBOX_OPEN_DRAWER_REQUEST';
       mode?: 'inbox' | 'projects';
+    }
+  | {
+      type: 'AGY_INBOX_EMPTY_SCREEN';
+      reason: 'route_overview' | 'dom_empty';
+      activeUrl?: string;
+      activeInstanceUuid?: string | null;
+      activeCascadeId?: string | null;
     };

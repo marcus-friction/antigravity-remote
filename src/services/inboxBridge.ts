@@ -408,7 +408,32 @@ export const INBOX_BRIDGE_SCRIPT = `
                   capturedMetadata = copy;
                 } catch (_) {}
               }
-              return orig.apply(this, arguments);
+              var result = orig.apply(this, arguments);
+              if (
+                methodName === 'proxyCommand' &&
+                result &&
+                typeof result.then === 'function'
+              ) {
+                try {
+                  var reqArg = arguments.length > 0 ? arguments[0] : null;
+                  var rpcPath =
+                    reqArg && typeof reqArg.getRpcPath === 'function'
+                      ? String(reqArg.getRpcPath() || '')
+                      : '';
+                  if (
+                    rpcPath.indexOf('UpdateConversationAnnotations') !== -1 ||
+                    rpcPath.indexOf('DeleteCascadeTrajectory') !== -1
+                  ) {
+                    result.then(
+                      function() {
+                        scheduleRefresh(350);
+                      },
+                      function() {}
+                    );
+                  }
+                } catch (_) {}
+              }
+              return result;
             };
           })(methodNames[i]);
         }
@@ -3754,6 +3779,24 @@ export const INBOX_BRIDGE_SCRIPT = `
         });
     }
 
+    function extractIframeSubPath(rawPath, frameSrc) {
+      if (typeof rawPath !== 'string') return '/';
+      var trimmed = rawPath.trim();
+      if (!trimmed) return '/';
+      var pathOnly = trimmed.split(/[?#]/)[0] || '/';
+      var normalized = pathOnly.indexOf('/') === 0 ? pathOnly : '/' + pathOnly;
+      if (frameSrc) {
+        try {
+          var basePath = new URL(frameSrc).pathname.replace(/\\/+$/, '');
+          if (basePath && normalized.indexOf(basePath) === 0) {
+            normalized = normalized.substring(basePath.length) || '/';
+          }
+        } catch (_) {}
+      }
+      var cleaned = normalized.replace(/\\/+$/, '');
+      return cleaned || '/';
+    }
+
     function extractCascadeIdFromIframePath(rawPath, frameSrc) {
       if (typeof rawPath !== 'string' || !rawPath) return null;
       var normalized = rawPath.indexOf('/') === 0 ? rawPath : '/' + rawPath;
@@ -3787,6 +3830,35 @@ export const INBOX_BRIDGE_SCRIPT = `
           return;
         }
 
+        if (data.type === 'AGY_REMOTE_EMPTY_SCREEN') {
+          var emptySubPath =
+            typeof data.subPath === 'string'
+              ? extractIframeSubPath(data.subPath, frameSrc)
+              : null;
+          var emptyCascadeId =
+            typeof data.cascadeId === 'string' && SAFE_ID_RE.test(data.cascadeId)
+              ? data.cascadeId
+              : null;
+          if (!emptyCascadeId && (!emptySubPath || emptySubPath === '/')) {
+            clearHostChildPathParam();
+            setIframeCascadeOverride(null);
+          }
+          var emptyRoute = parseRouteFromLocation();
+          scheduleRefresh(250);
+          postToNative({
+            type: 'AGY_INBOX_EMPTY_SCREEN',
+            reason:
+              data.reason === 'route_overview' || data.reason === 'dom_empty'
+                ? data.reason
+                : 'dom_empty',
+            activeUrl: window.location.href,
+            activeInstanceUuid: emptyRoute.instanceUuid,
+            activeCascadeId:
+              emptyCascadeId !== null ? emptyCascadeId : emptyRoute.cascadeId
+          });
+          return;
+        }
+
         if (data.type === 'AGY_REMOTE_REQUEST_THREAD_CONTEXT') {
           syncActiveThreadContext();
           return;
@@ -3795,23 +3867,35 @@ export const INBOX_BRIDGE_SCRIPT = `
         if (data.type === 'URL_CHANGED') {
           var rawChangedPath = typeof data.path === 'string' ? data.path : '';
           var changedCascadeId = extractCascadeIdFromIframePath(rawChangedPath, frameSrc);
+          var changedSubPath = extractIframeSubPath(rawChangedPath, frameSrc);
+          var isChangedEmptySubPath = changedSubPath === '/';
           if (completePendingFastNavIfMatched(changedCascadeId, true)) {
             return;
           }
           if (completePendingStartNavIfMatched(changedCascadeId, true)) {
             return;
           }
-          if (!changedCascadeId) {
+          var hadActiveCascadeBeforeUrlChanged = Boolean(
+            activeIframeCascadeId || parseRouteFromLocation().cascadeId
+          );
+          if (!changedCascadeId && isChangedEmptySubPath) {
             clearHostChildPathParam();
           }
           setIframeCascadeOverride(changedCascadeId);
           var routeNow = parseRouteFromLocation();
-          postToNative({
+          var changedMsg = {
             type: 'AGY_INBOX_ACTIVE_ROUTE',
             activeUrl: window.location.href,
             activeInstanceUuid: routeNow.instanceUuid,
             activeCascadeId: activeIframeCascadeId
-          });
+          };
+          if (!changedCascadeId && !isChangedEmptySubPath) {
+            changedMsg.isEmptyRoute = false;
+          }
+          postToNative(changedMsg);
+          if (hadActiveCascadeBeforeUrlChanged && !changedCascadeId) {
+            scheduleRefresh(300);
+          }
           return;
         }
 
@@ -3829,6 +3913,8 @@ export const INBOX_BRIDGE_SCRIPT = `
             : null;
         if (reportedPath !== null) {
           var extractedCascadeId = extractCascadeIdFromIframePath(reportedPath, frameSrc);
+          var extractedSubPath = extractIframeSubPath(reportedPath, frameSrc);
+          var isExtractedEmptySubPath = extractedSubPath === '/';
           if (completePendingFastNavIfMatched(extractedCascadeId, isUrlChangeEvent)) {
             return;
           }
@@ -3836,17 +3922,27 @@ export const INBOX_BRIDGE_SCRIPT = `
             return;
           }
           if (isUrlChangeEvent) {
-            if (!extractedCascadeId) {
+            var hadActiveCascadeBeforeJspb = Boolean(
+              activeIframeCascadeId || parseRouteFromLocation().cascadeId
+            );
+            if (!extractedCascadeId && isExtractedEmptySubPath) {
               clearHostChildPathParam();
             }
             setIframeCascadeOverride(extractedCascadeId);
             var currentRoute = parseRouteFromLocation();
-            postToNative({
+            var jspbRouteMsg = {
               type: 'AGY_INBOX_ACTIVE_ROUTE',
               activeUrl: window.location.href,
               activeInstanceUuid: currentRoute.instanceUuid,
               activeCascadeId: activeIframeCascadeId
-            });
+            };
+            if (!extractedCascadeId && !isExtractedEmptySubPath) {
+              jspbRouteMsg.isEmptyRoute = false;
+            }
+            postToNative(jspbRouteMsg);
+            if (hadActiveCascadeBeforeJspb && !extractedCascadeId) {
+              scheduleRefresh(300);
+            }
           }
         }
 

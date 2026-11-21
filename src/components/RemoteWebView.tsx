@@ -89,6 +89,9 @@ import {
   buildInboxSnapshot,
   extractAccountPathPrefix,
   extractActiveRouteFromUrl,
+  extractWorkspaceSubPathFromUrl,
+  isEmptyWorkspaceRoute,
+  isTrajectoryMarkedArchivedInMessage,
   parseInboxBridgeMessage,
   reconcileRunningThreadTransitions,
   resolveActiveRouteFromBridgeMessage,
@@ -340,6 +343,10 @@ function findMatchingThread(
   );
 }
 
+function getEmptyScreenKey(instanceUuid: string | null): string {
+  return instanceUuid ? `empty:${instanceUuid}` : 'empty:root';
+}
+
 const COMBINED_INJECTED_SCRIPT = `${KEYBOARD_ADAPTATION_SCRIPT}\n${PROJECT_OVERVIEW_SCROLL_SCRIPT}\n${INBOX_BRIDGE_SCRIPT}`;
 
 const EMPTY_INBOX_SNAPSHOT: InboxSnapshot = {
@@ -438,6 +445,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const completedUnreadMapRef = useRef<Record<string, number>>({});
   const locallyReadMapRef = useRef<Record<string, number>>({});
   const activeInstanceUuidRef = useRef<string | null>(null);
+  const activeCascadeIdRef = useRef<string | null>(null);
+  const isOnEmptyScreenRef = useRef<boolean>(false);
+  const currentEmptyScreenKeyRef = useRef<string | null>(null);
+  const emptyScreenDismissedKeyRef = useRef<string | null>(null);
+  const seenLiveActiveThreadKeyRef = useRef<string | null>(null);
   const lastObservedOverviewInstanceRef = useRef<string | null>(null);
   const canReturnToOverviewRef = useRef<boolean>(false);
   const pendingFastNavRef = useRef<
@@ -592,7 +604,19 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
 
       const initialTarget = incomingDeepLinkUrl ?? savedUrl;
       const initialRoute = extractActiveRouteFromUrl(initialTarget);
+      const isInitialEmpty = isEmptyWorkspaceRoute({
+        activeUrl: initialTarget,
+        activeInstanceUuid: initialRoute.instanceUuid,
+        activeCascadeId: initialRoute.cascadeId,
+      });
       activeInstanceUuidRef.current = initialRoute.instanceUuid;
+      activeCascadeIdRef.current = initialRoute.cascadeId;
+      isOnEmptyScreenRef.current = isInitialEmpty;
+      currentEmptyScreenKeyRef.current = isInitialEmpty
+        ? getEmptyScreenKey(initialRoute.instanceUuid)
+        : null;
+      emptyScreenDismissedKeyRef.current = null;
+      seenLiveActiveThreadKeyRef.current = null;
       lastObservedOverviewInstanceRef.current = initialRoute.cascadeId
         ? null
         : initialRoute.instanceUuid;
@@ -936,6 +960,88 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     [],
   );
 
+  const armInboxRefreshTimeout = useCallback(() => {
+    if (inboxRefreshTimeoutRef.current) {
+      clearTimeout(inboxRefreshTimeoutRef.current);
+    }
+    inboxRefreshTimeoutRef.current = setTimeout(() => {
+      inboxRefreshTimeoutRef.current = null;
+      setIsInboxRefreshing(false);
+    }, INBOX_REFRESH_TIMEOUT_MS);
+    (inboxRefreshTimeoutRef.current as { unref?: () => void })?.unref?.();
+  }, []);
+
+  const handleRefreshInbox = useCallback(
+    (forceUsage: boolean = false) => {
+      if (isResettingSessionRef.current) return;
+      setIsInboxRefreshing(true);
+      armInboxRefreshTimeout();
+      webViewRef.current?.injectJavaScript(INBOX_BRIDGE_SCRIPT);
+      webViewRef.current?.injectJavaScript(buildInboxRefreshScript(forceUsage));
+    },
+    [armInboxRefreshTimeout],
+  );
+
+  const handleDismissDrawerGuidance = useCallback(() => {
+    setHasSeenDrawerGuidance((prev) => {
+      if (!prev) {
+        void saveDrawerGuidanceSeen(true);
+      }
+      return true;
+    });
+  }, []);
+
+  const openDrawerForEmptyScreen = useCallback(
+    (
+      emptyKey: string,
+      options?: {
+        triggerRefresh?: boolean;
+        skipSnapshotRecompute?: boolean;
+      },
+    ): boolean => {
+      if (
+        isResettingSessionRef.current ||
+        stageRef.current !== 'authenticated' ||
+        isComposingNewThreadRef.current ||
+        emptyScreenDismissedKeyRef.current === emptyKey
+      ) {
+        return false;
+      }
+      if (isDrawerOpenRef.current) {
+        // Drawer (or docked tablet sidebar) is already open; avoid switching
+        // away from the user's active tab, just refresh Inbox if requested.
+        if (options?.triggerRefresh) {
+          handleRefreshInbox(false);
+        }
+        return false;
+      }
+      if (resumeReadSettleTimerRef.current) {
+        clearTimeout(resumeReadSettleTimerRef.current);
+        resumeReadSettleTimerRef.current = null;
+      }
+      userClosedTabletSidebarRef.current = false;
+      handleDismissDrawerGuidance();
+      if (!isTabletLayoutRef.current) {
+        Keyboard.dismiss?.();
+      }
+      setDrawerInitialMode('inbox');
+      isDrawerOpenRef.current = true;
+      setIsDrawerOpen(true);
+      if (!options?.skipSnapshotRecompute) {
+        recomputeSnapshotWithLocalState({ isDrawerOpen: true });
+      }
+      if (options?.triggerRefresh) {
+        handleRefreshInbox(false);
+      }
+      return true;
+    },
+    [
+      handleDismissDrawerGuidance,
+      handleRefreshInbox,
+      recomputeSnapshotWithLocalState,
+    ],
+  );
+
   useEffect(() => {
     if (prevIsTabletLayoutRef.current === isTabletLayout) {
       return;
@@ -1073,7 +1179,24 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
                 const resumeRoute = extractActiveRouteFromUrl(
                   currentNavUrlRef.current,
                 );
-                if (!resumeRoute.cascadeId) {
+                const isResumeEmpty = isEmptyWorkspaceRoute({
+                  activeUrl: currentNavUrlRef.current,
+                  activeInstanceUuid: resumeRoute.instanceUuid,
+                  activeCascadeId: resumeRoute.cascadeId,
+                });
+                const isResumeOverviewOrDashboard =
+                  isResumeEmpty ||
+                  (!resumeRoute.cascadeId &&
+                    extractWorkspaceSubPathFromUrl(currentNavUrlRef.current) ===
+                      null);
+                if (isResumeOverviewOrDashboard) {
+                  emptyScreenDismissedKeyRef.current = null;
+                  if (isResumeEmpty) {
+                    isOnEmptyScreenRef.current = true;
+                    currentEmptyScreenKeyRef.current = getEmptyScreenKey(
+                      resumeRoute.instanceUuid,
+                    );
+                  }
                   setDrawerInitialMode('inbox');
                   isDrawerOpenRef.current = true;
                   setIsDrawerOpen(true);
@@ -1217,6 +1340,10 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           return true;
         }
         if (!isTabletLayoutRef.current) {
+          if (isOnEmptyScreenRef.current && currentEmptyScreenKeyRef.current) {
+            emptyScreenDismissedKeyRef.current =
+              currentEmptyScreenKeyRef.current;
+          }
           isDrawerOpenRef.current = false;
           setIsDrawerOpen(false);
           if (isAppForegroundRef.current) {
@@ -1244,6 +1371,12 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         webViewRef.current.injectJavaScript(buildReturnToOverviewScript());
         // Because Antigravity's native sidebar is hidden, returning from a thread
         // to the overview automatically opens our native Inbox sidebar.
+        const emptyKey = getEmptyScreenKey(activeInstanceUuidRef.current);
+        activeCascadeIdRef.current = null;
+        seenLiveActiveThreadKeyRef.current = null;
+        isOnEmptyScreenRef.current = true;
+        currentEmptyScreenKeyRef.current = emptyKey;
+        emptyScreenDismissedKeyRef.current = null;
         setDrawerInitialMode('inbox');
         isDrawerOpenRef.current = true;
         setIsDrawerOpen(true);
@@ -1290,6 +1423,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       clearInboxTimers();
       locallyReadMapRef.current = {};
       activeInstanceUuidRef.current = null;
+      activeCascadeIdRef.current = null;
+      isOnEmptyScreenRef.current = false;
+      currentEmptyScreenKeyRef.current = null;
+      emptyScreenDismissedKeyRef.current = null;
+      seenLiveActiveThreadKeyRef.current = null;
       lastObservedOverviewInstanceRef.current = null;
       canReturnToOverviewRef.current = false;
       webViewRef.current?.stopLoading();
@@ -1422,7 +1560,26 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         if (route.cascadeId) {
           isComposingNewThreadRef.current = false;
         }
+        const prevInstanceUuid = activeInstanceUuidRef.current;
+        const prevCascadeId = activeCascadeIdRef.current;
         activeInstanceUuidRef.current = route.instanceUuid;
+        activeCascadeIdRef.current = route.cascadeId;
+        if (
+          route.instanceUuid !== prevInstanceUuid ||
+          route.cascadeId !== prevCascadeId
+        ) {
+          seenLiveActiveThreadKeyRef.current = null;
+        }
+        const isEmptyNow = isEmptyWorkspaceRoute({
+          activeUrl: validation.normalizedUrl,
+          activeInstanceUuid: route.instanceUuid,
+          activeCascadeId: route.cascadeId,
+        });
+        if (!isEmptyNow) {
+          isOnEmptyScreenRef.current = false;
+          currentEmptyScreenKeyRef.current = null;
+          emptyScreenDismissedKeyRef.current = null;
+        }
         recordActiveRouteForBackNavigation(route.instanceUuid, route.cascadeId);
         reconcilePendingThreadProject(route.instanceUuid, route.cascadeId);
         if (
@@ -1459,6 +1616,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
               cookieRecoveryAttemptsRef.current = 0;
               renderRecoveryTimestampsRef.current = [];
               renderProcessDeadRef.current = false;
+              stageRef.current = 'authenticated';
               setStage('authenticated');
               webViewRef.current?.injectJavaScript(INBOX_BRIDGE_SCRIPT);
               if (activeThreadProjectRef.current) {
@@ -1472,10 +1630,22 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
                 !isDrawerOpenRef.current &&
                 (isTabletLayoutRef.current || !route.cascadeId)
               ) {
+                if (isEmptyNow) {
+                  const emptyKey = getEmptyScreenKey(route.instanceUuid);
+                  isOnEmptyScreenRef.current = true;
+                  currentEmptyScreenKeyRef.current = emptyKey;
+                }
                 setDrawerInitialMode('inbox');
                 isDrawerOpenRef.current = true;
                 setIsDrawerOpen(true);
                 recomputeSnapshotWithLocalState({ isDrawerOpen: true });
+              } else if (isEmptyNow) {
+                const emptyKey = getEmptyScreenKey(route.instanceUuid);
+                isOnEmptyScreenRef.current = true;
+                currentEmptyScreenKeyRef.current = emptyKey;
+                openDrawerForEmptyScreen(emptyKey, {
+                  triggerRefresh: !becameAuthenticated,
+                });
               }
             }
           });
@@ -1485,6 +1655,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     [
       checkPost2faSessionAndAdvance,
       markThreadReadInWorkstationClock,
+      openDrawerForEmptyScreen,
       recomputeSnapshotWithLocalState,
       reconcilePendingThreadProject,
       recordActiveRouteForBackNavigation,
@@ -1633,6 +1804,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         isComposingNewThreadRef.current = false;
       }
       activeInstanceUuidRef.current = targetRoute.instanceUuid;
+      activeCascadeIdRef.current = targetRoute.cascadeId;
+      seenLiveActiveThreadKeyRef.current = null;
+      isOnEmptyScreenRef.current = false;
+      currentEmptyScreenKeyRef.current = null;
+      emptyScreenDismissedKeyRef.current = null;
       lastObservedOverviewInstanceRef.current = targetRoute.cascadeId
         ? null
         : targetRoute.instanceUuid;
@@ -1678,37 +1854,6 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     webViewRef.current.injectJavaScript(buildOpenHostSettingsScript());
   }, [getDashboardUrlForCurrentAccount, handleNavigateToUrl]);
 
-  const armInboxRefreshTimeout = useCallback(() => {
-    if (inboxRefreshTimeoutRef.current) {
-      clearTimeout(inboxRefreshTimeoutRef.current);
-    }
-    inboxRefreshTimeoutRef.current = setTimeout(() => {
-      inboxRefreshTimeoutRef.current = null;
-      setIsInboxRefreshing(false);
-    }, INBOX_REFRESH_TIMEOUT_MS);
-    (inboxRefreshTimeoutRef.current as { unref?: () => void })?.unref?.();
-  }, []);
-
-  const handleRefreshInbox = useCallback(
-    (forceUsage: boolean = false) => {
-      if (isResettingSessionRef.current) return;
-      setIsInboxRefreshing(true);
-      armInboxRefreshTimeout();
-      webViewRef.current?.injectJavaScript(INBOX_BRIDGE_SCRIPT);
-      webViewRef.current?.injectJavaScript(buildInboxRefreshScript(forceUsage));
-    },
-    [armInboxRefreshTimeout],
-  );
-
-  const handleDismissDrawerGuidance = useCallback(() => {
-    setHasSeenDrawerGuidance((prev) => {
-      if (!prev) {
-        void saveDrawerGuidanceSeen(true);
-      }
-      return true;
-    });
-  }, []);
-
   const handleOpenDrawer = useCallback(
     (preferredMode?: DrawerMode) => {
       if (isResettingSessionRef.current) return;
@@ -1718,6 +1863,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       }
       isComposingNewThreadRef.current = false;
       userClosedTabletSidebarRef.current = false;
+      emptyScreenDismissedKeyRef.current = null;
       handleDismissDrawerGuidance();
       if (!isTabletLayoutRef.current) {
         Keyboard.dismiss?.();
@@ -1746,6 +1892,9 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const handleCloseDrawer = useCallback(() => {
     if (isTabletLayoutRef.current) {
       userClosedTabletSidebarRef.current = true;
+    }
+    if (isOnEmptyScreenRef.current && currentEmptyScreenKeyRef.current) {
+      emptyScreenDismissedKeyRef.current = currentEmptyScreenKeyRef.current;
     }
     isDrawerOpenRef.current = false;
     setIsDrawerOpen(false);
@@ -1802,6 +1951,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         setIsDrawerOpen(false);
       }
       isComposingNewThreadRef.current = false;
+      activeCascadeIdRef.current = thread.cascadeId;
+      seenLiveActiveThreadKeyRef.current = thread.id;
+      isOnEmptyScreenRef.current = false;
+      currentEmptyScreenKeyRef.current = null;
+      emptyScreenDismissedKeyRef.current = null;
       setPendingThreadProject(null);
 
       markThreadReadInWorkstationClock(thread, 'unread_only');
@@ -1865,6 +2019,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         setIsDrawerOpen(false);
       }
       isComposingNewThreadRef.current = true;
+      activeCascadeIdRef.current = null;
+      seenLiveActiveThreadKeyRef.current = null;
+      isOnEmptyScreenRef.current = false;
+      currentEmptyScreenKeyRef.current = null;
+      emptyScreenDismissedKeyRef.current = null;
       setPendingThreadProject({
         instanceUuid: project.instanceUuid,
         cascadeId: null,
@@ -2196,26 +2355,92 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             activeInstanceUuid: built.activeInstanceUuid,
             activeCascadeId: built.activeCascadeId,
           };
+          const prevInstanceUuid = activeInstanceUuidRef.current;
+          const prevCascadeId = activeCascadeIdRef.current;
           activeInstanceUuidRef.current = built.activeInstanceUuid;
+          activeCascadeIdRef.current = built.activeCascadeId;
           recordActiveRouteForBackNavigation(
             built.activeInstanceUuid,
             built.activeCascadeId,
           );
+
+          const activeThreadKey =
+            built.activeInstanceUuid && built.activeCascadeId
+              ? `${built.activeInstanceUuid}:${built.activeCascadeId}`
+              : null;
+          const matchingActiveThread = findMatchingThread(
+            built.threads,
+            built.activeInstanceUuid,
+            built.activeCascadeId,
+          );
+          const activeThreadJustArchived = Boolean(
+            activeThreadKey &&
+              !matchingActiveThread &&
+              seenLiveActiveThreadKeyRef.current === activeThreadKey &&
+              isTrajectoryMarkedArchivedInMessage(
+                message,
+                built.activeInstanceUuid,
+                built.activeCascadeId,
+              ),
+          );
+          const isEmptySnapshotRoute = isEmptyWorkspaceRoute({
+            activeUrl: message.activeUrl ?? currentNavUrlRef.current,
+            activeInstanceUuid: built.activeInstanceUuid,
+            activeCascadeId: built.activeCascadeId,
+          });
+
+          if (matchingActiveThread && activeThreadKey) {
+            seenLiveActiveThreadKeyRef.current = activeThreadKey;
+            isOnEmptyScreenRef.current = false;
+            currentEmptyScreenKeyRef.current = null;
+            emptyScreenDismissedKeyRef.current = null;
+          } else if (
+            prevInstanceUuid !== built.activeInstanceUuid ||
+            prevCascadeId !== built.activeCascadeId
+          ) {
+            seenLiveActiveThreadKeyRef.current = null;
+          }
+
+          let openedEmptyDrawer = false;
+          if (activeThreadJustArchived || isEmptySnapshotRoute) {
+            if (activeThreadJustArchived) {
+              seenLiveActiveThreadKeyRef.current = null;
+            }
+            const emptyKey = getEmptyScreenKey(built.activeInstanceUuid);
+            isOnEmptyScreenRef.current = true;
+            currentEmptyScreenKeyRef.current = emptyKey;
+            openedEmptyDrawer = openDrawerForEmptyScreen(emptyKey, {
+              triggerRefresh: false,
+              skipSnapshotRecompute: true,
+            });
+          }
+
+          const finalBuilt =
+            openedEmptyDrawer && !isTabletLayoutRef.current
+              ? applyLocalStateToSnapshot(built, {
+                  activeInstanceUuid: built.activeInstanceUuid,
+                  activeCascadeId: built.activeCascadeId,
+                  locallyReadAtByThreadId: locallyReadMapRef.current,
+                  isAppForeground: isAppForegroundRef.current,
+                  isDrawerOpen: true,
+                })
+              : built;
+
           if (
             isAppForegroundRef.current &&
-            !drawerBlockingNow &&
+            !(openedEmptyDrawer || drawerBlockingNow) &&
             !resumeReadSettleTimerRef.current &&
-            built.activeInstanceUuid &&
-            built.activeCascadeId
+            finalBuilt.activeInstanceUuid &&
+            finalBuilt.activeCascadeId
           ) {
             const activeThread = findMatchingThread(
-              built.threads,
-              built.activeInstanceUuid,
-              built.activeCascadeId,
+              finalBuilt.threads,
+              finalBuilt.activeInstanceUuid,
+              finalBuilt.activeCascadeId,
             );
             markThreadReadInWorkstationClock(activeThread, 'none');
           }
-          setInboxSnapshot(built);
+          setInboxSnapshot(finalBuilt);
           break;
         }
 
@@ -2231,7 +2456,16 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           if (activeCascadeId) {
             isComposingNewThreadRef.current = false;
           }
+          const prevInstanceUuid = activeInstanceUuidRef.current;
+          const prevCascadeId = activeCascadeIdRef.current;
           activeInstanceUuidRef.current = activeInstanceUuid;
+          activeCascadeIdRef.current = activeCascadeId;
+          if (
+            activeInstanceUuid !== prevInstanceUuid ||
+            activeCascadeId !== prevCascadeId
+          ) {
+            seenLiveActiveThreadKeyRef.current = null;
+          }
           recordActiveRouteForBackNavigation(
             activeInstanceUuid,
             activeCascadeId,
@@ -2244,6 +2478,30 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
               activeCascadeId,
             };
           }
+          const isEmptyNow = isEmptyWorkspaceRoute({
+            activeUrl: message.activeUrl ?? currentNavUrlRef.current,
+            activeInstanceUuid,
+            activeCascadeId,
+            isEmptyRouteHint: message.isEmptyRoute,
+          });
+          if (isEmptyNow) {
+            const emptyKey = getEmptyScreenKey(activeInstanceUuid);
+            isOnEmptyScreenRef.current = true;
+            currentEmptyScreenKeyRef.current = emptyKey;
+            const opened = openDrawerForEmptyScreen(emptyKey, {
+              triggerRefresh: Boolean(prevCascadeId),
+              skipSnapshotRecompute: true,
+            });
+            recomputeSnapshotWithLocalState({
+              activeInstanceUuid,
+              activeCascadeId,
+              isDrawerOpen: opened ? true : isDrawerOpenRef.current,
+            });
+            break;
+          }
+          isOnEmptyScreenRef.current = false;
+          currentEmptyScreenKeyRef.current = null;
+          emptyScreenDismissedKeyRef.current = null;
           if (
             isAppForegroundRef.current &&
             (!isDrawerOpenRef.current || isTabletLayoutRef.current) &&
@@ -2284,6 +2542,12 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             syncVerifiedActiveHostUrl(pending.targetUrl);
             const fastRoute = extractActiveRouteFromUrl(pending.targetUrl);
             activeInstanceUuidRef.current = fastRoute.instanceUuid;
+            activeCascadeIdRef.current = fastRoute.cascadeId;
+            if (fastRoute.cascadeId) {
+              isOnEmptyScreenRef.current = false;
+              currentEmptyScreenKeyRef.current = null;
+              emptyScreenDismissedKeyRef.current = null;
+            }
             recordActiveRouteForBackNavigation(
               fastRoute.instanceUuid,
               fastRoute.cascadeId,
@@ -2307,6 +2571,12 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
               : pending.targetUrl;
           const resultRoute = extractActiveRouteFromUrl(effectiveUrl);
           const resolvedCascadeId = message.cascadeId || resultRoute.cascadeId;
+          if (resolvedCascadeId) {
+            isComposingNewThreadRef.current = false;
+            isOnEmptyScreenRef.current = false;
+            currentEmptyScreenKeyRef.current = null;
+            emptyScreenDismissedKeyRef.current = null;
+          }
           reconcilePendingThreadProject(
             resultRoute.instanceUuid,
             resolvedCascadeId,
@@ -2316,6 +2586,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           } else {
             syncVerifiedActiveHostUrl(effectiveUrl);
             activeInstanceUuidRef.current = resultRoute.instanceUuid;
+            activeCascadeIdRef.current = resolvedCascadeId;
             recordActiveRouteForBackNavigation(
               resultRoute.instanceUuid,
               resolvedCascadeId,
@@ -2380,6 +2651,53 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           handleOpenDrawer(message.mode ?? 'inbox');
           break;
         }
+
+        case 'AGY_INBOX_EMPTY_SCREEN': {
+          syncVerifiedActiveHostUrl(message.activeUrl);
+          const resolvedRoute = resolveActiveRouteFromBridgeMessage(
+            message,
+            currentNavUrlRef.current,
+          );
+          if (message.reason === 'route_overview') {
+            activeInstanceUuidRef.current = resolvedRoute.instanceUuid;
+            activeCascadeIdRef.current = resolvedRoute.cascadeId;
+            if (!resolvedRoute.cascadeId) {
+              seenLiveActiveThreadKeyRef.current = null;
+            }
+            recordActiveRouteForBackNavigation(
+              resolvedRoute.instanceUuid,
+              resolvedRoute.cascadeId,
+            );
+            reconcilePendingThreadProject(
+              resolvedRoute.instanceUuid,
+              resolvedRoute.cascadeId,
+            );
+            if (lastSnapshotMessageRef.current) {
+              lastSnapshotMessageRef.current = {
+                ...lastSnapshotMessageRef.current,
+                activeInstanceUuid: resolvedRoute.instanceUuid,
+                activeCascadeId: resolvedRoute.cascadeId,
+              };
+            }
+          }
+          const emptyKey = getEmptyScreenKey(
+            resolvedRoute.instanceUuid ?? activeInstanceUuidRef.current,
+          );
+          isOnEmptyScreenRef.current = true;
+          currentEmptyScreenKeyRef.current = emptyKey;
+          const opened = openDrawerForEmptyScreen(emptyKey, {
+            triggerRefresh: true,
+            skipSnapshotRecompute: message.reason === 'route_overview',
+          });
+          if (message.reason === 'route_overview') {
+            recomputeSnapshotWithLocalState({
+              activeInstanceUuid: resolvedRoute.instanceUuid,
+              activeCascadeId: resolvedRoute.cascadeId,
+              isDrawerOpen: opened ? true : isDrawerOpenRef.current,
+            });
+          }
+          break;
+        }
       }
     },
     [
@@ -2388,6 +2706,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       handleNavigateToUrl,
       handleOpenDrawer,
       markThreadReadInWorkstationClock,
+      openDrawerForEmptyScreen,
       recomputeSnapshotWithLocalState,
       reconcilePendingThreadProject,
       recordActiveRouteForBackNavigation,

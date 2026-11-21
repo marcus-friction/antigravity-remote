@@ -2139,8 +2139,9 @@ describe('Session and navigation regressions', () => {
     expect(controls().props.attentionCount).toBe(0);
     expect(clearNativeActionNotification).toHaveBeenCalled();
 
-    // 4. Now start a second run on `agent-run-1`, exit to Project Overview (`activeCascadeId: null`), and let it finish while app is active:
-    // enters BLUE state (`attentionCount: 1`, `urgentAttentionCount: 0`) and notifies!
+    // 4. Now start a second run on `agent-run-1`, exit to Project Overview (`activeCascadeId: null`):
+    // exiting to the empty overview auto-opens our Inbox drawer; closing it and letting the run finish
+    // while app is active enters BLUE state (`attentionCount: 1`, `urgentAttentionCount: 0`) and notifies!
     (syncNativeActionNotification as jest.Mock).mockClear();
     await deliverRunSnapshot({
       isRunning: true,
@@ -2162,6 +2163,11 @@ describe('Session and navigation regressions', () => {
         },
       });
     });
+    expect(controls().props.visible).toBe(true);
+    await act(async () => {
+      controls().props.onClose();
+    });
+    expect(controls().props.visible).toBe(false);
     await deliverRunSnapshot({
       isRunning: false,
       modifiedIso: workstationSecondFinishIso,
@@ -4402,4 +4408,312 @@ describe('Session and navigation regressions', () => {
       });
     });
   });
+
+  it('opens the drawer by default whenever the screen becomes empty (e.g. after archiving a thread) while respecting manual dismissal, new-chat composing, and non-empty routes', async () => {
+    mockCookieStore.set('https://antigravity.google.com', {
+      SID: { name: 'SID', value: 'empty-screen-session', domain: '.google.com' },
+    });
+
+    // 1. Authenticated inside an active thread on phone -> drawer stays closed
+    await navigate(
+      'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-1',
+      false,
+    );
+    expect(controls().props.visible).toBe(false);
+
+    const sendSnapshot = async (params: {
+      activeUrl: string;
+      activeCascadeId: string | null;
+      archivedThread1?: boolean;
+      archivedThread2?: boolean;
+    }) => {
+      await act(async () => {
+        webView().props.onMessage({
+          nativeEvent: {
+            url: params.activeUrl,
+            data: JSON.stringify({
+              type: 'AGY_INBOX_SNAPSHOT',
+              fetchedAtMs: Date.now(),
+              activeUrl: params.activeUrl,
+              activeInstanceUuid: 'workstation-1',
+              activeCascadeId: params.activeCascadeId,
+              instances: [
+                {
+                  uuid: 'workstation-1',
+                  name: 'Primary Box',
+                  status: 1,
+                  trajectories: {
+                    trajectorySummaries: {
+                      'thread-1': {
+                        summary: 'First thread',
+                        status: 'CASCADE_RUN_STATUS_IDLE',
+                        annotations: {
+                          archived: Boolean(params.archivedThread1),
+                        },
+                        lastModifiedTime: '2026-11-20T10:00:00Z',
+                      },
+                      'thread-2': {
+                        summary: 'Second thread',
+                        status: 'CASCADE_RUN_STATUS_IDLE',
+                        annotations: {
+                          archived: Boolean(params.archivedThread2),
+                        },
+                        lastModifiedTime: '2026-11-20T09:50:00Z',
+                      },
+                      'old-archived': {
+                        summary: 'Old archived thread',
+                        status: 'CASCADE_RUN_STATUS_IDLE',
+                        annotations: { archived: true },
+                        lastModifiedTime: '2026-11-10T09:00:00Z',
+                      },
+                    },
+                  },
+                },
+              ],
+            }),
+          },
+        });
+      });
+    };
+
+    await sendSnapshot({
+      activeUrl:
+        'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-1',
+      activeCascadeId: 'thread-1',
+    });
+    expect(controls().props.visible).toBe(false);
+
+    // 2. Archiving thread-1 navigates iframe to `/` (`AGY_INBOX_ACTIVE_ROUTE` with `activeCascadeId: null`) ->
+    //    auto-opens the Inbox drawer AND triggers an Inbox refresh!
+    mockWebViewInjectJavaScript.mockClear();
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_ACTIVE_ROUTE',
+            activeUrl: 'https://antigravity.google.com/r/workstation-1',
+            activeInstanceUuid: 'workstation-1',
+            activeCascadeId: null,
+          }),
+        },
+      });
+    });
+    expect(controls().props.visible).toBe(true);
+    expect(controls().props.initialMode).toBe('inbox');
+    expect(
+      mockWebViewInjectJavaScript.mock.calls.some(
+        ([script]) =>
+          typeof script === 'string' &&
+          script.includes('window.__agyInboxBridge.refresh('),
+      ),
+    ).toBe(true);
+
+    // 3. Manually closing the drawer on that empty screen stays closed across polling snapshots
+    //    and redundant empty-screen notifications until the user enters a thread or resumes app
+    await act(async () => {
+      controls().props.onClose();
+    });
+    expect(controls().props.visible).toBe(false);
+
+    await sendSnapshot({
+      activeUrl: 'https://antigravity.google.com/r/workstation-1',
+      activeCascadeId: null,
+      archivedThread1: true,
+    });
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_EMPTY_SCREEN',
+            reason: 'dom_empty',
+            activeUrl: 'https://antigravity.google.com/r/workstation-1',
+            activeInstanceUuid: 'workstation-1',
+            activeCascadeId: null,
+          }),
+        },
+      });
+    });
+    expect(controls().props.visible).toBe(false);
+
+    // 4. User selects thread-2, then archives it in place (DOM becomes empty via `AGY_INBOX_EMPTY_SCREEN`) ->
+    //    drawer auto-opens again!
+    const thread2 = controls().props.snapshot.threads.find(
+      (t: any) => t.cascadeId === 'thread-2',
+    )!;
+    await act(async () => {
+      controls().props.onSelectThread(thread2);
+    });
+    expect(controls().props.visible).toBe(false);
+
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-2',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_EMPTY_SCREEN',
+            reason: 'dom_empty',
+            activeUrl:
+              'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-2',
+            activeInstanceUuid: 'workstation-1',
+            activeCascadeId: 'thread-2',
+          }),
+        },
+      });
+    });
+    expect(controls().props.visible).toBe(true);
+
+    // 5. Fallback safety net: if active thread transitions from live -> `annotations.archived: true`
+    //    in `AGY_INBOX_SNAPSHOT` even without a route change or DOM event, drawer opens automatically!
+    await act(async () => {
+      controls().props.onSelectThread(thread2);
+    });
+    await sendSnapshot({
+      activeUrl:
+        'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-2',
+      activeCascadeId: 'thread-2',
+      archivedThread1: true,
+      archivedThread2: false,
+    });
+    expect(controls().props.visible).toBe(false);
+
+    await sendSnapshot({
+      activeUrl:
+        'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-2',
+      activeCascadeId: 'thread-2',
+      archivedThread1: true,
+      archivedThread2: true,
+    });
+    expect(controls().props.visible).toBe(true);
+
+    // 6. Intentionally opening an already-archived thread does NOT force-open the drawer
+    await act(async () => {
+      controls().props.onClose();
+    });
+    await navigate(
+      'https://antigravity.google.com/r/workstation-1?p=c%2Fold-archived',
+      false,
+    );
+    await sendSnapshot({
+      activeUrl:
+        'https://antigravity.google.com/r/workstation-1?p=c%2Fold-archived',
+      activeCascadeId: 'old-archived',
+      archivedThread1: true,
+      archivedThread2: true,
+    });
+    expect(controls().props.visible).toBe(false);
+
+    // 7. Non-empty sub-routes (`/battle/99`, `isEmptyRoute: false`, `/remote/history`, All Machines `/`)
+    //    do NOT auto-open the drawer
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_ACTIVE_ROUTE',
+            activeUrl: 'https://antigravity.google.com/r/workstation-1',
+            activeInstanceUuid: 'workstation-1',
+            activeCascadeId: null,
+            isEmptyRoute: false,
+          }),
+        },
+      });
+    });
+    expect(controls().props.visible).toBe(false);
+    await navigate(
+      'https://antigravity.google.com/r/workstation-1?p=battle%2F99',
+      false,
+    );
+    expect(controls().props.visible).toBe(false);
+    await navigate('https://antigravity.google.com/remote/history', false);
+    expect(controls().props.visible).toBe(false);
+    await navigate('https://antigravity.google.com/', false);
+    expect(controls().props.visible).toBe(false);
+
+    // 8. Navigating via top-frame Back/archive onto an empty workstation `/r/workstation-1`
+    //    or standalone `/remote` when already authenticated DOES open the drawer!
+    await navigate('https://antigravity.google.com/r/workstation-1', false);
+    expect(controls().props.visible).toBe(true);
+
+    await act(async () => {
+      controls().props.onClose();
+    });
+    await navigate('https://antigravity.google.com/remote/c/cloud-1', false);
+    expect(controls().props.visible).toBe(false);
+    await navigate('https://antigravity.google.com/remote', false);
+    expect(controls().props.visible).toBe(true);
+
+    // 9. Starting `+ New` in Projects tab (`isComposingNewThreadRef = true`) keeps drawer CLOSED
+    //    even if `startProjectChat` falls back to overview `/` (`activeCascadeId: null`)
+    await act(async () => {
+      controls().props.onStartProjectThread!({
+        id: 'workstation-1:ws:app',
+        projectId: null,
+        name: 'my-app',
+        workspaceName: 'my-app',
+        workspaceUri: 'file:///home/dev/my-app',
+        instanceUuid: 'workstation-1',
+        instanceName: 'Primary Box',
+        source: 'remote-control',
+        threads: [],
+        latestModifiedAtMs: 0,
+        attentionCount: 0,
+        urgentCount: 0,
+        runningCount: 0,
+        hasActiveThread: false,
+        newChatUrl: 'https://antigravity.google.com/r/workstation-1',
+      });
+    });
+    expect(controls().props.visible).toBe(false);
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_ACTIVE_ROUTE',
+            activeUrl: 'https://antigravity.google.com/r/workstation-1',
+            activeInstanceUuid: 'workstation-1',
+            activeCascadeId: null,
+          }),
+        },
+      });
+    });
+    expect(controls().props.visible).toBe(false);
+
+    // 10. On tablet with a manually collapsed docked sidebar, archiving the active thread re-opens the docked sidebar!
+    mockWindowDimensions = { width: 1024, height: 768 };
+    try {
+      await act(async () => {
+        tree.update(<App />);
+      });
+      await navigate(
+        'https://antigravity.google.com/r/workstation-1?p=c%2Ftablet-thread',
+        false,
+      );
+      await act(async () => {
+        controls().props.onClose();
+      });
+      expect(controls().props.docked).toBe(true);
+      expect(controls().props.visible).toBe(false);
+
+      await act(async () => {
+        webView().props.onMessage({
+          nativeEvent: {
+            url: 'https://antigravity.google.com/r/workstation-1',
+            data: JSON.stringify({
+              type: 'AGY_INBOX_ACTIVE_ROUTE',
+              activeUrl: 'https://antigravity.google.com/r/workstation-1',
+              activeInstanceUuid: 'workstation-1',
+              activeCascadeId: null,
+            }),
+          },
+        });
+      });
+      expect(controls().props.visible).toBe(true);
+    } finally {
+      mockWindowDimensions = { width: 390, height: 844 };
+    }
+  });
+
 });
