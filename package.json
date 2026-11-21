@@ -1,6 +1,6 @@
 {
   "name": "antigravity-remote",
-  "version": "1.5.2",
+  "version": "1.6.0",
   "license": "MIT",
   "private": true,
   "main": "index.ts",

@@ -372,8 +372,9 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     initialMode === 'projects' ? 'projects' : 'inbox',
   );
   const defaultMode: DrawerMode =
-    initialMode ??
-    (stage === 'authenticated' ? lastPrimaryNavModeRef.current : 'settings');
+    stage === 'authenticated'
+      ? (initialMode ?? lastPrimaryNavModeRef.current)
+      : 'settings';
   const defaultModeRef = useRef<DrawerMode>(defaultMode);
   defaultModeRef.current = defaultMode;
   const [activeMode, setActiveMode] = useState<DrawerMode>(defaultMode);
@@ -1475,9 +1476,6 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     isDraggingOpenRef.current = false;
     setIsDraggingOpen(false);
     onNavigateToUrl(targetUrl);
-    if (!docked) {
-      onClose();
-    }
   };
 
   const handleTriggerHostSettings = () => {

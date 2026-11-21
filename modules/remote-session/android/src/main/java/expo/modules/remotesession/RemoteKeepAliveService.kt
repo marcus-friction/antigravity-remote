@@ -25,29 +25,50 @@ class RemoteKeepAliveService : Service() {
   private val handler = Handler(Looper.getMainLooper())
   private var wakeLock: PowerManager.WakeLock? = null
   private var deadlineElapsedRealtimeMs: Long = 0L
+  private var instanceGeneration: Long = 0L
 
   private val keepAliveTickRunnable = object : Runnable {
     override fun run() {
+      if (!desiredRunning || !isRunning || instanceGeneration != activeGeneration) {
+        return
+      }
       val remainingMs = deadlineElapsedRealtimeMs - SystemClock.elapsedRealtime()
       if (remainingMs <= 0L) {
-        notifyKeepAliveEnded(stoppedByUser = false)
+        desiredRunning = false
+        isRunning = false
+        activeGeneration += 1L
+        runCatching { notifyKeepAliveEnded(stoppedByUser = false) }
         stopKeepAliveAndSelf()
       } else {
-        notifyKeepAlivePollTick()
-        handler.postDelayed(this, minOf(remainingMs, POLL_INTERVAL_MS))
+        runCatching { notifyKeepAlivePollTick() }
+        if (desiredRunning && isRunning && instanceGeneration == activeGeneration) {
+          handler.postDelayed(this, minOf(remainingMs, POLL_INTERVAL_MS))
+        }
       }
     }
+  }
+
+  internal fun cancelScheduledTicks() {
+    handler.removeCallbacks(keepAliveTickRunnable)
   }
 
   override fun onBind(intent: Intent?): IBinder? = null
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     if (intent?.action == ACTION_STOP_KEEP_ALIVE) {
-      notifyKeepAliveEnded(stoppedByUser = true)
+      val wasActive = desiredRunning || isRunning
+      desiredRunning = false
+      startPending = false
+      isRunning = false
+      activeGeneration += 1L
+      if (wasActive) {
+        runCatching { notifyKeepAliveEnded(stoppedByUser = true) }
+      }
       stopKeepAliveAndSelf()
       return START_NOT_STICKY
     }
 
+    startPending = false
     val requestedMinutes = intent?.getIntExtra(EXTRA_DURATION_MINUTES, DEFAULT_MINUTES)
       ?: DEFAULT_MINUTES
     val clampedMinutes = requestedMinutes.coerceIn(1, MAX_MINUTES)
@@ -67,11 +88,24 @@ class RemoteKeepAliveService : Service() {
         startForeground(NOTIFICATION_ID, notification)
       }
     } catch (_: Exception) {
-      notifyKeepAliveEnded(stoppedByUser = false)
+      desiredRunning = false
+      isRunning = false
+      activeGeneration += 1L
+      runCatching { notifyKeepAliveEnded(stoppedByUser = false) }
       stopKeepAliveAndSelf()
       return START_NOT_STICKY
     }
 
+    val intentGeneration = intent?.getLongExtra(EXTRA_GENERATION, activeGeneration) ?: activeGeneration
+    if (!desiredRunning || intentGeneration != activeGeneration) {
+      // Stopped while startForegroundService() was in flight: fulfill the foreground
+      // contract above, then tear down cleanly without firing an expiry callback.
+      stopKeepAliveAndSelf()
+      return START_NOT_STICKY
+    }
+
+    instanceGeneration = activeGeneration
+    activeInstance = this
     isRunning = true
     deadlineElapsedRealtimeMs = SystemClock.elapsedRealtime() + durationMs
     acquireBoundedWakeLock(durationMs)
@@ -85,30 +119,59 @@ class RemoteKeepAliveService : Service() {
   }
 
   override fun onTaskRemoved(rootIntent: Intent?) {
-    notifyKeepAliveEnded(stoppedByUser = false)
+    val shouldNotify = desiredRunning || isRunning
+    desiredRunning = false
+    startPending = false
+    isRunning = false
+    activeGeneration += 1L
+    if (shouldNotify) {
+      runCatching { notifyKeepAliveEnded(stoppedByUser = false) }
+    }
     stopKeepAliveAndSelf()
     super.onTaskRemoved(rootIntent)
   }
 
   override fun onTimeout(startId: Int) {
-    notifyKeepAliveEnded(stoppedByUser = false)
+    val shouldNotify = desiredRunning || isRunning
+    desiredRunning = false
+    startPending = false
+    isRunning = false
+    activeGeneration += 1L
+    if (shouldNotify) {
+      runCatching { notifyKeepAliveEnded(stoppedByUser = false) }
+    }
     stopKeepAliveAndSelf()
   }
 
   override fun onTimeout(startId: Int, fgsType: Int) {
-    notifyKeepAliveEnded(stoppedByUser = false)
+    val shouldNotify = desiredRunning || isRunning
+    desiredRunning = false
+    startPending = false
+    isRunning = false
+    activeGeneration += 1L
+    if (shouldNotify) {
+      runCatching { notifyKeepAliveEnded(stoppedByUser = false) }
+    }
     stopKeepAliveAndSelf()
   }
 
   override fun onDestroy() {
-    isRunning = false
+    if (activeInstance === this) {
+      activeInstance = null
+      isRunning = false
+    }
     handler.removeCallbacks(keepAliveTickRunnable)
     releaseWakeLock()
     super.onDestroy()
   }
 
   private fun stopKeepAliveAndSelf() {
-    isRunning = false
+    if (activeInstance === this) {
+      activeInstance = null
+    }
+    if (instanceGeneration == activeGeneration || !desiredRunning) {
+      isRunning = false
+    }
     handler.removeCallbacks(keepAliveTickRunnable)
     releaseWakeLock()
     try {
@@ -229,10 +292,25 @@ class RemoteKeepAliveService : Service() {
     private const val POLL_INTERVAL_MS = 20_000L
     const val ACTION_STOP_KEEP_ALIVE = "expo.modules.remotesession.STOP_KEEP_ALIVE"
     const val EXTRA_DURATION_MINUTES = "duration_minutes"
+    private const val EXTRA_GENERATION = "generation"
 
     @Volatile
     var isRunning: Boolean = false
       private set
+
+    @Volatile
+    private var desiredRunning: Boolean = false
+
+    @Volatile
+    private var startPending: Boolean = false
+
+    @Volatile
+    private var activeGeneration: Long = 0L
+
+    private var activeInstance: RemoteKeepAliveService? = null
+
+    val isActiveOrPending: Boolean
+      get() = desiredRunning && (isRunning || startPending)
 
     private val listenerLock = Any()
     private var listenerOwner: Any? = null
@@ -284,8 +362,13 @@ class RemoteKeepAliveService : Service() {
 
     fun start(context: Context, durationMinutes: Int): Boolean {
       val clamped = durationMinutes.coerceIn(1, MAX_MINUTES)
+      val nextGen = activeGeneration + 1L
+      activeGeneration = nextGen
+      desiredRunning = true
+      startPending = true
       val intent = Intent(context, RemoteKeepAliveService::class.java).apply {
         putExtra(EXTRA_DURATION_MINUTES, clamped)
+        putExtra(EXTRA_GENERATION, nextGen)
       }
       return try {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -296,11 +379,25 @@ class RemoteKeepAliveService : Service() {
         true
       } catch (_: Exception) {
         // ForegroundServiceStartNotAllowedException or OEM restriction
+        desiredRunning = false
+        startPending = false
         false
       }
     }
 
     fun stop(context: Context) {
+      val hadPendingStart = startPending && !isRunning
+      desiredRunning = false
+      isRunning = false
+      activeGeneration += 1L
+      activeInstance?.cancelScheduledTicks()
+      if (hadPendingStart) {
+        // Avoid calling stopService() before onStartCommand() invokes startForeground(),
+        // which throws RemoteServiceException on API 26-30; onStartCommand() will call
+        // startForeground() and immediately tear down upon seeing !desiredRunning.
+        return
+      }
+      startPending = false
       try {
         context.stopService(Intent(context, RemoteKeepAliveService::class.java))
       } catch (_: Exception) {

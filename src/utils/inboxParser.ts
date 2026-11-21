@@ -60,7 +60,15 @@ function normalizeWorkspaceUriKey(uri: string | null | undefined): string | null
   if (vscodeRemoteMatch) {
     value = vscodeRemoteMatch[1];
   } else if (/^file:\/\//i.test(value)) {
-    value = value.replace(/^file:\/\/(?:localhost)?/i, '');
+    if (/^file:\/\/localhost(?=\/|$)/i.test(value)) {
+      value = value.replace(/^file:\/\/localhost/i, '');
+    } else if (/^file:\/\/\//i.test(value)) {
+      value = value.replace(/^file:\/\//i, '');
+    } else {
+      // UNC file URI: `file://server/share/path` -> `/server/share/path`
+      // matching `\\server\share\path` once backslashes collapse.
+      value = `/${value.replace(/^file:\/\//i, '')}`;
+    }
   }
 
   try {
@@ -68,7 +76,7 @@ function normalizeWorkspaceUriKey(uri: string | null | undefined): string | null
   } catch {
     // Keep original string if malformed percent-escape is present.
   }
-  value = value.replace(/\\/g, '/');
+  value = value.normalize('NFC').replace(/\\/g, '/');
 
   if (/^[a-zA-Z]:\//.test(value)) {
     value = `/${value}`;
@@ -89,9 +97,10 @@ function normalizeWorkspaceUriKey(uri: string | null | undefined): string | null
 function normalizeProjectSlugKey(name: string | null | undefined): string | null {
   if (!name || typeof name !== 'string') return null;
   const slug = name
+    .normalize('NFC')
     .trim()
     .toLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, '');
+    .replace(/[^\p{L}\p{M}\p{N}]+/gu, '');
   return slug.length >= 2 ? slug : null;
 }
 
@@ -99,7 +108,11 @@ function getCanonicalPathSegmentCount(normalizedUriKey: string): number {
   if (!normalizedUriKey.startsWith('/')) {
     return 0;
   }
-  return normalizedUriKey.split('/').filter(Boolean).length;
+  const segments = normalizedUriKey.split('/').filter(Boolean);
+  if (segments.length > 0 && /^[a-z]:$/.test(segments[0])) {
+    return segments.length - 1;
+  }
+  return segments.length;
 }
 
 const ATTENTION_PRIORITY: Record<InboxAttentionKind, number> = {
@@ -135,6 +148,9 @@ export function parseProtoTimestampMs(raw: unknown): number {
     if (!Number.isFinite(raw) || raw <= 0) {
       return 0;
     }
+    if (raw > 1e14) {
+      return Math.floor(raw / 1000);
+    }
     return raw > 1e11 ? Math.floor(raw) : Math.floor(raw * 1000);
   }
 
@@ -147,6 +163,9 @@ export function parseProtoTimestampMs(raw: unknown): number {
       const numeric = Number(trimmed);
       if (!Number.isFinite(numeric) || numeric <= 0) {
         return 0;
+      }
+      if (numeric > 1e14) {
+        return Math.floor(numeric / 1000);
       }
       return numeric > 1e11 ? Math.floor(numeric) : Math.floor(numeric * 1000);
     }
@@ -339,7 +358,9 @@ export function isEmptyWorkspaceRoute(params: {
     return false;
   }
   return Boolean(
-    params.activeInstanceUuid && params.activeCascadeId === null,
+    !params.activeUrl &&
+      params.activeInstanceUuid &&
+      params.activeCascadeId === null,
   );
 }
 
@@ -424,14 +445,22 @@ function extractLastSegmentFromUri(uri: unknown): string | null {
   if (typeof uri !== 'string' || !uri.trim()) {
     return null;
   }
+  const trimmed = uri.trim();
+  const hasScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed);
+  const withoutScheme = hasScheme
+    ? trimmed.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/]*/, '')
+    : trimmed;
+  if (hasScheme && !withoutScheme) {
+    return null;
+  }
   try {
-    const decoded = decodeURIComponent(uri.trim()).replace(/\/+$/, '');
-    const withoutScheme = decoded.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/]*/, '');
-    const candidate = withoutScheme || decoded;
-    const parts = candidate.split(/[\\/]/).filter(Boolean);
+    const decoded = decodeURIComponent(withoutScheme)
+      .normalize('NFC')
+      .replace(/\/+$/, '');
+    const parts = decoded.split(/[\\/]/).filter(Boolean);
     return parts.length > 0 ? parts[parts.length - 1] : null;
   } catch {
-    const cleaned = uri.trim().replace(/\/+$/, '');
+    const cleaned = withoutScheme.normalize('NFC').replace(/\/+$/, '');
     const parts = cleaned.split(/[\\/]/).filter(Boolean);
     return parts.length > 0 ? parts[parts.length - 1] : null;
   }
@@ -2521,9 +2550,11 @@ function parseServerProjectsForInstance(params: {
 
       const archived = Boolean(rawProj.archived);
       const workspaceUris = extractProjectWorkspaceUris(rawProj);
-      for (const uri of workspaceUris) {
-        const key = normalizeWorkspaceUriKey(uri);
-        if (key) coveredWorkspaceUriKeys.add(key);
+      if (!archived) {
+        for (const uri of workspaceUris) {
+          const key = normalizeWorkspaceUriKey(uri);
+          if (key) coveredWorkspaceUriKeys.add(key);
+        }
       }
 
       const rawName = rawProj.name ?? rawProj.title ?? rawProj.displayName ?? rawProj.display_name;
@@ -2535,9 +2566,20 @@ function parseServerProjectsForInstance(params: {
           ? truncateText(rawName.trim(), 72)
           : truncateText(fallbackName, 72);
 
-      const updatedAtMs = parseProtoTimestampMs(
-        rawProj.updatedAt ?? rawProj.updated_at ?? rawProj.updateTimeMicros,
-      );
+      const rawMicros = rawProj.updateTimeMicros ?? rawProj.update_time_micros;
+      const parsedMicrosNum =
+        typeof rawMicros === 'number'
+          ? rawMicros
+          : typeof rawMicros === 'string' && /^\d+(?:\.\d+)?$/.test(rawMicros.trim())
+            ? Number(rawMicros.trim())
+            : 0;
+      const microsAsMs =
+        Number.isFinite(parsedMicrosNum) && parsedMicrosNum > 0
+          ? Math.floor(parsedMicrosNum / 1000)
+          : 0;
+      const updatedAtMs =
+        parseProtoTimestampMs(rawProj.updatedAt ?? rawProj.updated_at) ||
+        microsAsMs;
 
       parsed.push({
         id: `${instanceUuid}:project:${projectId}`,
@@ -3089,7 +3131,7 @@ export function buildProjectGroups(
     group: InboxProjectGroup,
   ) => {
     if (!rawName || !rawName.trim()) return;
-    const key = `${instanceUuid}:${rawName.trim().toLowerCase()}`;
+    const key = `${instanceUuid}:${rawName.normalize('NFC').trim().toLowerCase()}`;
     const list = groupsByWorkspaceName.get(key) ?? [];
     if (!list.includes(group)) {
       list.push(group);
@@ -3178,18 +3220,24 @@ export function buildProjectGroups(
       newChatUrl: buildOverviewUrl('remote-control', proj.instanceUuid),
     };
     groupsByKey.set(group.id, group);
-    if (proj.projectId) {
+    if (proj.projectId && !groupByProjectId.has(`${proj.instanceUuid}:${proj.projectId}`)) {
       groupByProjectId.set(`${proj.instanceUuid}:${proj.projectId}`, group);
     }
     for (const cid of proj.conversationIds) {
-      groupByConversationId.set(`${proj.instanceUuid}:${cid}`, group);
+      const convKey = `${proj.instanceUuid}:${cid}`;
+      if (!groupByConversationId.has(convKey)) {
+        groupByConversationId.set(convKey, group);
+      }
     }
     const instUriEntries =
       serverUriEntriesByInstance.get(proj.instanceUuid) ?? [];
     for (const uri of proj.workspaceUris) {
       const uriKey = normalizeWorkspaceUriKey(uri);
       if (uriKey) {
-        groupByWorkspaceUri.set(`${proj.instanceUuid}:${uriKey}`, group);
+        const fullUriKey = `${proj.instanceUuid}:${uriKey}`;
+        if (!groupByWorkspaceUri.has(fullUriKey)) {
+          groupByWorkspaceUri.set(fullUriKey, group);
+        }
         instUriEntries.push({ uriKey, group });
       }
       indexProjectName(proj.instanceUuid, extractLastSegmentFromUri(uri), group);
@@ -3264,7 +3312,7 @@ export function buildProjectGroups(
       }
       for (const candName of candidateNames) {
         const nameCandidates = groupsByWorkspaceName.get(
-          `${thread.instanceUuid}:${candName.toLowerCase()}`,
+          `${thread.instanceUuid}:${candName.normalize('NFC').toLowerCase()}`,
         );
         if (nameCandidates && nameCandidates.length === 1) {
           group = nameCandidates[0];
@@ -3321,14 +3369,19 @@ export function buildProjectGroups(
           newChatUrl: buildOverviewUrl(thread.source, thread.instanceUuid),
         };
         groupsByKey.set(groupKey, group);
-        if (thread.projectId) {
+        if (
+          thread.projectId &&
+          !groupByProjectId.has(`${thread.instanceUuid}:${thread.projectId}`)
+        ) {
           groupByProjectId.set(`${thread.instanceUuid}:${thread.projectId}`, group);
         }
-        const uriKey = normalizeWorkspaceUriKey(thread.workspaceUri);
-        if (uriKey) {
-          groupByWorkspaceUri.set(`${thread.instanceUuid}:${uriKey}`, group);
+        if (!isExplicitArchivedProject) {
+          const uriKey = normalizeWorkspaceUriKey(thread.workspaceUri);
+          if (uriKey && !groupByWorkspaceUri.has(`${thread.instanceUuid}:${uriKey}`)) {
+            groupByWorkspaceUri.set(`${thread.instanceUuid}:${uriKey}`, group);
+          }
+          indexProjectName(thread.instanceUuid, thread.workspaceName, group);
         }
-        indexProjectName(thread.instanceUuid, thread.workspaceName, group);
       }
     }
 
@@ -3567,6 +3620,9 @@ function matchServerProjectForThreadTiered(
       if (bestMatches.length === 1) {
         return bestMatches[0];
       }
+      if (bestMatches.length > 1) {
+        break;
+      }
     }
   }
 
@@ -3583,25 +3639,33 @@ function matchServerProjectForThreadTiered(
 
   // Tier 5: Unambiguous exact project name or workspace folder basename match.
   for (const pool of orderedPools) {
+    let hadAmbiguousMatchInPool = false;
     for (const candName of candidateNames) {
-      const targetName = candName.toLowerCase();
+      const targetName = candName.normalize('NFC').toLowerCase();
       const nameMatches = pool.filter((proj) => {
-        if (proj.name.trim().toLowerCase() === targetName) {
+        if (proj.name.normalize('NFC').trim().toLowerCase() === targetName) {
           return true;
         }
         return proj.workspaceUris.some((uri) => {
           const seg = extractLastSegmentFromUri(uri);
-          return seg ? seg.trim().toLowerCase() === targetName : false;
+          return seg ? seg.normalize('NFC').trim().toLowerCase() === targetName : false;
         });
       });
       if (nameMatches.length === 1) {
         return nameMatches[0];
       }
+      if (nameMatches.length > 1) {
+        hadAmbiguousMatchInPool = true;
+      }
+    }
+    if (hadAmbiguousMatchInPool) {
+      break;
     }
   }
 
   // Tier 6: Unambiguous Unicode-aware normalized slug match.
   for (const pool of orderedPools) {
+    let hadAmbiguousSlugInPool = false;
     for (const candName of candidateNames) {
       const targetSlug = normalizeProjectSlugKey(candName);
       if (!targetSlug) continue;
@@ -3617,6 +3681,12 @@ function matchServerProjectForThreadTiered(
       if (slugMatches.length === 1) {
         return slugMatches[0];
       }
+      if (slugMatches.length > 1) {
+        hadAmbiguousSlugInPool = true;
+      }
+    }
+    if (hadAmbiguousSlugInPool) {
+      break;
     }
   }
 
@@ -3877,7 +3947,10 @@ export function parseInboxBridgeMessage(
                 typeof rawUsage.error === 'string' ? rawUsage.error : null,
             }
           : null;
-      return {
+      const snapshotMessage: Extract<
+        InboxBridgeMessage,
+        { type: 'AGY_INBOX_SNAPSHOT' }
+      > = {
         type: 'AGY_INBOX_SNAPSHOT',
         fetchedAtMs:
           typeof parsed.fetchedAtMs === 'number'
@@ -3904,6 +3977,10 @@ export function parseInboxBridgeMessage(
         usage: sanitizedUsage,
         error: typeof parsed.error === 'string' ? parsed.error : null,
       };
+      if (typeof parsed.isEmptyRoute === 'boolean') {
+        snapshotMessage.isEmptyRoute = parsed.isEmptyRoute;
+      }
+      return snapshotMessage;
     }
 
     case 'AGY_INBOX_ACTIVE_ROUTE': {
@@ -4087,13 +4164,15 @@ export function parseInboxBridgeMessage(
     }
 
     case 'AGY_INBOX_EMPTY_SCREEN': {
-      const reason =
-        parsed.reason === 'route_overview' || parsed.reason === 'dom_empty'
-          ? parsed.reason
-          : 'dom_empty';
+      if (
+        parsed.reason !== 'route_overview' &&
+        parsed.reason !== 'dom_empty'
+      ) {
+        return null;
+      }
       return {
         type: 'AGY_INBOX_EMPTY_SCREEN',
-        reason,
+        reason: parsed.reason,
         activeUrl:
           typeof parsed.activeUrl === 'string' ? parsed.activeUrl : undefined,
         activeInstanceUuid:

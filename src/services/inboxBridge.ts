@@ -4,7 +4,7 @@ import { ActiveThreadProjectContext } from '../types/inbox';
  * Trusted-Types-safe WebView bridge injected into `https://antigravity.google.com`.
  *
  * Security & CSP invariants:
- * - Executes strictly when `window.location.hostname === 'antigravity.google.com'`.
+ * - Executes strictly when `window.location.origin === 'https://antigravity.google.com'`.
  * - Never touches `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`,
  *   `<script>` injection, `eval`, or `new Function` (satisfies `require-trusted-types-for 'script'`).
  * - Reuses the host page's first-party / enterprise gRPC-Web `ApiServicePromiseClient`
@@ -18,7 +18,7 @@ import { ActiveThreadProjectContext } from '../types/inbox';
 export const INBOX_BRIDGE_SCRIPT = `
 (function() {
   try {
-    if (!window.location || window.location.hostname !== 'antigravity.google.com') {
+    if (!window.location || window.location.origin !== 'https://antigravity.google.com') {
       return true;
     }
     if (window.__agyInboxBridge) {
@@ -66,6 +66,7 @@ export const INBOX_BRIDGE_SCRIPT = `
     var INSTANCE_RPC_TIMEOUT_MS = 8000;
     var JETBOX_SUMMARIES_TIMEOUT_MS = 5500;
     var JETBOX_SUMMARIES_SETTLE_MS = 220;
+    var JETBOX_MAX_BUFFER_BYTES = 8 * 1024 * 1024;
     var READ_PROJECTS_BATCH_SIZE = 64;
     var BACKGROUND_TASKS_RPC_TIMEOUT_MS = 3500;
     var PROJECTS_RPC_TIMEOUT_MS = 5000;
@@ -77,6 +78,7 @@ export const INBOX_BRIDGE_SCRIPT = `
     var capturedApiClient = null;
     var capturedMetadata = null;
     var capturedMetadataAtMs = 0;
+    var bridgeRpcDepth = 0;
     var standaloneApiClient = null;
     var cachedProtoNs = null;
     var cachedAuthFirstParty = null;
@@ -99,7 +101,9 @@ export const INBOX_BRIDGE_SCRIPT = `
     var cloudTrajectoriesCache = null;
     var activeIframeCascadeId = null;
     var activeIframeInstanceUuid = null;
+    var activeIframeIsEmptyRoute = null;
     var hasIframeRouteOverride = false;
+    var isSyncingHostUrl = false;
     var activeThreadContext = null;
     var pendingFastNav = null;
     var pendingStartNav = null;
@@ -111,7 +115,48 @@ export const INBOX_BRIDGE_SCRIPT = `
     var activeRefreshToken = 0;
     var lastBackgroundRefreshCompletedAtMs = 0;
     var pendingRpcDeadlines = [];
+    var activeJetboxCancels = [];
+    var activeTimeoutIds = [];
+    var bootstrapTimers = [];
+    var realtimeHintMicrotaskQueued = false;
     var isStopped = false;
+
+    function invokeBridgeRpc(fn) {
+      bridgeRpcDepth += 1;
+      try {
+        return fn();
+      } finally {
+        bridgeRpcDepth -= 1;
+      }
+    }
+
+    function cancelActiveJetboxStreams() {
+      var cancels = activeJetboxCancels;
+      activeJetboxCancels = [];
+      for (var i = 0; i < cancels.length; i++) {
+        try {
+          cancels[i]();
+        } catch (_) {}
+      }
+    }
+
+    function trackTimeoutId(id) {
+      if (id !== null && id !== undefined) {
+        activeTimeoutIds.push(id);
+      }
+      return id;
+    }
+
+    function clearTrackedTimeout(id) {
+      if (id === null || id === undefined) return;
+      clearTimeout(id);
+      for (var i = activeTimeoutIds.length - 1; i >= 0; i--) {
+        if (activeTimeoutIds[i] === id) {
+          activeTimeoutIds.splice(i, 1);
+          break;
+        }
+      }
+    }
 
     function generateUuidV4() {
       try {
@@ -155,6 +200,8 @@ export const INBOX_BRIDGE_SCRIPT = `
           typeof res.message === 'string' &&
           !res.cascadeId &&
           !res.cascade_id &&
+          !res.trajectorySummaries &&
+          !res.trajectory_summaries &&
           !res.project &&
           !res.projects &&
           !res.projectIds &&
@@ -177,19 +224,28 @@ export const INBOX_BRIDGE_SCRIPT = `
       return SAFE_ID_RE.test(uuid) ? uuid : null;
     }
 
-    function setIframeCascadeOverride(cascadeId) {
+    function setIframeCascadeOverride(cascadeId, isEmptyRoute) {
       activeIframeCascadeId = cascadeId || null;
       activeIframeInstanceUuid = extractInstanceUuidFromHostPath();
       hasIframeRouteOverride = activeIframeInstanceUuid !== null;
+      if (cascadeId) {
+        activeIframeIsEmptyRoute = false;
+      } else if (typeof isEmptyRoute === 'boolean') {
+        activeIframeIsEmptyRoute = isEmptyRoute;
+      } else {
+        activeIframeIsEmptyRoute = null;
+      }
     }
 
     function clearIframeCascadeOverride() {
       activeIframeCascadeId = null;
       activeIframeInstanceUuid = null;
+      activeIframeIsEmptyRoute = null;
       hasIframeRouteOverride = false;
     }
 
     function postToNative(payload) {
+      if (isStopped) return;
       try {
         if (
           window.ReactNativeWebView &&
@@ -231,17 +287,22 @@ export const INBOX_BRIDGE_SCRIPT = `
           instanceUuid: currentInstanceUuid,
           cascadeId: hasIframeRouteOverride
             ? activeIframeCascadeId
-            : (cMatch && cMatch[1]) || null
+            : (cMatch && cMatch[1]) || null,
+          isEmptyRoute:
+            hasIframeRouteOverride && typeof activeIframeIsEmptyRoute === 'boolean'
+              ? activeIframeIsEmptyRoute
+              : null
         };
       }
       var cloudMatch = /^\\/remote\\/c\\/([a-zA-Z0-9._-]+)(?:[/?#]|$)/.exec(stripped);
       if (cloudMatch) {
         return {
           instanceUuid: '__cloud__',
-          cascadeId: cloudMatch[1]
+          cascadeId: cloudMatch[1],
+          isEmptyRoute: null
         };
       }
-      return { instanceUuid: null, cascadeId: null };
+      return { instanceUuid: null, cascadeId: null, isEmptyRoute: null };
     }
 
     function discoverHostNamespaces() {
@@ -365,8 +426,10 @@ export const INBOX_BRIDGE_SCRIPT = `
                       summary: title
                     };
                   }
-                  cloudTrajectoriesCache = mapped;
-                  scheduleRefresh(200);
+                  if (!isStopped) {
+                    cloudTrajectoriesCache = mapped;
+                    scheduleRefresh(200);
+                  }
                 }
               } catch (_) {}
             }).catch(function() {});
@@ -400,26 +463,31 @@ export const INBOX_BRIDGE_SCRIPT = `
             var orig = Ctor.prototype[methodName];
             if (typeof orig !== 'function') return;
             Ctor.prototype[methodName] = function() {
-              if (this) {
-                capturedApiClient = this;
-              }
-              var callMeta = arguments.length > 1 ? arguments[1] : null;
-              if (callMeta && typeof callMeta === 'object') {
-                try {
-                  var copy = Object.create(null);
-                  var mKeys = Object.keys(callMeta);
-                  for (var k = 0; k < mKeys.length; k++) {
-                    var mk = mKeys[k];
-                    if (typeof callMeta[mk] === 'string') {
-                      copy[mk] = callMeta[mk];
+              var isBridgeCall = bridgeRpcDepth > 0;
+              if (!isBridgeCall) {
+                if (this) {
+                  capturedApiClient = this;
+                }
+                var callMeta = arguments.length > 1 ? arguments[1] : null;
+                if (callMeta && typeof callMeta === 'object') {
+                  try {
+                    var copy = Object.create(null);
+                    var mKeys = Object.keys(callMeta);
+                    for (var k = 0; k < mKeys.length; k++) {
+                      var mk = mKeys[k];
+                      if (typeof callMeta[mk] === 'string') {
+                        copy[mk] = callMeta[mk];
+                      }
                     }
-                  }
-                  capturedMetadata = copy;
-                  capturedMetadataAtMs = Date.now();
-                } catch (_) {}
+                    capturedMetadata = copy;
+                    capturedMetadataAtMs = Date.now();
+                  } catch (_) {}
+                }
               }
               var result = orig.apply(this, arguments);
               if (
+                !isBridgeCall &&
+                !isStopped &&
                 methodName === 'proxyCommand' &&
                 result &&
                 typeof result.then === 'function'
@@ -436,7 +504,9 @@ export const INBOX_BRIDGE_SCRIPT = `
                   ) {
                     result.then(
                       function() {
-                        scheduleRefresh(350);
+                        if (!isStopped) {
+                          scheduleRefresh(350);
+                        }
                       },
                       function() {}
                     );
@@ -554,6 +624,10 @@ export const INBOX_BRIDGE_SCRIPT = `
           return buildStandaloneAuthHeader().then(function(freshAuth) {
             if (freshAuth) {
               meta[authHeaderKey] = freshAuth;
+              if (capturedMetadata) {
+                capturedMetadata[authHeaderKey] = freshAuth;
+                capturedMetadataAtMs = Date.now();
+              }
             }
             return {
               proto: proto,
@@ -639,26 +713,29 @@ export const INBOX_BRIDGE_SCRIPT = `
     function withTimeout(promise, timeoutMs, label) {
       return new Promise(function(resolve, reject) {
         var settled = false;
+        var timer = null;
         var deadlineEntry = {
           deadlineMs: Date.now() + timeoutMs,
           fire: function() {
             if (!settled) {
               settled = true;
-              clearTimeout(timer);
+              clearTrackedTimeout(timer);
+              timer = null;
               reject(new Error(label || 'RPC timeout'));
             }
           }
         };
         pendingRpcDeadlines.push(deadlineEntry);
-        var timer = setTimeout(function() {
+        timer = trackTimeoutId(setTimeout(function() {
           removePendingRpcDeadline(deadlineEntry);
           deadlineEntry.fire();
-        }, timeoutMs);
+        }, timeoutMs));
         promise.then(
           function(value) {
             if (!settled) {
               settled = true;
-              clearTimeout(timer);
+              clearTrackedTimeout(timer);
+              timer = null;
               removePendingRpcDeadline(deadlineEntry);
               resolve(value);
             }
@@ -666,7 +743,8 @@ export const INBOX_BRIDGE_SCRIPT = `
           function(err) {
             if (!settled) {
               settled = true;
-              clearTimeout(timer);
+              clearTrackedTimeout(timer);
+              timer = null;
               removePendingRpcDeadline(deadlineEntry);
               reject(err);
             }
@@ -686,12 +764,14 @@ export const INBOX_BRIDGE_SCRIPT = `
       if (typeof responseObj.getPayload_asB64 === 'function') {
         var b64 = responseObj.getPayload_asB64();
         if (b64 && typeof atob === 'function') {
-          var bin = atob(b64);
-          var out = new Uint8Array(bin.length);
-          for (var i = 0; i < bin.length; i++) {
-            out[i] = bin.charCodeAt(i);
-          }
-          return out;
+          try {
+            var bin = atob(b64);
+            var out = new Uint8Array(bin.length);
+            for (var i = 0; i < bin.length; i++) {
+              out[i] = bin.charCodeAt(i);
+            }
+            return out;
+          } catch (_) {}
         }
       }
       if (typeof responseObj.getPayload === 'function') {
@@ -765,19 +845,22 @@ export const INBOX_BRIDGE_SCRIPT = `
       var offset = 0;
       var decoder = typeof TextDecoder === 'function' ? new TextDecoder('utf-8') : null;
       if (!buffer || buffer.length === 0 || !decoder) {
-        return { frames: frames, remaining: buffer || new Uint8Array(0) };
+        return { frames: frames, remaining: buffer || new Uint8Array(0), overflow: false };
       }
       // Fallback for plain unframed JSON responses (e.g. legacy proxies or test mocks).
       if (buffer[0] === 123) {
+        if (buffer.length > JETBOX_MAX_BUFFER_BYTES) {
+          return { frames: frames, remaining: new Uint8Array(0), overflow: true };
+        }
         try {
           var directText = decoder.decode(buffer);
           var directObj = JSON.parse(directText);
           if (directObj && typeof directObj === 'object') {
             frames.push({ flags: 0, data: directObj });
-            return { frames: frames, remaining: new Uint8Array(0) };
+            return { frames: frames, remaining: new Uint8Array(0), overflow: false };
           }
         } catch (_) {
-          return { frames: frames, remaining: buffer };
+          return { frames: frames, remaining: buffer, overflow: false };
         }
       }
       while (offset + 5 <= buffer.length) {
@@ -787,17 +870,20 @@ export const INBOX_BRIDGE_SCRIPT = `
           (buffer[offset + 2] << 16) +
           (buffer[offset + 3] << 8) +
           buffer[offset + 4];
-        if (len > 32 * 1024 * 1024) {
+        if (len > JETBOX_MAX_BUFFER_BYTES) {
           // Corrupted/unexpected framing — abort parsing remaining bytes.
-          return { frames: frames, remaining: new Uint8Array(0) };
+          return { frames: frames, remaining: new Uint8Array(0), overflow: true };
         }
         if (offset + 5 + len > buffer.length) {
           break;
         }
         var slice = buffer.subarray(offset + 5, offset + 5 + len);
         offset += 5 + len;
-        // Skip compressed frames (bit 0 set) since we request uncompressed JSON.
+        // Skip compressed data frames (bit 0 set); preserve compressed EndStream signal (bit 1 set).
         if ((flags & 1) !== 0) {
+          if ((flags & 2) !== 0) {
+            frames.push({ flags: flags, data: Object.create(null) });
+          }
           continue;
         }
         try {
@@ -808,33 +894,63 @@ export const INBOX_BRIDGE_SCRIPT = `
       }
       return {
         frames: frames,
-        remaining: offset < buffer.length ? buffer.subarray(offset) : new Uint8Array(0)
+        remaining: offset < buffer.length ? buffer.slice(offset) : new Uint8Array(0),
+        overflow: false
       };
+    }
+
+    function parseTimestampForComparison(ts) {
+      if (ts === null || ts === undefined || ts === '') return 0;
+      if (typeof ts === 'number') {
+        if (!isFinite(ts) || ts <= 0) return 0;
+        if (ts > 1e14) return Math.floor(ts / 1000);
+        return ts > 1e11 ? ts : ts * 1000;
+      }
+      if (typeof ts === 'string') {
+        var trimmed = ts.trim();
+        if (!trimmed) return 0;
+        if (/^\\d+(?:\\.\\d+)?$/.test(trimmed)) {
+          var num = Number(trimmed);
+          if (!isFinite(num) || num <= 0) return 0;
+          if (num > 1e14) return Math.floor(num / 1000);
+          return num > 1e11 ? num : num * 1000;
+        }
+        var parsed = Date.parse(trimmed);
+        return isNaN(parsed) ? 0 : parsed;
+      }
+      if (typeof ts === 'object') {
+        var sec = Number(ts.seconds !== undefined ? ts.seconds : ts.secs || 0);
+        var nanos = Number(ts.nanos !== undefined ? ts.nanos : ts.nanoseconds || 0);
+        if (isFinite(sec) && sec > 0) {
+          var nanoMs = isFinite(nanos) && nanos > 0 ? Math.floor(nanos / 1e6) : 0;
+          return sec * 1000 + nanoMs;
+        }
+      }
+      return 0;
     }
 
     function getSummaryTimestampScore(raw) {
       if (!raw || typeof raw !== 'object') return 0;
       var ts = raw.lastModifiedTime || raw.last_modified_time || raw.createdTime || raw.created_time;
-      if (!ts) return 0;
-      if (typeof ts === 'number') return ts > 1e11 ? ts : ts * 1000;
-      if (typeof ts === 'string') {
-        var parsed = Date.parse(ts);
-        return isNaN(parsed) ? 0 : parsed;
-      }
-      if (typeof ts === 'object') {
-        var sec = Number(ts.seconds || ts.secs || 0);
-        if (sec > 0) return sec * 1000;
-      }
-      return 0;
+      return parseTimestampForComparison(ts);
     }
 
     function isSummaryLiveActive(raw) {
       if (!raw || typeof raw !== 'object' || raw.killed) return false;
       var waiting = raw.waitingSteps || raw.waiting_steps;
       if (Array.isArray(waiting) && waiting.length > 0) return true;
-      if (raw.notFullyIdle || raw.not_fully_idle || raw.hasRunningSubagents || raw.has_running_subagents) {
+      if (
+        raw.notFullyIdle ||
+        raw.not_fully_idle ||
+        raw.hasRunningSubagents ||
+        raw.has_running_subagents ||
+        raw.hasActiveChildren ||
+        raw.has_active_children
+      ) {
         return true;
       }
+      var bgCount = Number(raw.backgroundTaskCount || raw.background_task_count || 0);
+      if (isFinite(bgCount) && bgCount > 0) return true;
       var st = raw.status;
       if (st === 2 || st === 3 || st === 4) return true;
       if (typeof st === 'string') {
@@ -853,20 +969,6 @@ export const INBOX_BRIDGE_SCRIPT = `
 
     function getJetboxBackendKey(backend) {
       return backend ? String(backend) : 'local';
-    }
-
-    function parseTimestampForComparison(ts) {
-      if (!ts) return 0;
-      if (typeof ts === 'number') return ts > 1e11 ? ts : ts * 1000;
-      if (typeof ts === 'string') {
-        var parsed = Date.parse(ts);
-        return isNaN(parsed) ? 0 : parsed;
-      }
-      if (typeof ts === 'object') {
-        var sec = Number(ts.seconds || ts.secs || 0);
-        if (sec > 0) return sec * 1000;
-      }
-      return 0;
     }
 
     function hasPresentScalar(obj, camelKey, snakeKey) {
@@ -1075,18 +1177,48 @@ export const INBOX_BRIDGE_SCRIPT = `
       return merged;
     }
 
+    function stripVolatileRuntimeFields(raw) {
+      if (!raw || typeof raw !== 'object') return raw;
+      var clean = Object.create(null);
+      var keys = Object.keys(raw);
+      for (var i = 0; i < keys.length; i++) {
+        var k = keys[i];
+        if (
+          k === 'waitingSteps' ||
+          k === 'waiting_steps' ||
+          k === 'notFullyIdle' ||
+          k === 'not_fully_idle' ||
+          k === 'hasRunningSubagents' ||
+          k === 'has_running_subagents' ||
+          k === 'hasActiveChildren' ||
+          k === 'has_active_children' ||
+          k === 'backgroundTaskCount' ||
+          k === 'background_task_count' ||
+          k === 'status'
+        ) {
+          continue;
+        }
+        clean[k] = raw[k];
+      }
+      return clean;
+    }
+
     function mergeTrajectorySummaryMaps(jetboxMap, cascadeMap, jetboxIsFresh) {
       var out = Object.create(null);
+      var hasCascadeMap = Boolean(cascadeMap && typeof cascadeMap === 'object');
       if (jetboxMap && typeof jetboxMap === 'object') {
         var jKeys = Object.keys(jetboxMap);
         for (var i = 0; i < jKeys.length; i++) {
           var jk = jKeys[i];
           if (SAFE_ID_RE.test(jk) && jetboxMap[jk] && typeof jetboxMap[jk] === 'object') {
-            out[jk] = jetboxMap[jk];
+            out[jk] =
+              jetboxIsFresh === false && !(hasCascadeMap && cascadeMap[jk])
+                ? stripVolatileRuntimeFields(jetboxMap[jk])
+                : jetboxMap[jk];
           }
         }
       }
-      if (cascadeMap && typeof cascadeMap === 'object') {
+      if (hasCascadeMap) {
         var cKeys = Object.keys(cascadeMap);
         for (var j = 0; j < cKeys.length; j++) {
           var ck = cKeys[j];
@@ -1339,21 +1471,48 @@ export const INBOX_BRIDGE_SCRIPT = `
         var receivedValidFrame = false;
         var settleTimer = null;
         var hardTimer = null;
+        var settleDeadlineEntry = null;
+        var hardDeadlineEntry = null;
+
+        function removeCancelHandle() {
+          for (var i = activeJetboxCancels.length - 1; i >= 0; i--) {
+            if (activeJetboxCancels[i] === abortStream) {
+              activeJetboxCancels.splice(i, 1);
+              break;
+            }
+          }
+        }
+
+        function clearSettleTimerAndDeadline() {
+          if (settleTimer !== null) {
+            clearTrackedTimeout(settleTimer);
+            settleTimer = null;
+          }
+          if (settleDeadlineEntry) {
+            removePendingRpcDeadline(settleDeadlineEntry);
+            settleDeadlineEntry = null;
+          }
+        }
 
         function finish(ok) {
           if (settled) return;
           settled = true;
-          if (settleTimer) {
-            clearTimeout(settleTimer);
-            settleTimer = null;
-          }
-          if (hardTimer) {
-            clearTimeout(hardTimer);
+          clearSettleTimerAndDeadline();
+          if (hardTimer !== null) {
+            clearTrackedTimeout(hardTimer);
             hardTimer = null;
           }
-          if (stream && typeof stream.cancel === 'function') {
+          if (hardDeadlineEntry) {
+            removePendingRpcDeadline(hardDeadlineEntry);
+            hardDeadlineEntry = null;
+          }
+          removeCancelHandle();
+          var activeStream = stream;
+          stream = null;
+          rawBuffer = new Uint8Array(0);
+          if (activeStream && typeof activeStream.cancel === 'function') {
             try {
-              stream.cancel();
+              activeStream.cancel();
             } catch (_) {}
           }
           resolve({
@@ -1362,18 +1521,46 @@ export const INBOX_BRIDGE_SCRIPT = `
           });
         }
 
-        function armSettleTimer() {
-          if (settleTimer) clearTimeout(settleTimer);
-          settleTimer = setTimeout(function() {
-            settleTimer = null;
-            finish(receivedValidFrame);
-          }, JETBOX_SUMMARIES_SETTLE_MS);
+        function abortStream() {
+          finish(false);
         }
 
-        hardTimer = setTimeout(function() {
+        activeJetboxCancels.push(abortStream);
+
+        function armSettleTimer() {
+          clearSettleTimerAndDeadline();
+          settleDeadlineEntry = {
+            deadlineMs: Date.now() + JETBOX_SUMMARIES_SETTLE_MS,
+            fire: function() {
+              finish(receivedValidFrame);
+            }
+          };
+          pendingRpcDeadlines.push(settleDeadlineEntry);
+          settleTimer = trackTimeoutId(setTimeout(function() {
+            settleTimer = null;
+            if (settleDeadlineEntry) {
+              removePendingRpcDeadline(settleDeadlineEntry);
+              settleDeadlineEntry = null;
+            }
+            finish(receivedValidFrame);
+          }, JETBOX_SUMMARIES_SETTLE_MS));
+        }
+
+        hardDeadlineEntry = {
+          deadlineMs: Date.now() + JETBOX_SUMMARIES_TIMEOUT_MS,
+          fire: function() {
+            finish(receivedValidFrame);
+          }
+        };
+        pendingRpcDeadlines.push(hardDeadlineEntry);
+        hardTimer = trackTimeoutId(setTimeout(function() {
           hardTimer = null;
+          if (hardDeadlineEntry) {
+            removePendingRpcDeadline(hardDeadlineEntry);
+            hardDeadlineEntry = null;
+          }
           finish(receivedValidFrame);
-        }, JETBOX_SUMMARIES_TIMEOUT_MS);
+        }, JETBOX_SUMMARIES_TIMEOUT_MS));
 
         try {
           var req = new ctx.proto.ProxyCommandRequest();
@@ -1393,69 +1580,88 @@ export const INBOX_BRIDGE_SCRIPT = `
               map.set('x-is-streaming', 'true');
             }
           }
-          stream = ctx.client.streamProxyCommand(req, ctx.metadata);
+          stream = invokeBridgeRpc(function() {
+            return ctx.client.streamProxyCommand(req, ctx.metadata);
+          });
           if (!stream || typeof stream.on !== 'function') {
             finish(false);
             return;
           }
           stream.on('data', function(res) {
             if (settled) return;
-            var chunk = extractRawPayloadBytes(res);
-            if (!chunk || chunk.length === 0) return;
-            if (receivedValidFrame) {
-              armSettleTimer();
-            }
-            rawBuffer = concatBytes(rawBuffer, chunk);
-            var decoded = decodeConnectJsonFrames(rawBuffer);
-            rawBuffer = decoded.remaining;
-            for (var i = 0; i < decoded.frames.length; i++) {
-              var frame = decoded.frames[i];
-              var payload = frame.data;
-              if (frame.flags === 2) {
-                var endErr = payload && payload.error ? payload.error : payload;
-                if (
-                  endErr &&
-                  typeof endErr === 'object' &&
-                  typeof endErr.code === 'string' &&
-                  endErr.code.toLowerCase() === 'unimplemented'
-                ) {
-                  unsupportedJetboxSummariesCache[cacheKey] = versionTag;
-                }
-                finish(receivedValidFrame);
+            try {
+              var chunk = extractRawPayloadBytes(res);
+              if (!chunk || chunk.length === 0) return;
+              if (rawBuffer.length + chunk.length > JETBOX_MAX_BUFFER_BYTES) {
+                finish(false);
                 return;
               }
-              if (payload && typeof payload === 'object') {
-                if (hasConnectRpcError(payload) && !payload.updates && !payload.deletes) {
+              if (receivedValidFrame) {
+                armSettleTimer();
+              }
+              rawBuffer = concatBytes(rawBuffer, chunk);
+              var decoded = decodeConnectJsonFrames(rawBuffer);
+              rawBuffer = decoded.remaining;
+              if (decoded.overflow) {
+                finish(false);
+                return;
+              }
+              for (var i = 0; i < decoded.frames.length; i++) {
+                var frame = decoded.frames[i];
+                var payload = frame.data;
+                if ((frame.flags & 2) !== 0) {
+                  var endErr =
+                    payload && typeof payload === 'object' && payload.error
+                      ? payload.error
+                      : hasConnectRpcError(payload)
+                        ? payload
+                        : null;
                   if (
-                    typeof payload.code === 'string' &&
-                    payload.code.toLowerCase() === 'unimplemented'
+                    endErr &&
+                    typeof endErr === 'object' &&
+                    typeof endErr.code === 'string' &&
+                    endErr.code.toLowerCase() === 'unimplemented'
                   ) {
                     unsupportedJetboxSummariesCache[cacheKey] = versionTag;
                   }
-                  finish(receivedValidFrame);
+                  finish(endErr ? false : receivedValidFrame);
                   return;
                 }
-                receivedValidFrame = true;
-                var updates = payload.updates;
-                if (updates && typeof updates === 'object' && !Array.isArray(updates)) {
-                  var uKeys = Object.keys(updates);
-                  for (var u = 0; u < uKeys.length; u++) {
-                    var uk = uKeys[u];
-                    if (SAFE_ID_RE.test(uk) && updates[uk] && typeof updates[uk] === 'object') {
-                      collected[uk] = updates[uk];
+                if (payload && typeof payload === 'object') {
+                  if (hasConnectRpcError(payload) && !payload.updates && !payload.deletes) {
+                    if (
+                      typeof payload.code === 'string' &&
+                      payload.code.toLowerCase() === 'unimplemented'
+                    ) {
+                      unsupportedJetboxSummariesCache[cacheKey] = versionTag;
+                    }
+                    finish(false);
+                    return;
+                  }
+                  receivedValidFrame = true;
+                  var updates = payload.updates;
+                  if (updates && typeof updates === 'object' && !Array.isArray(updates)) {
+                    var uKeys = Object.keys(updates);
+                    for (var u = 0; u < uKeys.length; u++) {
+                      var uk = uKeys[u];
+                      if (SAFE_ID_RE.test(uk) && updates[uk] && typeof updates[uk] === 'object') {
+                        collected[uk] = updates[uk];
+                      }
                     }
                   }
-                }
-                if (Array.isArray(payload.deletes)) {
-                  for (var d = 0; d < payload.deletes.length; d++) {
-                    var delId = payload.deletes[d];
-                    if (typeof delId === 'string') {
-                      delete collected[delId];
+                  if (Array.isArray(payload.deletes)) {
+                    for (var d = 0; d < payload.deletes.length; d++) {
+                      var delId = payload.deletes[d];
+                      if (typeof delId === 'string') {
+                        delete collected[delId];
+                      }
                     }
                   }
+                  armSettleTimer();
                 }
-                armSettleTimer();
               }
+            } catch (_) {
+              finish(false);
             }
           });
           stream.on('end', function() {
@@ -1470,10 +1676,10 @@ export const INBOX_BRIDGE_SCRIPT = `
             ) {
               unsupportedJetboxSummariesCache[cacheKey] = versionTag;
             }
-            finish(receivedValidFrame);
+            finish(false);
           });
         } catch (_) {
-          finish(receivedValidFrame);
+          finish(false);
         }
       });
     }
@@ -1500,7 +1706,9 @@ export const INBOX_BRIDGE_SCRIPT = `
           ? timeoutMs
           : INSTANCE_RPC_TIMEOUT_MS;
       return withTimeout(
-        ctx.client.proxyCommand(req, ctx.metadata),
+        invokeBridgeRpc(function() {
+          return ctx.client.proxyCommand(req, ctx.metadata);
+        }),
         rpcTimeout,
         'ProxyCommand timeout'
       ).then(function(res) {
@@ -1682,10 +1890,13 @@ export const INBOX_BRIDGE_SCRIPT = `
       });
     }
 
-    function fetchUsageFromCandidates(ctx, candidates, forceUsage, isBackgroundPoll) {
+    function fetchUsageFromCandidates(ctx, candidates, forceUsage, isBackgroundPoll, canWriteCache) {
+      var allowWrite = typeof canWriteCache === 'function' ? canWriteCache : function() { return !isStopped; };
       if (!candidates || candidates.length === 0) {
-        lastUsageCache = null;
-        lastUsageFetchedAtMs = 0;
+        if (allowWrite()) {
+          lastUsageCache = null;
+          lastUsageFetchedAtMs = 0;
+        }
         return Promise.resolve(null);
       }
       if (
@@ -1729,8 +1940,10 @@ export const INBOX_BRIDGE_SCRIPT = `
         var current = candidates[idx++];
         return queryUsageOnCandidate(ctx, current).then(function(res) {
           if (res && res.ok && res.payload) {
-            lastUsageCache = res.payload;
-            lastUsageFetchedAtMs = res.payload.fetchedAtMs;
+            if (allowWrite()) {
+              lastUsageCache = res.payload;
+              lastUsageFetchedAtMs = res.payload.fetchedAtMs;
+            }
             return res.payload;
           }
           if (!firstError && res && res.error) {
@@ -1758,7 +1971,8 @@ export const INBOX_BRIDGE_SCRIPT = `
       return job;
     }
 
-    function fetchProjectsForInstance(ctx, uuid) {
+    function fetchProjectsForInstance(ctx, uuid, canWriteCache) {
+      var allowWrite = typeof canWriteCache === 'function' ? canWriteCache : function() { return !isStopped; };
       return callProxyJson(ctx, uuid, LIST_PROJECTS_PATH, '{}', PROJECTS_RPC_TIMEOUT_MS)
         .then(function(listRes) {
           if (!listRes || typeof listRes !== 'object' || hasConnectRpcError(listRes)) {
@@ -1782,12 +1996,16 @@ export const INBOX_BRIDGE_SCRIPT = `
           }
           if (cleanIds.length === 0) {
             var resolvedEmpty = inlineProjects ? compactProjectsList(inlineProjects) : [];
-            lastProjectsCache[uuid] = resolvedEmpty;
+            if (allowWrite()) {
+              lastProjectsCache[uuid] = resolvedEmpty;
+            }
             return resolvedEmpty;
           }
           if (inlineProjects && inlineProjects.length >= cleanIds.length) {
             var compactedInline = compactProjectsList(inlineProjects);
-            lastProjectsCache[uuid] = compactedInline;
+            if (allowWrite()) {
+              lastProjectsCache[uuid] = compactedInline;
+            }
             return compactedInline;
           }
           var batchIdLists = [];
@@ -1844,7 +2062,9 @@ export const INBOX_BRIDGE_SCRIPT = `
             }
             if (anyBatchSucceeded) {
               var compactedProjects = compactProjectsList(combined);
-              lastProjectsCache[uuid] = compactedProjects;
+              if (allowWrite()) {
+                lastProjectsCache[uuid] = compactedProjects;
+              }
               return compactedProjects;
             }
             return (
@@ -1859,7 +2079,8 @@ export const INBOX_BRIDGE_SCRIPT = `
         });
     }
 
-    function fetchWorkspaceInfosForInstance(ctx, uuid) {
+    function fetchWorkspaceInfosForInstance(ctx, uuid, canWriteCache) {
+      var allowWrite = typeof canWriteCache === 'function' ? canWriteCache : function() { return !isStopped; };
       return callProxyJson(ctx, uuid, GET_WORKSPACE_INFOS_PATH, '{}', PROJECTS_RPC_TIMEOUT_MS)
         .then(function(wsRes) {
           if (!wsRes || typeof wsRes !== 'object' || hasConnectRpcError(wsRes)) {
@@ -1884,10 +2105,10 @@ export const INBOX_BRIDGE_SCRIPT = `
               : null) ||
             lastHomeDirCache[uuid] ||
             null;
-          if (infos) {
+          if (infos && allowWrite()) {
             lastWorkspaceInfosCache[uuid] = infos;
           }
-          if (homeUri) {
+          if (homeUri && allowWrite()) {
             lastHomeDirCache[uuid] = homeUri;
           }
           return {
@@ -1903,7 +2124,8 @@ export const INBOX_BRIDGE_SCRIPT = `
         });
     }
 
-    function fetchBackgroundTasksForInstance(ctx, uuid, version) {
+    function fetchBackgroundTasksForInstance(ctx, uuid, version, canWriteCache) {
+      var allowWrite = typeof canWriteCache === 'function' ? canWriteCache : function() { return !isStopped; };
       var versionTag = version || '*';
       if (unsupportedBackgroundTasksCache[uuid] === versionTag) {
         return Promise.resolve({ ok: false, tasks: null });
@@ -1918,6 +2140,7 @@ export const INBOX_BRIDGE_SCRIPT = `
         .then(function(res) {
           if (!res || typeof res !== 'object' || hasConnectRpcError(res)) {
             if (
+              allowWrite() &&
               res &&
               typeof res.code === 'string' &&
               res.code.toLowerCase() === 'unimplemented'
@@ -1969,7 +2192,9 @@ export const INBOX_BRIDGE_SCRIPT = `
               task: compactedTask
             });
           }
-          lastBackgroundTasksCache[uuid] = compact;
+          if (allowWrite()) {
+            lastBackgroundTasksCache[uuid] = compact;
+          }
           return { ok: true, tasks: compact };
         })
         .catch(function() {
@@ -1977,7 +2202,73 @@ export const INBOX_BRIDGE_SCRIPT = `
         });
     }
 
+    function deleteInstanceCachesForUuid(uuid) {
+      delete lastTrajectoryCache[uuid];
+      delete lastJetboxSummariesCache[uuid + ':local'];
+      delete lastJetboxSummariesCache[uuid + ':2'];
+      delete lastJetboxSummariesCache[uuid + ':3'];
+      delete unsupportedJetboxSummariesCache[uuid + ':local'];
+      delete unsupportedJetboxSummariesCache[uuid + ':2'];
+      delete unsupportedJetboxSummariesCache[uuid + ':3'];
+      delete lastBackgroundTasksCache[uuid];
+      delete unsupportedBackgroundTasksCache[uuid];
+      delete lastProjectsCache[uuid];
+      delete lastWorkspaceInfosCache[uuid];
+      delete lastHomeDirCache[uuid];
+    }
+
+    function pruneStaleInstanceCaches(activeUuids) {
+      var caches = [
+        lastTrajectoryCache,
+        lastBackgroundTasksCache,
+        unsupportedBackgroundTasksCache,
+        lastProjectsCache,
+        lastWorkspaceInfosCache,
+        lastHomeDirCache
+      ];
+      for (var c = 0; c < caches.length; c++) {
+        var keys = Object.keys(caches[c]);
+        for (var k = 0; k < keys.length; k++) {
+          if (!activeUuids[keys[k]]) {
+            delete caches[c][keys[k]];
+          }
+        }
+      }
+      var prefixedCaches = [lastJetboxSummariesCache, unsupportedJetboxSummariesCache];
+      for (var p = 0; p < prefixedCaches.length; p++) {
+        var pKeys = Object.keys(prefixedCaches[p]);
+        for (var pk = 0; pk < pKeys.length; pk++) {
+          var sep = pKeys[pk].indexOf(':');
+          var ownerUuid = sep > 0 ? pKeys[pk].substring(0, sep) : pKeys[pk];
+          if (!activeUuids[ownerUuid]) {
+            delete prefixedCaches[p][pKeys[pk]];
+          }
+        }
+      }
+    }
+
+    function buildSnapshotNativePayload(route, instancesPayload, usagePayload, errorMessage) {
+      var msg = {
+        type: 'AGY_INBOX_SNAPSHOT',
+        fetchedAtMs: Date.now(),
+        activeUrl: window.location.href,
+        activeInstanceUuid: route.instanceUuid,
+        activeCascadeId: route.cascadeId,
+        instances: instancesPayload,
+        cloudTrajectories: cloudTrajectoriesCache,
+        usage: usagePayload,
+        error: errorMessage
+      };
+      if (typeof route.isEmptyRoute === 'boolean') {
+        msg.isEmptyRoute = route.isEmptyRoute;
+      }
+      return msg;
+    }
+
     function refresh(forceUsage, isBackgroundPoll) {
+      if (isStopped) {
+        return Promise.resolve(null);
+      }
       var isHiddenBackgroundPoll =
         Boolean(isBackgroundPoll) ||
         (typeof document !== 'undefined' &&
@@ -2003,20 +2294,25 @@ export const INBOX_BRIDGE_SCRIPT = `
       pendingForcedUsageRefresh = false;
       pendingBackgroundFollowUp = false;
       var runToken = ++activeRefreshToken;
+      var isCurrentRun = function() {
+        return !isStopped && runToken === activeRefreshToken;
+      };
       inFlightRefreshStartedAtMs = Date.now();
 
       inFlightRefresh = getClientWithMetadata()
         .then(function(ctx) {
-          if (!ctx || isStopped || runToken !== activeRefreshToken) {
+          if (!ctx || !isCurrentRun()) {
             return null;
           }
           var listReq = new ctx.proto.ListInstancesRequest();
           return withTimeout(
-            ctx.client.listInstances(listReq, ctx.metadata),
+            invokeBridgeRpc(function() {
+              return ctx.client.listInstances(listReq, ctx.metadata);
+            }),
             INSTANCE_RPC_TIMEOUT_MS,
             'ListInstances timeout'
           ).then(function(listRes) {
-            if (isStopped || runToken !== activeRefreshToken) {
+            if (!isCurrentRun()) {
               return null;
             }
             var rawList =
@@ -2026,12 +2322,14 @@ export const INBOX_BRIDGE_SCRIPT = `
             var route = parseRouteFromLocation();
             var instanceJobs = [];
             var usageCandidates = [];
+            var activeUuids = Object.create(null);
 
             for (var i = 0; i < rawList.length; i++) {
               (function(inst) {
                 var uuid =
                   typeof inst.getUuid === 'function' ? inst.getUuid() : '';
                 if (!uuid || !SAFE_ID_RE.test(uuid)) return;
+                activeUuids[uuid] = true;
                 var status =
                   typeof inst.getStatus === 'function' ? inst.getStatus() : 0;
                 var meta =
@@ -2062,18 +2360,9 @@ export const INBOX_BRIDGE_SCRIPT = `
                   (route.instanceUuid === uuid && status !== 2);
 
                 if (!shouldQuery) {
-                  delete lastTrajectoryCache[uuid];
-                  delete lastJetboxSummariesCache[uuid + ':local'];
-                  delete lastJetboxSummariesCache[uuid + ':2'];
-                  delete lastJetboxSummariesCache[uuid + ':3'];
-                  delete unsupportedJetboxSummariesCache[uuid + ':local'];
-                  delete unsupportedJetboxSummariesCache[uuid + ':2'];
-                  delete unsupportedJetboxSummariesCache[uuid + ':3'];
-                  delete lastBackgroundTasksCache[uuid];
-                  delete unsupportedBackgroundTasksCache[uuid];
-                  delete lastProjectsCache[uuid];
-                  delete lastWorkspaceInfosCache[uuid];
-                  delete lastHomeDirCache[uuid];
+                  if (isCurrentRun()) {
+                    deleteInstanceCachesForUuid(uuid);
+                  }
                   instanceJobs.push(
                     Promise.resolve({
                       uuid: uuid,
@@ -2103,10 +2392,18 @@ export const INBOX_BRIDGE_SCRIPT = `
 
                 var cascadeTrajJob = callProxyJson(ctx, uuid, GET_TRAJECTORIES_PATH, '{}')
                   .then(function(parsed) {
+                    if (!parsed || typeof parsed !== 'object' || hasConnectRpcError(parsed)) {
+                      return {
+                        ok: false,
+                        trajectories: null,
+                        error:
+                          (parsed && typeof parsed.message === 'string' && parsed.message) ||
+                          'Unreachable'
+                      };
+                    }
                     var summaries =
-                      (parsed &&
-                        (parsed.trajectorySummaries ||
-                          parsed.trajectory_summaries)) ||
+                      (parsed.trajectorySummaries ||
+                        parsed.trajectory_summaries) ||
                       parsed ||
                       Object.create(null);
                     return {
@@ -2135,7 +2432,9 @@ export const INBOX_BRIDGE_SCRIPT = `
                     })
                   : fetchJetboxSummariesStream(ctx, uuid, 0, version).then(function(res) {
                       if (res && res.ok && res.summaries) {
-                        lastJetboxSummariesCache[localJetboxCacheKey] = res.summaries;
+                        if (isCurrentRun()) {
+                          lastJetboxSummariesCache[localJetboxCacheKey] = res.summaries;
+                        }
                         return {
                           ok: true,
                           liveSummaries: res.summaries,
@@ -2151,16 +2450,16 @@ export const INBOX_BRIDGE_SCRIPT = `
 
                 // Always fetch live running background tasks (even while backgrounded) so
                 // threads waiting on background commands/timers/workflows never notify early.
-                var bgTasksJob = fetchBackgroundTasksForInstance(ctx, uuid, version);
+                var bgTasksJob = fetchBackgroundTasksForInstance(ctx, uuid, version, isCurrentRun);
                 var projectsJob = isHiddenBackgroundPoll
                   ? Promise.resolve(lastProjectsCache[uuid] || null)
-                  : fetchProjectsForInstance(ctx, uuid);
+                  : fetchProjectsForInstance(ctx, uuid, isCurrentRun);
                 var wsInfoJob = isHiddenBackgroundPoll
                   ? Promise.resolve({
                       workspaceInfos: lastWorkspaceInfosCache[uuid] || null,
                       homeDirUri: lastHomeDirCache[uuid] || null
                     })
-                  : fetchWorkspaceInfosForInstance(ctx, uuid);
+                  : fetchWorkspaceInfosForInstance(ctx, uuid, isCurrentRun);
 
                 instanceJobs.push(
                   Promise.all([
@@ -2177,6 +2476,7 @@ export const INBOX_BRIDGE_SCRIPT = `
                     var wsResult = results[4] || { workspaceInfos: null, homeDirUri: null };
 
                     var extraBackends = [];
+                    var fallbackExtraCached = null;
                     if (!isHiddenBackgroundPoll && Array.isArray(projectsResult)) {
                       var hasCloudProj = false;
                       var hasEntProj = false;
@@ -2187,24 +2487,35 @@ export const INBOX_BRIDGE_SCRIPT = `
                       }
                       if (hasCloudProj) {
                         extraBackends.push(2);
-                      } else {
+                      } else if (isCurrentRun()) {
                         delete lastJetboxSummariesCache[uuid + ':2'];
                       }
                       if (hasEntProj) {
                         extraBackends.push(3);
-                      } else {
+                      } else if (isCurrentRun()) {
                         delete lastJetboxSummariesCache[uuid + ':3'];
+                      }
+                    } else if (!isHiddenBackgroundPoll && projectsResult === null) {
+                      var cachedCloud = lastJetboxSummariesCache[uuid + ':2'];
+                      var cachedEnt = lastJetboxSummariesCache[uuid + ':3'];
+                      if (cachedCloud) fallbackExtraCached = cachedCloud;
+                      if (cachedEnt) {
+                        fallbackExtraCached = fallbackExtraCached
+                          ? mergeTrajectorySummaryMaps(fallbackExtraCached, cachedEnt, true)
+                          : cachedEnt;
                       }
                     }
 
                     var extraJetboxJob =
-                      extraBackends.length > 0
+                      extraBackends.length > 0 && isCurrentRun()
                         ? Promise.all(
                             extraBackends.map(function(b) {
                               var bCacheKey = uuid + ':' + getJetboxBackendKey(b);
                               return fetchJetboxSummariesStream(ctx, uuid, b, version).then(function(res) {
                                 if (res && res.ok && res.summaries) {
-                                  lastJetboxSummariesCache[bCacheKey] = res.summaries;
+                                  if (isCurrentRun()) {
+                                    lastJetboxSummariesCache[bCacheKey] = res.summaries;
+                                  }
                                   return {
                                     ok: true,
                                     liveSummaries: res.summaries,
@@ -2228,6 +2539,11 @@ export const INBOX_BRIDGE_SCRIPT = `
                       var cachedJetboxMap = jetboxResult && jetboxResult.cachedSummaries
                         ? jetboxResult.cachedSummaries
                         : null;
+                      if (fallbackExtraCached) {
+                        cachedJetboxMap = cachedJetboxMap
+                          ? mergeTrajectorySummaryMaps(cachedJetboxMap, fallbackExtraCached, true)
+                          : fallbackExtraCached;
+                      }
                       var anyLiveJetboxOk = Boolean(jetboxResult && jetboxResult.ok);
 
                       for (var eIdx = 0; eIdx < extraResults.length; eIdx++) {
@@ -2257,7 +2573,9 @@ export const INBOX_BRIDGE_SCRIPT = `
                           ? mergeTrajectorySummaryMaps(cachedJetboxMap, liveMerged, false)
                           : liveMerged;
                         finalTrajectories = compactTrajectorySummaries(withCachedFallback);
-                        lastTrajectoryCache[uuid] = finalTrajectories;
+                        if (isCurrentRun()) {
+                          lastTrajectoryCache[uuid] = finalTrajectories;
+                        }
                       } else {
                         finalTrajectories = lastTrajectoryCache[uuid] || null;
                       }
@@ -2290,16 +2608,21 @@ export const INBOX_BRIDGE_SCRIPT = `
               })(rawList[i]);
             }
 
+            if (isCurrentRun()) {
+              pruneStaleInstanceCaches(activeUuids);
+            }
+
             var instancesPromise = Promise.all(instanceJobs);
             var usageJob = fetchUsageFromCandidates(
               ctx,
               usageCandidates,
               didForceUsageThisRun,
-              isHiddenBackgroundPoll
+              isHiddenBackgroundPoll,
+              isCurrentRun
             );
 
             return instancesPromise.then(function(instancesPayload) {
-              if (isStopped || runToken !== activeRefreshToken) {
+              if (!isCurrentRun()) {
                 return;
               }
               lastInstancesPayloadCache = instancesPayload;
@@ -2308,35 +2631,30 @@ export const INBOX_BRIDGE_SCRIPT = `
                 var emittedInitialSnapshot = false;
                 var inlineBudgetTimer = isHiddenBackgroundPoll
                   ? null
-                  : setTimeout(function() {
-                      if (
-                        emittedInitialSnapshot ||
-                        isStopped ||
-                        runToken !== activeRefreshToken
-                      ) {
+                  : trackTimeoutId(setTimeout(function() {
+                      inlineBudgetTimer = null;
+                      if (emittedInitialSnapshot || !isCurrentRun()) {
                         return;
                       }
                       emittedInitialSnapshot = true;
                       var fallbackRoute = parseRouteFromLocation();
-                      postToNative({
-                        type: 'AGY_INBOX_SNAPSHOT',
-                        fetchedAtMs: Date.now(),
-                        activeUrl: window.location.href,
-                        activeInstanceUuid: fallbackRoute.instanceUuid,
-                        activeCascadeId: fallbackRoute.cascadeId,
-                        instances: instancesPayload,
-                        cloudTrajectories: cloudTrajectoriesCache,
-                        usage: lastUsageCache,
-                        error: null
-                      });
+                      postToNative(
+                        buildSnapshotNativePayload(
+                          fallbackRoute,
+                          instancesPayload,
+                          lastUsageCache,
+                          null
+                        )
+                      );
                       resolveSnapshot();
-                    }, USAGE_INLINE_BUDGET_MS);
+                    }, USAGE_INLINE_BUDGET_MS));
 
                 usageJob.then(function(usagePayload) {
-                  if (inlineBudgetTimer) {
-                    clearTimeout(inlineBudgetTimer);
+                  if (inlineBudgetTimer !== null) {
+                    clearTrackedTimeout(inlineBudgetTimer);
+                    inlineBudgetTimer = null;
                   }
-                  if (isStopped || runToken !== activeRefreshToken) {
+                  if (!isCurrentRun()) {
                     if (!emittedInitialSnapshot) {
                       emittedInitialSnapshot = true;
                       resolveSnapshot();
@@ -2346,32 +2664,26 @@ export const INBOX_BRIDGE_SCRIPT = `
                   var latestRoute = parseRouteFromLocation();
                   if (!emittedInitialSnapshot) {
                     emittedInitialSnapshot = true;
-                    postToNative({
-                      type: 'AGY_INBOX_SNAPSHOT',
-                      fetchedAtMs: Date.now(),
-                      activeUrl: window.location.href,
-                      activeInstanceUuid: latestRoute.instanceUuid,
-                      activeCascadeId: latestRoute.cascadeId,
-                      instances: instancesPayload,
-                      cloudTrajectories: cloudTrajectoriesCache,
-                      usage: usagePayload,
-                      error: null
-                    });
+                    postToNative(
+                      buildSnapshotNativePayload(
+                        latestRoute,
+                        instancesPayload,
+                        usagePayload,
+                        null
+                      )
+                    );
                     resolveSnapshot();
                     return;
                   }
                   if (usagePayload) {
-                    postToNative({
-                      type: 'AGY_INBOX_SNAPSHOT',
-                      fetchedAtMs: Date.now(),
-                      activeUrl: window.location.href,
-                      activeInstanceUuid: latestRoute.instanceUuid,
-                      activeCascadeId: latestRoute.cascadeId,
-                      instances: lastInstancesPayloadCache,
-                      cloudTrajectories: cloudTrajectoriesCache,
-                      usage: usagePayload,
-                      error: null
-                    });
+                    postToNative(
+                      buildSnapshotNativePayload(
+                        latestRoute,
+                        lastInstancesPayloadCache,
+                        usagePayload,
+                        null
+                      )
+                    );
                   }
                 });
               });
@@ -2379,24 +2691,20 @@ export const INBOX_BRIDGE_SCRIPT = `
           });
         })
         .catch(function(err) {
-          if (isStopped || runToken !== activeRefreshToken) {
+          if (!isCurrentRun()) {
             return;
           }
           var latestRoute = parseRouteFromLocation();
-          postToNative({
-            type: 'AGY_INBOX_SNAPSHOT',
-            fetchedAtMs: Date.now(),
-            activeUrl: window.location.href,
-            activeInstanceUuid: latestRoute.instanceUuid,
-            activeCascadeId: latestRoute.cascadeId,
-            instances:
+          postToNative(
+            buildSnapshotNativePayload(
+              latestRoute,
               lastInstancesPayloadCache.length > 0
                 ? lastInstancesPayloadCache
                 : [],
-            cloudTrajectories: cloudTrajectoriesCache,
-            usage: lastUsageCache,
-            error: err && err.message ? String(err.message) : 'Unable to query Antigravity instances'
-          });
+              lastUsageCache,
+              err && err.message ? String(err.message) : 'Unable to query Antigravity instances'
+            )
+          );
         })
         .then(function() {
           if (runToken !== activeRefreshToken) {
@@ -2432,29 +2740,36 @@ export const INBOX_BRIDGE_SCRIPT = `
       return inFlightRefresh;
     }
 
+    function supersedeStalledRefreshIfNeeded(now) {
+      flushExpiredRpcDeadlines(now);
+      if (
+        inFlightRefresh &&
+        inFlightRefreshStartedAtMs > 0 &&
+        now - inFlightRefreshStartedAtMs >= STALE_INFLIGHT_REFRESH_MS
+      ) {
+        // Supersede a stalled in-flight refresh whose Blink setTimeout may
+        // have been throttled while the phone was locked.
+        activeRefreshToken += 1;
+        cancelActiveJetboxStreams();
+        inFlightRefresh = null;
+        inFlightRefreshStartedAtMs = 0;
+        pendingFollowUpRefresh = false;
+        pendingForcedUsageRefresh = false;
+        pendingBackgroundFollowUp = false;
+        return true;
+      }
+      return false;
+    }
+
     function backgroundTick(minGapMs) {
       if (isStopped) {
         return Promise.resolve(null);
       }
       var now = Date.now();
-      flushExpiredRpcDeadlines(now);
+      supersedeStalledRefreshIfNeeded(now);
 
       if (inFlightRefresh) {
-        if (
-          inFlightRefreshStartedAtMs > 0 &&
-          now - inFlightRefreshStartedAtMs >= STALE_INFLIGHT_REFRESH_MS
-        ) {
-          // Supersede a stalled in-flight refresh whose Blink setTimeout may
-          // have been throttled while the phone was locked.
-          activeRefreshToken += 1;
-          inFlightRefresh = null;
-          inFlightRefreshStartedAtMs = 0;
-          pendingFollowUpRefresh = false;
-          pendingForcedUsageRefresh = false;
-          pendingBackgroundFollowUp = false;
-        } else {
-          return inFlightRefresh;
-        }
+        return inFlightRefresh;
       }
 
       var effectiveMinGap =
@@ -2474,13 +2789,16 @@ export const INBOX_BRIDGE_SCRIPT = `
     }
 
     function scheduleRefresh(delayMs) {
+      if (isStopped) return;
       var wait = typeof delayMs === 'number' && delayMs >= 0 ? delayMs : 250;
       if (refreshTimer) {
         clearTimeout(refreshTimer);
       }
       refreshTimer = setTimeout(function() {
         refreshTimer = null;
-        refresh();
+        if (!isStopped) {
+          refresh();
+        }
       }, wait);
     }
 
@@ -3092,10 +3410,10 @@ export const INBOX_BRIDGE_SCRIPT = `
       }
       var completed = pendingStartNav;
       clearPendingStartNav();
+      setIframeCascadeOverride(confirmedCascadeId, false);
       if (!hostHandlesUrlSync) {
         syncHostLocationUrl(completed.targetUrl);
       }
-      setIframeCascadeOverride(confirmedCascadeId);
       postToNative({
         type: 'AGY_INBOX_START_CHAT_RESULT',
         requestId: completed.requestId,
@@ -3124,17 +3442,23 @@ export const INBOX_BRIDGE_SCRIPT = `
       try {
         var parsedTarget = new URL(targetUrl);
         if (parsedTarget.origin === window.location.origin) {
-          window.history.replaceState(
-            window.history.state,
-            '',
-            parsedTarget.pathname + parsedTarget.search + parsedTarget.hash
-          );
+          isSyncingHostUrl = true;
+          try {
+            window.history.replaceState(
+              window.history.state,
+              '',
+              parsedTarget.pathname + parsedTarget.search + parsedTarget.hash
+            );
+          } finally {
+            isSyncingHostUrl = false;
+          }
         }
       } catch (_) {}
     }
 
     function clearHostChildPathParam() {
       if (
+        !extractInstanceUuidFromHostPath() ||
         !window.location ||
         !window.history ||
         typeof window.history.replaceState !== 'function'
@@ -3152,14 +3476,11 @@ export const INBOX_BRIDGE_SCRIPT = `
           parsedCurrent.pathname +
           (nextSearch ? '?' + nextSearch : '') +
           parsedCurrent.hash;
-        window.history.replaceState(window.history.state, '', nextRelativeUrl);
-        if (typeof window.location.search === 'string') {
-          try {
-            var updatedHref = parsedCurrent.origin + nextRelativeUrl;
-            if (window.location.href !== updatedHref) {
-              // Real browsers update window.location synchronously via replaceState.
-            }
-          } catch (_) {}
+        isSyncingHostUrl = true;
+        try {
+          window.history.replaceState(window.history.state, '', nextRelativeUrl);
+        } finally {
+          isSyncingHostUrl = false;
         }
       } catch (_) {}
     }
@@ -3173,10 +3494,10 @@ export const INBOX_BRIDGE_SCRIPT = `
       }
       var completed = pendingFastNav;
       clearPendingFastNav();
+      setIframeCascadeOverride(confirmedCascadeId, false);
       if (!hostHandlesUrlSync) {
         syncHostLocationUrl(completed.targetUrl);
       }
-      setIframeCascadeOverride(confirmedCascadeId);
       postToNative({
         type: 'AGY_INBOX_FAST_NAV_RESULT',
         requestId: completed.requestId,
@@ -3320,8 +3641,8 @@ export const INBOX_BRIDGE_SCRIPT = `
             { jspbPayload: JSON.stringify([null, null, []]) },
             frameOrigin
           );
+          setIframeCascadeOverride(null, false);
           clearHostChildPathParam();
-          setIframeCascadeOverride(null);
           postToNative({
             type: 'AGY_INBOX_START_CHAT_RESULT',
             requestId: requestId,
@@ -3969,17 +4290,41 @@ export const INBOX_BRIDGE_SCRIPT = `
       return match ? match[1] : null;
     }
 
-    window.addEventListener('message', function(event) {
+    function scheduleHiddenRealtimeRefresh() {
+      if (realtimeHintMicrotaskQueued || isStopped) {
+        return;
+      }
+      realtimeHintMicrotaskQueued = true;
+      Promise.resolve().then(function() {
+        realtimeHintMicrotaskQueued = false;
+        if (isStopped) return;
+        supersedeStalledRefreshIfNeeded(Date.now());
+        refresh(false, true);
+      });
+    }
+
+    function onWindowMessage(event) {
+      if (isStopped) return;
       try {
         if (!event || event.origin !== 'https://antigravity.static.usercontent.goog') {
           return;
         }
         var data = event.data;
         if (!data || typeof data !== 'object') return;
-        var frame = findHubIframe();
+        var visibleFrame = findHubIframe(true);
+        var hasValidVisibleFrameSource =
+          event.source === undefined
+            ? true
+            : Boolean(
+                visibleFrame &&
+                  visibleFrame.contentWindow &&
+                  event.source === visibleFrame.contentWindow
+              );
+        var frame = visibleFrame || findHubIframe(false);
         var frameSrc = frame ? frame.src : '';
 
         if (data.type === 'AGY_REMOTE_OPEN_DRAWER') {
+          if (!hasValidVisibleFrameSource) return;
           postToNative({
             type: 'AGY_INBOX_OPEN_DRAWER_REQUEST',
             mode: data.mode === 'projects' ? 'projects' : 'inbox'
@@ -3988,6 +4333,7 @@ export const INBOX_BRIDGE_SCRIPT = `
         }
 
         if (data.type === 'AGY_REMOTE_EMPTY_SCREEN') {
+          if (!hasValidVisibleFrameSource) return;
           var emptySubPath =
             typeof data.subPath === 'string'
               ? extractIframeSubPath(data.subPath, frameSrc)
@@ -3997,8 +4343,8 @@ export const INBOX_BRIDGE_SCRIPT = `
               ? data.cascadeId
               : null;
           if (!emptyCascadeId && (!emptySubPath || emptySubPath === '/')) {
+            setIframeCascadeOverride(null, true);
             clearHostChildPathParam();
-            setIframeCascadeOverride(null);
           }
           var emptyRoute = parseRouteFromLocation();
           scheduleRefresh(250);
@@ -4017,11 +4363,13 @@ export const INBOX_BRIDGE_SCRIPT = `
         }
 
         if (data.type === 'AGY_REMOTE_REQUEST_THREAD_CONTEXT') {
+          if (!hasValidVisibleFrameSource) return;
           syncActiveThreadContext();
           return;
         }
 
         if (data.type === 'URL_CHANGED') {
+          if (!hasValidVisibleFrameSource) return;
           var rawChangedPath = typeof data.path === 'string' ? data.path : '';
           var changedCascadeId = extractCascadeIdFromIframePath(rawChangedPath, frameSrc);
           var changedSubPath = extractIframeSubPath(rawChangedPath, frameSrc);
@@ -4035,10 +4383,13 @@ export const INBOX_BRIDGE_SCRIPT = `
           var hadActiveCascadeBeforeUrlChanged = Boolean(
             activeIframeCascadeId || parseRouteFromLocation().cascadeId
           );
+          setIframeCascadeOverride(
+            changedCascadeId,
+            changedCascadeId ? false : isChangedEmptySubPath
+          );
           if (!changedCascadeId && isChangedEmptySubPath) {
             clearHostChildPathParam();
           }
-          setIframeCascadeOverride(changedCascadeId);
           var routeNow = parseRouteFromLocation();
           var changedMsg = {
             type: 'AGY_INBOX_ACTIVE_ROUTE',
@@ -4068,7 +4419,7 @@ export const INBOX_BRIDGE_SCRIPT = `
           : isUrlResponseEvent
             ? (typeof jspb[3][0] === 'string' ? jspb[3][0] : '')
             : null;
-        if (reportedPath !== null) {
+        if (reportedPath !== null && hasValidVisibleFrameSource) {
           var extractedCascadeId = extractCascadeIdFromIframePath(reportedPath, frameSrc);
           var extractedSubPath = extractIframeSubPath(reportedPath, frameSrc);
           var isExtractedEmptySubPath = extractedSubPath === '/';
@@ -4082,10 +4433,13 @@ export const INBOX_BRIDGE_SCRIPT = `
             var hadActiveCascadeBeforeJspb = Boolean(
               activeIframeCascadeId || parseRouteFromLocation().cascadeId
             );
+            setIframeCascadeOverride(
+              extractedCascadeId,
+              extractedCascadeId ? false : isExtractedEmptySubPath
+            );
             if (!extractedCascadeId && isExtractedEmptySubPath) {
               clearHostChildPathParam();
             }
-            setIframeCascadeOverride(extractedCascadeId);
             var currentRoute = parseRouteFromLocation();
             var jspbRouteMsg = {
               type: 'AGY_INBOX_ACTIVE_ROUTE',
@@ -4118,11 +4472,7 @@ export const INBOX_BRIDGE_SCRIPT = `
             document.visibilityState === 'hidden' &&
             window.__agyKeepAliveLockDesired
           ) {
-            Promise.resolve().then(function() {
-              if (!isStopped) {
-                refresh(false, true);
-              }
-            });
+            scheduleHiddenRealtimeRefresh();
           } else {
             scheduleRefresh(300);
           }
@@ -4139,33 +4489,39 @@ export const INBOX_BRIDGE_SCRIPT = `
             document.visibilityState === 'hidden' &&
             window.__agyKeepAliveLockDesired
           ) {
-            Promise.resolve().then(function() {
-              if (!isStopped) {
-                refresh(false, true);
-              }
-            });
+            scheduleHiddenRealtimeRefresh();
           } else {
             scheduleRefresh(350);
           }
         }
       } catch (_) {}
-    });
+    }
+
+    window.addEventListener('message', onWindowMessage);
 
     function emitActiveRouteFromLocation() {
+      if (isStopped || isSyncingHostUrl) return;
       syncFullBleedWorkspace();
       var route = parseRouteFromLocation();
-      postToNative({
+      var routeMsg = {
         type: 'AGY_INBOX_ACTIVE_ROUTE',
         activeUrl: window.location.href,
         activeInstanceUuid: route.instanceUuid,
         activeCascadeId: route.cascadeId
-      });
+      };
+      if (typeof route.isEmptyRoute === 'boolean') {
+        routeMsg.isEmptyRoute = route.isEmptyRoute;
+      }
+      postToNative(routeMsg);
     }
 
-    window.addEventListener('popstate', function() {
+    function onPopState() {
+      if (isStopped) return;
       clearIframeCascadeOverride();
       emitActiveRouteFromLocation();
-    });
+    }
+
+    window.addEventListener('popstate', onPopState);
 
     try {
       if (window.navigation && typeof window.navigation.addEventListener === 'function') {
@@ -4178,7 +4534,9 @@ export const INBOX_BRIDGE_SCRIPT = `
         (document && (document.documentElement || document.body)) || null;
       if (observeRoot && typeof MutationObserver === 'function') {
         domObserver = new MutationObserver(function() {
-          scheduleFullBleedSync(35);
+          if (!isStopped) {
+            scheduleFullBleedSync(35);
+          }
         });
         domObserver.observe(observeRoot, {
           childList: true,
@@ -4211,16 +4569,23 @@ export const INBOX_BRIDGE_SCRIPT = `
 
     syncFullBleedWorkspace();
 
-    window.addEventListener('focus', function() {
+    function onWindowFocus() {
+      if (isStopped) return;
       syncFullBleedWorkspace();
       scheduleRefresh(250);
-    });
+    }
 
-    window.addEventListener('online', function() {
+    function onWindowOnline() {
+      if (isStopped) return;
       scheduleRefresh(350);
-    });
+    }
+
+    window.addEventListener('focus', onWindowFocus);
+
+    window.addEventListener('online', onWindowOnline);
 
     var pollId = setInterval(function() {
+      if (isStopped) return;
       if (document.visibilityState === 'hidden') {
         if (!window.__agyKeepAliveLockDesired) {
           return;
@@ -4239,16 +4604,18 @@ export const INBOX_BRIDGE_SCRIPT = `
     var bootstrapDelays = [0, 350, 1100, 2600, 5200];
     for (var b = 0; b < bootstrapDelays.length; b++) {
       (function(delay) {
-        setTimeout(function() {
+        var bTimer = setTimeout(function() {
+          if (isStopped) return;
           syncFullBleedWorkspace();
           if (installHooks() && delay <= 1100) {
             scheduleRefresh(150);
           }
         }, delay);
+        bootstrapTimers.push(bTimer);
       })(bootstrapDelays[b]);
     }
 
-    window.__agyInboxBridge = {
+    var bridgeApi = {
       installHooks: installHooks,
       refresh: refresh,
       backgroundTick: backgroundTick,
@@ -4266,17 +4633,55 @@ export const INBOX_BRIDGE_SCRIPT = `
       stop: function() {
         isStopped = true;
         activeRefreshToken += 1;
+        cancelActiveJetboxStreams();
         pendingRpcDeadlines = [];
+        for (var t = 0; t < activeTimeoutIds.length; t++) {
+          clearTimeout(activeTimeoutIds[t]);
+        }
+        activeTimeoutIds = [];
+        for (var bt = 0; bt < bootstrapTimers.length; bt++) {
+          clearTimeout(bootstrapTimers[bt]);
+        }
+        bootstrapTimers = [];
         activeThreadContext = null;
         clearPendingFastNav();
         clearPendingStartNav();
-        if (refreshTimer) clearTimeout(refreshTimer);
-        if (fullBleedTimer) clearTimeout(fullBleedTimer);
-        if (pollId) clearInterval(pollId);
+        if (refreshTimer) {
+          clearTimeout(refreshTimer);
+          refreshTimer = null;
+        }
+        if (fullBleedTimer) {
+          clearTimeout(fullBleedTimer);
+          fullBleedTimer = null;
+        }
+        if (pollId) {
+          clearInterval(pollId);
+          pollId = null;
+        }
+        try {
+          if (typeof window.removeEventListener === 'function') {
+            window.removeEventListener('message', onWindowMessage);
+            window.removeEventListener('popstate', onPopState);
+            window.removeEventListener('focus', onWindowFocus);
+            window.removeEventListener('online', onWindowOnline);
+          }
+        } catch (_) {}
+        try {
+          if (
+            window.navigation &&
+            typeof window.navigation.removeEventListener === 'function'
+          ) {
+            window.navigation.removeEventListener(
+              'currententrychange',
+              emitActiveRouteFromLocation
+            );
+          }
+        } catch (_) {}
         if (domObserver && typeof domObserver.disconnect === 'function') {
           try {
             domObserver.disconnect();
           } catch (_) {}
+          domObserver = null;
         }
         try {
           if (
@@ -4294,8 +4699,12 @@ export const INBOX_BRIDGE_SCRIPT = `
           }
         } catch (_) {}
         restoreHostChrome();
+        if (window.__agyInboxBridge === bridgeApi) {
+          window.__agyInboxBridge = null;
+        }
       }
     };
+    window.__agyInboxBridge = bridgeApi;
   } catch (_) {}
   return true;
 })();

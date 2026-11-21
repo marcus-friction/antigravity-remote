@@ -457,6 +457,7 @@ describe('End-to-End <App /> Flow', () => {
     );
 
     // 8. Simulate incoming OS Deep Link (`antigravity-remote://r/deep-linked-host`)
+    //    Empty workstation deep link keeps/opens the native drawer so the user never lands on a blank screen
     await act(async () => {
       for (const listener of mockLinkingListeners) {
         listener({ url: 'antigravity-remote://r/deep-linked-host' });
@@ -466,6 +467,14 @@ describe('End-to-End <App /> Flow', () => {
     expect(tree.root.findByType('WebView' as any).props.source.uri).toBe(
       'https://antigravity.google.com/r/deep-linked-host',
     );
+    expect(
+      tree.root.findByType(LeftNavigationDrawer).props.visible,
+    ).toBe(true);
+
+    // Close the drawer to enter the workspace view before testing keyboard handling
+    await act(async () => {
+      tree.root.findByType(LeftNavigationDrawer).props.onClose();
+    });
 
     // 8b. Simulate software keyboard opening when focusing the bottom chat box
     await act(async () => {
@@ -2555,7 +2564,8 @@ describe('Session and navigation regressions', () => {
     await act(async () => {
       switchStudioBtn.props.onPress();
     });
-    expect(controls().props.visible).toBe(false);
+    // Switching workstation on phone keeps the drawer open without bouncing closed -> blank -> reopen
+    expect(controls().props.visible).toBe(true);
     expect(webView().props.source.uri).toBe(
       'https://antigravity.google.com/r/workstation-2',
     );
@@ -2789,10 +2799,9 @@ describe('Session and navigation regressions', () => {
     expect(webView().props.source.uri).toBe(
       'https://antigravity.google.com/u/2/r/workstation-2',
     );
+    // Drawer stays smoothly open on phone after switching workstation
+    expect(controls().props.visible).toBe(true);
 
-    await act(async () => {
-      getOpenHandle().props.onPress();
-    });
     await act(async () => {
       tree.root
         .findAllByType('TouchableOpacity' as any)
@@ -4621,6 +4630,26 @@ describe('Session and navigation regressions', () => {
       });
     });
     expect(controls().props.visible).toBe(false);
+    // Follow-up snapshot carrying `isEmptyRoute: false` keeps drawer closed on `/battle/99`
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_SNAPSHOT',
+            fetchedAtMs: Date.now(),
+            activeUrl: 'https://antigravity.google.com/r/workstation-1',
+            activeInstanceUuid: 'workstation-1',
+            activeCascadeId: null,
+            isEmptyRoute: false,
+            instances: [
+              { uuid: 'workstation-1', name: 'Dev Box', status: 1, trajectories: {} },
+            ],
+          }),
+        },
+      });
+    });
+    expect(controls().props.visible).toBe(false);
     await navigate(
       'https://antigravity.google.com/r/workstation-1?p=battle%2F99',
       false,
@@ -4852,5 +4881,143 @@ describe('Session and navigation regressions', () => {
     });
     expect(clearNativeActionNotification).not.toHaveBeenCalled();
     expect(syncNativeActionNotification).not.toHaveBeenCalled();
+  });
+
+  it('prevents spurious re-alert when tapping a notification deep link (C2), respects /remote manual dismissal (H5), and clears composing state & stale activeCascadeId on workstation switch and Back (M13/M14)', async () => {
+    const RNPlatform = require('react-native').Platform;
+    RNPlatform.OS = 'android';
+    RNPlatform.Version = 34;
+    await act(async () => {
+      tree.unmount();
+    });
+    await act(async () => {
+      tree = renderer.create(<App />);
+    });
+    mockCookieStore.set('https://antigravity.google.com', {
+      SID: { name: 'SID', value: 'c2-h5-session', domain: '.google.com' },
+    });
+
+    // 1. C2: Notification deep-link tap marks the thread read and clears OS notification
+    //    WITHOUT Step 2c firing a spurious `shouldAlert: true` re-chime!
+    await navigate(
+      'https://antigravity.google.com/r/workstation-1?p=c%2Fother-thread',
+      false,
+    );
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fother-thread',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_SNAPSHOT',
+            fetchedAtMs: Date.now(),
+            activeUrl:
+              'https://antigravity.google.com/r/workstation-1?p=c%2Fother-thread',
+            activeInstanceUuid: 'workstation-1',
+            activeCascadeId: 'other-thread',
+            instances: [
+              {
+                uuid: 'workstation-1',
+                name: 'Dev Box',
+                status: 1,
+                trajectories: {
+                  'other-thread': {
+                    summary: 'Current thread',
+                    status: 'CASCADE_RUN_STATUS_IDLE',
+                    lastModifiedTime: '2026-11-21T08:00:00Z',
+                    lastUserViewTime: '2026-11-21T08:01:00Z',
+                  },
+                  'alert-thread': {
+                    summary: 'Finished migration',
+                    status: 'CASCADE_RUN_STATUS_IDLE',
+                    annotations: { markedAsUnread: true },
+                    lastModifiedTime: '2026-11-21T08:05:00Z',
+                    lastUserViewTime: '2026-11-21T08:00:00Z',
+                  },
+                },
+              },
+            ],
+          }),
+        },
+      });
+    });
+    expect(syncNativeActionNotification).toHaveBeenCalledTimes(1);
+
+    (syncNativeActionNotification as jest.Mock).mockClear();
+    (clearNativeActionNotification as jest.Mock).mockClear();
+    await act(async () => {
+      for (const listener of mockLinkingListeners) {
+        listener({
+          url: 'antigravity-remote://r/workstation-1?p=c%2Falert-thread',
+        });
+      }
+    });
+    expect(clearNativeActionNotification).toHaveBeenCalled();
+    expect(syncNativeActionNotification).not.toHaveBeenCalled();
+
+    // 2. H5: Manual dismissal on `/remote` stays dismissed across AGY_INBOX_EMPTY_SCREEN + AGY_INBOX_SNAPSHOT
+    await navigate('https://antigravity.google.com/remote', false);
+    expect(controls().props.visible).toBe(true);
+    await act(async () => {
+      controls().props.onClose();
+    });
+    expect(controls().props.visible).toBe(false);
+
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/remote',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_EMPTY_SCREEN',
+            reason: 'route_overview',
+            activeUrl: 'https://antigravity.google.com/remote',
+            activeInstanceUuid: null,
+            activeCascadeId: null,
+          }),
+        },
+      });
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/remote',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_SNAPSHOT',
+            fetchedAtMs: Date.now() + 1000,
+            activeUrl: 'https://antigravity.google.com/remote',
+            activeInstanceUuid: null,
+            activeCascadeId: null,
+            instances: [],
+          }),
+        },
+      });
+    });
+    expect(controls().props.visible).toBe(false);
+
+    // 3. M14: Starting `+ New` composer then switching workstation clears composing flag
+    await act(async () => {
+      controls().props.onStartProjectThread({
+        id: 'workstation-1:project:p1',
+        projectId: 'p1',
+        name: 'App',
+        workspaceName: 'app',
+        workspaceUri: 'file:///home/dev/app',
+        instanceUuid: 'workstation-1',
+        instanceName: 'Dev Box',
+        source: 'remote-control',
+        threads: [],
+        latestModifiedAtMs: 0,
+        attentionCount: 0,
+        urgentCount: 0,
+        runningCount: 0,
+        hasActiveThread: false,
+        newChatUrl: 'https://antigravity.google.com/r/workstation-1',
+      });
+    });
+    // Explicit workstation switch clears composing state
+    await act(async () => {
+      controls().props.onNavigateToUrl(
+        'https://antigravity.google.com/r/workstation-2',
+      );
+    });
+    await navigate('https://antigravity.google.com/r/workstation-2', false);
+    expect(controls().props.visible).toBe(true);
   });
 });

@@ -73,10 +73,11 @@ function buildThreadCardItem(
 ): ActionNotificationThreadItem {
   const visuals = getAttentionVisuals(thread.attentionKind);
   const projectName = resolveThreadProjectName(thread);
-  const instanceName = thread.instanceName || null;
-  const subtitle = projectName
-    ? `${thread.instanceName} • ${projectName}`
-    : thread.instanceName;
+  const instanceName = thread.instanceName?.trim() || null;
+  const subtitle =
+    projectName && instanceName
+      ? `${instanceName} • ${projectName}`
+      : projectName ?? instanceName ?? '';
   const deepLinkUrl =
     buildThreadNotificationDeepLink(thread.targetUrl) ?? ACTION_INBOX_DEEP_LINK;
 
@@ -187,8 +188,9 @@ export function buildActionNotificationSyncState(params: {
     const single = openThreads[0];
     const card = items[0];
     const deepLinkUrl = card.deepLinkUrl;
-    const title = single.instanceName
-      ? `1 action open • ${single.instanceName}`
+    const singleInstanceName = single.instanceName?.trim() || '';
+    const title = singleInstanceName
+      ? `1 action open • ${singleInstanceName}`
       : '1 action open';
     const body = `${single.title} — ${single.attentionReason}`;
     const expandedBody = formatFallbackCardBlock(card);
@@ -217,7 +219,8 @@ export function buildActionNotificationSyncState(params: {
     blocks.push(`+${count - MAX_NOTIFICATION_CARDS} more in Thread Inbox`);
   }
   const expandedBody = blocks.join('\n\n');
-  const signature = `${count}|${deepLinkUrl}|${title}|${body}|${expandedBody}|${itemsSig}`;
+  const allOpenIdsSig = openThreads.map((t) => t.id).join(',');
+  const signature = `${count}|${deepLinkUrl}|${title}|${body}|${expandedBody}|${itemsSig}|${allOpenIdsSig}`;
 
   return {
     signature,

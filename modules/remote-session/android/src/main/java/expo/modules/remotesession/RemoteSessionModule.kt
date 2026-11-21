@@ -27,6 +27,8 @@ import java.util.WeakHashMap
 import org.json.JSONArray
 import android.webkit.WebStorage
 import android.webkit.WebView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
 import androidx.webkit.ScriptHandler
 import androidx.webkit.WebStorageCompat
 import androidx.webkit.WebViewCompat
@@ -63,6 +65,7 @@ class RemoteSessionModule : Module() {
   )
 
   private val mainHandler = Handler(Looper.getMainLooper())
+  @Volatile private var isDestroyed: Boolean = false
   @Volatile private var keepAliveEnabled: Boolean = false
   @Volatile private var keepAliveMinutes: Int = 0
   @Volatile private var sessionActive: Boolean = false
@@ -79,18 +82,22 @@ class RemoteSessionModule : Module() {
   private val installedDocumentStartScripts =
     WeakHashMap<WebView, InstalledDocumentStartScript>()
   private val retryInstallDocumentStartRunnable = Runnable {
-    applyDocumentStartScriptIfNeeded()
+    if (!isDestroyed) {
+      applyDocumentStartScriptIfNeeded()
+    }
   }
 
   private val screenStateReceiver = object : BroadcastReceiver() {
     override fun onReceive(context: Context?, intent: Intent?) {
+      if (isDestroyed) return
       when (intent?.action) {
         Intent.ACTION_SCREEN_OFF -> {
           runOnMain {
             if (
+              !isDestroyed &&
               shouldKeepAlive() &&
               !stoppedForCurrentBackgroundStay &&
-              (isActivityStarted || serviceStartRequested || RemoteKeepAliveService.isRunning)
+              (isActivityStarted || serviceStartRequested || RemoteKeepAliveService.isActiveOrPending)
             ) {
               startBackgroundKeepAliveIfEligible()
             }
@@ -98,7 +105,7 @@ class RemoteSessionModule : Module() {
         }
         Intent.ACTION_USER_PRESENT -> {
           runOnMain {
-            if (isActivityResumed) {
+            if (!isDestroyed && (isActivityStarted || isActivityResumed)) {
               handleReturnedToInteractiveForeground()
             }
           }
@@ -111,23 +118,29 @@ class RemoteSessionModule : Module() {
     override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
 
     override fun onActivityStarted(activity: Activity) {
+      if (isDestroyed) return
       val current = appContext.currentActivity
       if (current != null && activity !== current) return
       lastActivityRef = WeakReference(activity)
       isActivityStarted = true
       runOnMain {
-        handleReturnedToInteractiveForeground(activity)
+        if (!isDestroyed) {
+          handleReturnedToInteractiveForeground(activity)
+        }
       }
     }
 
     override fun onActivityResumed(activity: Activity) {
+      if (isDestroyed) return
       val current = appContext.currentActivity
       if (current != null && activity !== current) return
       lastActivityRef = WeakReference(activity)
       isActivityStarted = true
       isActivityResumed = true
       runOnMain {
-        handleReturnedToInteractiveForeground(activity)
+        if (!isDestroyed) {
+          handleReturnedToInteractiveForeground(activity)
+        }
       }
     }
 
@@ -138,6 +151,7 @@ class RemoteSessionModule : Module() {
     }
 
     override fun onActivityStopped(activity: Activity) {
+      if (isDestroyed) return
       // Ignore configuration changes (e.g. screen rotation) and unrelated activities;
       // unlike Activity.onPause, onStop only runs when the window is no longer visible
       // (avoiding permission-dialog and split-screen focus churn).
@@ -147,8 +161,23 @@ class RemoteSessionModule : Module() {
       lastActivityRef = WeakReference(activity)
       isActivityStarted = false
       isActivityResumed = false
+      if (activity.isFinishing) {
+        runOnMain {
+          if (!isDestroyed) {
+            applyWebViewKeepAlivePolicy(
+              protectInBackground = false,
+              releaseWebLock = true,
+              hostActivity = activity
+            )
+            stopKeepAliveServiceIfRunning()
+          }
+        }
+        return
+      }
       runOnMain {
-        startBackgroundKeepAliveIfEligible(hostActivity = activity)
+        if (!isDestroyed) {
+          startBackgroundKeepAliveIfEligible(hostActivity = activity)
+        }
       }
     }
 
@@ -203,6 +232,7 @@ class RemoteSessionModule : Module() {
     return runCatching {
       val uri = Uri.parse(rawUrl)
       uri.scheme.equals("https", ignoreCase = true) &&
+        uri.encodedAuthority.equals("antigravity.google.com", ignoreCase = true) &&
         uri.host.equals("antigravity.google.com", ignoreCase = true) &&
         uri.port == -1 &&
         uri.userInfo == null
@@ -210,7 +240,7 @@ class RemoteSessionModule : Module() {
   }
 
   private fun registerScreenStateReceiverIfNeeded() {
-    if (screenStateReceiverContext != null) return
+    if (isDestroyed || screenStateReceiverContext != null) return
     val ctx = (appContext.reactContext?.applicationContext ?: appContext.currentActivity?.applicationContext)
       ?: return
     val filter = IntentFilter().apply {
@@ -237,15 +267,18 @@ class RemoteSessionModule : Module() {
   }
 
   private fun registerActivityLifecycleObserverIfNeeded() {
+    if (isDestroyed) return
     registerScreenStateReceiverIfNeeded()
+    if (registeredApplication != null) return
     val current = appContext.currentActivity
     if (current != null && !current.isFinishing) {
       lastActivityRef = WeakReference(current)
-      if (!isActivityStarted && isInteractiveAndUnlocked(current)) {
-        isActivityStarted = true
+      val lifecycleState = (current as? LifecycleOwner)?.lifecycle?.currentState
+      if (lifecycleState != null) {
+        isActivityStarted = lifecycleState.isAtLeast(Lifecycle.State.STARTED)
+        isActivityResumed = lifecycleState.isAtLeast(Lifecycle.State.RESUMED)
       }
     }
-    if (registeredApplication != null) return
     val app = (appContext.reactContext?.applicationContext ?: appContext.currentActivity?.application)
       as? Application ?: return
     app.registerActivityLifecycleCallbacks(activityLifecycleCallbacks)
@@ -289,10 +322,11 @@ class RemoteSessionModule : Module() {
   }
 
   private fun shouldKeepAlive(): Boolean {
-    return keepAliveEnabled && keepAliveMinutes > 0 && sessionActive
+    return !isDestroyed && keepAliveEnabled && keepAliveMinutes > 0 && sessionActive
   }
 
   private fun handleReturnedToInteractiveForeground(hostActivity: Activity? = null) {
+    if (isDestroyed) return
     val activity = hostActivity ?: appContext.currentActivity ?: lastActivityRef?.get()
     if (!isInteractiveAndUnlocked(activity ?: appContext.reactContext)) {
       return
@@ -315,6 +349,7 @@ class RemoteSessionModule : Module() {
   }
 
   private fun startBackgroundKeepAliveIfEligible(hostActivity: Activity? = null) {
+    if (isDestroyed) return
     if (!shouldKeepAlive() || stoppedForCurrentBackgroundStay) {
       applyWebViewKeepAlivePolicy(
         protectInBackground = false,
@@ -329,7 +364,7 @@ class RemoteSessionModule : Module() {
       wakeTimers = true,
       hostActivity = hostActivity
     )
-    if (serviceStartRequested || RemoteKeepAliveService.isRunning) {
+    if (serviceStartRequested || RemoteKeepAliveService.isActiveOrPending) {
       return
     }
     val context = appContext.reactContext
@@ -349,21 +384,23 @@ class RemoteSessionModule : Module() {
   }
 
   private fun triggerBackgroundStateRefresh() {
-    if (!shouldKeepAlive() || stoppedForCurrentBackgroundStay) {
+    if (isDestroyed || !shouldKeepAlive() || stoppedForCurrentBackgroundStay) {
       return
     }
     val webView = resolveActiveWebView() ?: return
-    if (!isTrustedAntigravityUrl(webView.url)) {
-      return
+    runCatching {
+      if (!isTrustedAntigravityUrl(webView.url)) {
+        return
+      }
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        webView.setRendererPriorityPolicy(
+          WebView.RENDERER_PRIORITY_IMPORTANT,
+          /* waivedWhenNotVisible = */ false
+        )
+      }
+      webView.resumeTimers()
+      webView.evaluateJavascript(BACKGROUND_POLL_SCRIPT, null)
     }
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      webView.setRendererPriorityPolicy(
-        WebView.RENDERER_PRIORITY_IMPORTANT,
-        /* waivedWhenNotVisible = */ false
-      )
-    }
-    webView.resumeTimers()
-    webView.evaluateJavascript(BACKGROUND_POLL_SCRIPT, null)
   }
 
   private fun applyWebViewKeepAlivePolicy(
@@ -373,18 +410,20 @@ class RemoteSessionModule : Module() {
     hostActivity: Activity? = null
   ) {
     val webView = resolveActiveWebView(hostActivity) ?: return
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      webView.setRendererPriorityPolicy(
-        WebView.RENDERER_PRIORITY_IMPORTANT,
-        /* waivedWhenNotVisible = */ !protectInBackground
-      )
-    }
-    if (releaseWebLock) {
-      webView.evaluateJavascript(RELEASE_WEB_LOCK_SCRIPT, null)
-    }
-    if (wakeTimers) {
-      webView.onResume()
-      webView.resumeTimers()
+    runCatching {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        webView.setRendererPriorityPolicy(
+          WebView.RENDERER_PRIORITY_IMPORTANT,
+          /* waivedWhenNotVisible = */ !protectInBackground
+        )
+      }
+      if (releaseWebLock && isTrustedAntigravityUrl(webView.url)) {
+        webView.evaluateJavascript(RELEASE_WEB_LOCK_SCRIPT, null)
+      }
+      if (wakeTimers) {
+        webView.onResume()
+        webView.resumeTimers()
+      }
     }
   }
 
@@ -679,7 +718,7 @@ class RemoteSessionModule : Module() {
     val hasProjectRows = items
       .take(MAX_RENDERED_NOTIFICATION_CARDS)
       .any { it.projectName.isNotEmpty() }
-    val maxCards = if (hasProjectRows && totalCount > MAX_RENDERED_NOTIFICATION_CARDS) {
+    val maxCards = if (hasProjectRows && totalCount >= MAX_RENDERED_NOTIFICATION_CARDS) {
       MAX_RENDERED_NOTIFICATION_CARDS_WITH_OVERFLOW
     } else {
       MAX_RENDERED_NOTIFICATION_CARDS
@@ -793,12 +832,13 @@ class RemoteSessionModule : Module() {
     val hasUrgent = cards.any { it.attentionKind == "approval" || it.attentionKind == "error" }
     val primaryStyle = cards.firstOrNull()?.let { resolveActionCardStyle(it.attentionKind) }
 
+    val postedAtMs = System.currentTimeMillis()
     builder
       .setSmallIcon(R.drawable.ic_stat_keep_alive)
       .setContentTitle(title)
       .setContentText(body)
       .setNumber(count)
-      .setWhen(System.currentTimeMillis())
+      .setWhen(postedAtMs)
       .setShowWhen(true)
       .setAutoCancel(true)
       .setOnlyAlertOnce(!shouldAlert)
@@ -827,6 +867,8 @@ class RemoteSessionModule : Module() {
         .setContentTitle("Antigravity Remote")
         .setContentText(publicSummary)
         .setNumber(count)
+        .setWhen(postedAtMs)
+        .setShowWhen(true)
         .setColor(accentColor)
         .setCategory(Notification.CATEGORY_MESSAGE)
       builder.setPublicVersion(publicBuilder.build())
@@ -875,21 +917,33 @@ class RemoteSessionModule : Module() {
     Name("RemoteSession")
 
     OnCreate {
-      registerActivityLifecycleObserverIfNeeded()
-      runOnMain { applyDrawerGestureExclusion() }
+      isDestroyed = false
+      runOnMain {
+        if (!isDestroyed) {
+          registerActivityLifecycleObserverIfNeeded()
+          applyDrawerGestureExclusion()
+        }
+      }
       RemoteKeepAliveService.registerKeepAliveEndedListener(this@RemoteSessionModule) { _ ->
-        stoppedForCurrentBackgroundStay = true
-        serviceStartRequested = false
         runOnMain {
-          applyWebViewKeepAlivePolicy(
-            protectInBackground = false,
-            releaseWebLock = true
-          )
+          if (isDestroyed) return@runOnMain
+          serviceStartRequested = false
+          val inInteractiveForeground =
+            isActivityStarted && isInteractiveAndUnlocked(appContext.reactContext)
+          if (!inInteractiveForeground) {
+            stoppedForCurrentBackgroundStay = true
+            applyWebViewKeepAlivePolicy(
+              protectInBackground = false,
+              releaseWebLock = true
+            )
+          }
         }
       }
       RemoteKeepAliveService.registerKeepAlivePollListener(this@RemoteSessionModule) {
         runOnMain {
-          triggerBackgroundStateRefresh()
+          if (!isDestroyed) {
+            triggerBackgroundStateRefresh()
+          }
         }
       }
     }
@@ -984,28 +1038,34 @@ class RemoteSessionModule : Module() {
 
     OnActivityEntersForeground {
       runOnMain {
-        registerActivityLifecycleObserverIfNeeded()
-        handleReturnedToInteractiveForeground()
+        if (!isDestroyed) {
+          registerActivityLifecycleObserverIfNeeded()
+          handleReturnedToInteractiveForeground()
+        }
       }
     }
 
     OnActivityDestroys {
       val activity = appContext.currentActivity
       if (activity == null || !activity.isChangingConfigurations) {
-        stopKeepAliveServiceIfRunning()
+        runOnMain {
+          stopKeepAliveServiceIfRunning()
+        }
       }
     }
 
     OnDestroy {
+      isDestroyed = true
+      RemoteKeepAliveService.unregisterKeepAlivePollListener(this@RemoteSessionModule)
+      RemoteKeepAliveService.unregisterKeepAliveEndedListener(this@RemoteSessionModule)
+      mainHandler.removeCallbacksAndMessages(null)
       runOnMain {
         clearDrawerGestureExclusionObservers()
         removeInstalledDocumentStartScripts()
+        unregisterScreenStateReceiver()
+        unregisterActivityLifecycleObserver()
+        stopKeepAliveServiceIfRunning()
       }
-      unregisterScreenStateReceiver()
-      unregisterActivityLifecycleObserver()
-      RemoteKeepAliveService.unregisterKeepAlivePollListener(this@RemoteSessionModule)
-      RemoteKeepAliveService.unregisterKeepAliveEndedListener(this@RemoteSessionModule)
-      stopKeepAliveServiceIfRunning()
     }
   }
 
@@ -1022,8 +1082,8 @@ class RemoteSessionModule : Module() {
       "https://antigravity.static.usercontent.goog"
     )
     private const val RELEASE_WEB_LOCK_SCRIPT =
-      "(function(){try{window.__agyKeepAliveLockDesired=false;if(typeof window.__agyReleaseKeepAliveLock==='function'){window.__agyReleaseKeepAliveLock();}window.__agyKeepAliveLockHeld=false;}catch(_){}})();"
+      "(function(){try{if(!window.location||window.location.origin!=='https://antigravity.google.com')return;window.__agyKeepAliveLockDesired=false;if(typeof window.__agyReleaseKeepAliveLock==='function'){window.__agyReleaseKeepAliveLock();}window.__agyKeepAliveLockHeld=false;}catch(_){}})();"
     private const val BACKGROUND_POLL_SCRIPT =
-      "(function(){try{if(!window.location||window.location.hostname!=='antigravity.google.com')return;window.__agyKeepAliveLockDesired=true;if(!window.__agyKeepAliveLockHeld&&!window.__agyKeepAliveLockPending&&navigator&&navigator.locks&&typeof navigator.locks.request==='function'){window.__agyKeepAliveLockPending=true;navigator.locks.request('__agy_remote_keep_alive',function(){window.__agyKeepAliveLockPending=false;if(!window.__agyKeepAliveLockDesired){window.__agyKeepAliveLockHeld=false;return Promise.resolve();}window.__agyKeepAliveLockHeld=true;return new Promise(function(resolve){window.__agyReleaseKeepAliveLock=function(){window.__agyKeepAliveLockHeld=false;window.__agyReleaseKeepAliveLock=null;resolve();};if(!window.__agyKeepAliveLockDesired){window.__agyReleaseKeepAliveLock();}});}).catch(function(){window.__agyKeepAliveLockPending=false;window.__agyKeepAliveLockHeld=false;});}if(window.__agyInboxBridge&&typeof window.__agyInboxBridge.backgroundTick==='function'){window.__agyInboxBridge.backgroundTick();}else if(window.__agyInboxBridge&&typeof window.__agyInboxBridge.refresh==='function'){window.__agyInboxBridge.refresh(false,true);}}catch(_){}})();"
+      "(function(){try{if(!window.location||window.location.origin!=='https://antigravity.google.com')return;window.__agyKeepAliveLockDesired=true;if(!window.__agyKeepAliveLockHeld&&!window.__agyKeepAliveLockPending&&navigator&&navigator.locks&&typeof navigator.locks.request==='function'){window.__agyKeepAliveLockPending=true;navigator.locks.request('__agy_remote_keep_alive',function(){window.__agyKeepAliveLockPending=false;if(!window.__agyKeepAliveLockDesired){window.__agyKeepAliveLockHeld=false;return Promise.resolve();}window.__agyKeepAliveLockHeld=true;return new Promise(function(resolve){window.__agyReleaseKeepAliveLock=function(){window.__agyKeepAliveLockHeld=false;window.__agyReleaseKeepAliveLock=null;resolve();};if(!window.__agyKeepAliveLockDesired){window.__agyReleaseKeepAliveLock();}});}).catch(function(){window.__agyKeepAliveLockPending=false;window.__agyKeepAliveLockHeld=false;});}if(window.__agyInboxBridge&&typeof window.__agyInboxBridge.backgroundTick==='function'){window.__agyInboxBridge.backgroundTick();}else if(window.__agyInboxBridge&&typeof window.__agyInboxBridge.refresh==='function'){window.__agyInboxBridge.refresh(false,true);}}catch(_){}})();"
   }
 }

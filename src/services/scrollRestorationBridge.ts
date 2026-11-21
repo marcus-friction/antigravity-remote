@@ -598,6 +598,7 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
 
     function checkRoute() {
       var nextRoute = classifyFrameRoute();
+      var hadInMemoryCurrentRoute = Boolean(currentRoute);
       var prevRoute = currentRoute || readLastRouteRecord();
 
       if (
@@ -634,7 +635,7 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
         }
       }
       if (typeof handleEmptyScreenOnRouteChange === 'function') {
-        handleEmptyScreenOnRouteChange(prevRoute, nextRoute);
+        handleEmptyScreenOnRouteChange(prevRoute, nextRoute, hadInMemoryCurrentRoute);
       }
     }
 
@@ -1203,11 +1204,36 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
       }
     }
 
-    var EMPTY_SCREEN_SETTLE_MS = 250;
+    var EMPTY_SCREEN_SETTLE_MS = 450;
     var emptyScreenCheckTimer = null;
     var hasSeenConversationViewOnRoute = false;
     var lastNotifiedEmptyRouteSignature = null;
     var lastObservedFrameCascadeId = null;
+
+    function isFrameHiddenOrZeroSized() {
+      if (document && document.visibilityState === 'hidden') {
+        return true;
+      }
+      if (
+        typeof window.innerWidth === 'number' &&
+        typeof window.innerHeight === 'number' &&
+        (window.innerWidth === 0 || window.innerHeight === 0)
+      ) {
+        return true;
+      }
+      return false;
+    }
+
+    function hasProjectQueryParam() {
+      try {
+        var search = (window.location && window.location.search) || '';
+        if (!search) return false;
+        var projectParam = new URLSearchParams(search).get('project');
+        return Boolean(projectParam && projectParam.trim());
+      } catch (_) {
+        return false;
+      }
+    }
 
     function isNodeVisiblyRendered(el) {
       if (!el || el.isConnected === false) return false;
@@ -1285,6 +1311,12 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
       return false;
     }
 
+    function hasVisibleComposerOrLoader() {
+      return hasAnyVisibleSelector(
+        'textarea, [contenteditable="true"], [role="textbox"], [role="progressbar"], [aria-busy="true"]'
+      );
+    }
+
     function extractCurrentFrameSubPath() {
       var pathname = (window.location && window.location.pathname) || '/';
       if (isWorkstationFrame) {
@@ -1344,7 +1376,11 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
               type: 'AGY_INBOX_EMPTY_SCREEN',
               reason: effectiveReason,
               activeUrl: (window.location && window.location.href) || undefined,
-              activeInstanceUuid: isWorkstationFrame ? undefined : '__cloud__',
+              activeInstanceUuid: isWorkstationFrame
+                ? undefined
+                : cascadeId
+                  ? '__cloud__'
+                  : null,
               activeCascadeId: cascadeId || null
             })
           );
@@ -1374,15 +1410,31 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
     }
 
     function hasMobileHomeSidebarNodes() {
-      if (!document || typeof document.querySelector !== 'function') {
+      if (!document || typeof document.querySelectorAll !== 'function') {
         return false;
       }
       try {
-        return Boolean(
+        if (
+          typeof document.querySelector === 'function' &&
           document.querySelector(
-            '[data-testid="conversation-list-sidebar"], [data-testid="mobile-home-concierge"], [data-sidebar-scroll-container="true"]'
+            '[data-testid="conversation-list-sidebar"], [data-testid="mobile-home-concierge"]'
           )
-        );
+        ) {
+          return true;
+        }
+        var scrollContainers = document.querySelectorAll('[data-sidebar-scroll-container="true"]');
+        for (var i = 0; i < scrollContainers.length; i++) {
+          var sc = scrollContainers[i];
+          if (!sc) continue;
+          if (
+            typeof sc.closest === 'function' &&
+            sc.closest('[data-testid="settings-sidebar"], [role="dialog"]')
+          ) {
+            continue;
+          }
+          return true;
+        }
+        return false;
       } catch (_) {
         return false;
       }
@@ -1406,6 +1458,7 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
 
     function evaluateEmptyScreenDom() {
       if (!shouldHideAntigravitySidebarInFrame()) return false;
+      if (isFrameHiddenOrZeroSized()) return false;
       var subPath = extractCurrentFrameSubPath();
       if (!subPath || isNonEmptySpecialSubPath(subPath)) {
         return false;
@@ -1422,28 +1475,36 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
         return false;
       }
 
+      if (hasAnyVisibleSelector('[role="progressbar"], [aria-busy="true"]')) {
+        return false;
+      }
+
       // Case 1: Root overview "/" once Antigravity's shell (with our hidden sidebar) has mounted
-      // and no conversation, plugin view, or dialog is visible.
-      if (subPath === '/' && hasAnyHiddenSidebarShellNodes()) {
+      // and no conversation, composer, plugin view, loader, or dialog is visible.
+      if (
+        subPath === '/' &&
+        !hasProjectQueryParam() &&
+        !hasAnyVisibleSelector('textarea, [contenteditable="true"], [role="textbox"]') &&
+        hasAnyHiddenSidebarShellNodes()
+      ) {
         notifyEmptyScreenFromFrame('route_overview', '/', null);
         return true;
       }
 
       // Case 2: A previously mounted conversation view disappeared (e.g. archived/deleted in place
-      // or navigated to an empty view) leaving either hidden mobile home nodes or no visible composer.
-      if (
-        hasSeenConversationViewOnRoute &&
-        (hasMobileHomeSidebarNodes() ||
-          !hasAnyVisibleSelector('textarea, [contenteditable="true"], [role="textbox"]'))
-      ) {
+      // or navigated to an empty view) leaving no visible composer, primary view, or loader.
+      if (hasSeenConversationViewOnRoute && !hasVisibleComposerOrLoader()) {
         notifyEmptyScreenFromFrame('dom_empty', subPath, frameCascadeId);
         return true;
       }
       return false;
     }
 
-    function scheduleEmptyScreenCheck(delayMs) {
+    function scheduleEmptyScreenCheck(delayMs, resetIfPending) {
       if (!shouldHideAntigravitySidebarInFrame()) return;
+      if (!resetIfPending && emptyScreenCheckTimer) {
+        return;
+      }
       var wait =
         typeof delayMs === 'number' && delayMs >= 0
           ? delayMs
@@ -1452,11 +1513,15 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
       emptyScreenCheckTimer = setTimeout(function() {
         emptyScreenCheckTimer = null;
         evaluateEmptyScreenDom();
+        if (!extractCurrentFrameCascadeId() && !emptyScreenCheckTimer) {
+          disconnectHeaderMutationObserver();
+        }
       }, wait);
     }
 
     function observeConversationEmptyState() {
       if (!shouldHideAntigravitySidebarInFrame()) return;
+      if (isFrameHiddenOrZeroSized()) return;
       if (hasAnyVisibleSelector('[data-testid="conversation-view"]')) {
         hasSeenConversationViewOnRoute = true;
         lastNotifiedEmptyRouteSignature = null;
@@ -1464,11 +1529,12 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
         return;
       }
       if (hasSeenConversationViewOnRoute) {
-        scheduleEmptyScreenCheck(EMPTY_SCREEN_SETTLE_MS);
+        // Do not reset an already-armed timer on unrelated streaming mutations (prevents starvation).
+        scheduleEmptyScreenCheck(EMPTY_SCREEN_SETTLE_MS, false);
       }
     }
 
-    function handleEmptyScreenOnRouteChange(prevRoute, nextRoute) {
+    function handleEmptyScreenOnRouteChange(prevRoute, nextRoute, hadInMemoryCurrentRoute) {
       if (!shouldHideAntigravitySidebarInFrame()) return;
       var prevCascadeId = lastObservedFrameCascadeId;
       var nextCascadeId = extractCurrentFrameCascadeId();
@@ -1485,11 +1551,16 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
 
       var leftDetailRoute =
         Boolean(prevCascadeId) ||
-        Boolean(prevRoute && prevRoute.kind === 'detail');
+        (Boolean(hadInMemoryCurrentRoute) &&
+          Boolean(prevRoute) &&
+          prevRoute.kind === 'detail' &&
+          prevRoute.scope === nextRoute.scope);
 
       if (nextSubPath === '/' && leftDetailRoute) {
         hasSeenConversationViewOnRoute = false;
-        notifyEmptyScreenFromFrame('route_overview', '/', null);
+        if (!hasProjectQueryParam() && !hasVisibleComposerOrLoader()) {
+          notifyEmptyScreenFromFrame('route_overview', '/', null);
+        }
         return;
       }
 
@@ -1500,7 +1571,8 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
         !isNonEmptySpecialSubPath(nextSubPath)
       ) {
         hasSeenConversationViewOnRoute = true;
-        scheduleEmptyScreenCheck(EMPTY_SCREEN_SETTLE_MS);
+        ensureHeaderMutationObserver();
+        scheduleEmptyScreenCheck(EMPTY_SCREEN_SETTLE_MS, true);
       }
     }
 
@@ -1511,7 +1583,9 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
         var frameCascadeId = extractCurrentFrameCascadeId();
         if (!frameCascadeId) {
           clearThreadProjectHeader();
-          disconnectHeaderMutationObserver();
+          if (!emptyScreenCheckTimer) {
+            disconnectHeaderMutationObserver();
+          }
           lastRequestedContextCascadeId = null;
           return;
         }
@@ -1594,6 +1668,11 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
         decoratedHeaderContainer = target.container;
       } catch (_) {
       } finally {
+        if (headerMutationObserver && typeof headerMutationObserver.takeRecords === 'function') {
+          try {
+            headerMutationObserver.takeRecords();
+          } catch (_) {}
+        }
         isSyncingThreadHeader = false;
       }
     }
@@ -1632,6 +1711,8 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
             decoratedHeaderContainer !== null
           ) {
             scheduleThreadHeaderSync(35);
+          } else if (emptyScreenCheckTimer !== null) {
+            observeConversationEmptyState();
           }
         });
         headerMutationObserver.observe(observeRoot, {
@@ -1702,7 +1783,9 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
       document.addEventListener('DOMContentLoaded', function() {
         hideAntigravitySidebarNodes();
         syncThreadProjectHeader();
-        evaluateEmptyScreenDom();
+        if (!evaluateEmptyScreenDom() && extractCurrentFrameSubPath() === '/') {
+          scheduleEmptyScreenCheck(1200, false);
+        }
       });
     }
     window.addEventListener('load', function() {
@@ -1710,7 +1793,7 @@ export const PROJECT_OVERVIEW_SCROLL_SCRIPT = `
       syncThreadProjectHeader();
       evaluateEmptyScreenDom();
       if (extractCurrentFrameSubPath() === '/') {
-        scheduleEmptyScreenCheck(450);
+        scheduleEmptyScreenCheck(450, true);
       }
       var loadedCascadeId = extractCurrentFrameCascadeId();
       if (loadedCascadeId && (!activeThreadContext || activeThreadContext.cascadeId !== loadedCascadeId)) {
@@ -1744,7 +1827,14 @@ export function buildReturnToOverviewScript(): string {
   return `
 (function() {
   try {
-    if (!window.location || window.location.hostname !== 'antigravity.google.com') {
+    if (
+      !window.location ||
+      (window.location.origin
+        ? window.location.origin !== 'https://antigravity.google.com'
+        : window.location.protocol !== 'https:' ||
+          window.location.hostname !== 'antigravity.google.com' ||
+          Boolean(window.location.port))
+    ) {
       return true;
     }
     var frames = document.querySelectorAll('iframe');

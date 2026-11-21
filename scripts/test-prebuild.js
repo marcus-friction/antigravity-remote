@@ -49,7 +49,7 @@ try {
         stdio: 'pipe',
       },
     );
-    checkNative(temporary);
+    checkNative(temporary, { checkPlayMetadata: false });
   }
   console.log(
     'Clean and incremental prebuild preserve native security, signing and IME configuration',

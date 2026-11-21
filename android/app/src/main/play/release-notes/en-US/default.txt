@@ -1,3 +1,4 @@
-• Fix premature completion notifications when an agent finishes its turn while background commands, timers, workflows, or subagents are still running.
-• Track live non-daemon background tasks across connected workstations (while still notifying normally when only long-running daemons like dev servers remain).
-• Keep nested subagents, hidden tool tasks, and active Battle Mode runs in Working status until all work truly completes, and skip notifications for user-canceled runs.
+• Keep updating thread status and proactively notifying while your screen is locked whenever keep-alive is active.
+• New Projects drawer with project-grouped conversations, folder browser & project creation, and thread project headers.
+• Docked side-by-side sidebar on tablets and foldables, plus automatic drawer opening when archiving leaves an empty screen.
+• Richer color-coded notification cards showing each thread's project name, plus reliability & session-auth fixes.

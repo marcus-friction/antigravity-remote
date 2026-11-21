@@ -1543,19 +1543,31 @@ describe('Android & iOS WebView scroll-restoration wiring and Inbox drawer scrol
 
     const matchesPart = (node: SimpleNode, rawPart: string): boolean => {
       const part = rawPart.trim();
-      const attrEq = /^\[([^=\]]+)="([^"]*)"\]$/.exec(part);
-      if (attrEq) return node.attributes[attrEq[1]] === attrEq[2];
-      const tagAttr = /^([a-z]+)\[([^=\]]+)(?:="([^"]*)")?\]$/i.exec(part);
-      if (tagAttr) {
-        if (node.tagName.toLowerCase() !== tagAttr[1].toLowerCase()) return false;
-        return tagAttr[3] !== undefined
-          ? node.attributes[tagAttr[2]] === tagAttr[3]
-          : Object.prototype.hasOwnProperty.call(node.attributes, tagAttr[2]);
+      if (!part) return false;
+      let rest = part;
+      const tagMatch = /^([a-z]+)/i.exec(rest);
+      if (tagMatch) {
+        if (node.tagName.toLowerCase() !== tagMatch[1].toLowerCase()) {
+          return false;
+        }
+        rest = rest.slice(tagMatch[0].length);
       }
-      if (/^[a-z]+$/i.test(part)) {
-        return node.tagName.toLowerCase() === part.toLowerCase();
+      const attrRegex = /\[([^=\]]+)(?:="([^"]*)")?\]/g;
+      let matchedAnyAttr = false;
+      let consumedLength = 0;
+      let m: RegExpExecArray | null;
+      while ((m = attrRegex.exec(rest)) !== null) {
+        if (m.index !== consumedLength) return false;
+        matchedAnyAttr = true;
+        consumedLength += m[0].length;
+        const ok =
+          m[2] !== undefined
+            ? node.attributes[m[1]] === m[2]
+            : Object.prototype.hasOwnProperty.call(node.attributes, m[1]);
+        if (!ok) return false;
       }
-      return false;
+      if (consumedLength !== rest.length) return false;
+      return Boolean(tagMatch || matchedAnyAttr);
     };
 
     const makeNode = (
@@ -1837,8 +1849,163 @@ describe('Android & iOS WebView scroll-restoration wiring and Inbox drawer scrol
       type: 'AGY_INBOX_EMPTY_SCREEN',
       reason: 'route_overview',
       activeUrl: 'https://antigravity.google.com/remote',
-      activeInstanceUuid: '__cloud__',
+      activeInstanceUuid: null,
       activeCascadeId: null,
     });
+
+    // 7. Regression coverage: Case 1 root overview shell detection, ?project= & composer & progressbar
+    //    guards, sidebar-dialog ignore, 0x0 hidden iframe bail-out, stale sessionStorage guard,
+    //    and non-starving dom_empty timer under continuous mutations.
+    parentPosts.length = 0;
+    const regDocEl = makeNode('html');
+    const regHead = makeNode('head');
+    const regBody = makeNode('body');
+    regDocEl.appendChild(regHead);
+    regDocEl.appendChild(regBody);
+    const regTimers: Array<{ id: number; fn: () => void }> = [];
+    let regNextId = 1;
+    const regMOs: Array<() => void> = [];
+    class RegMO {
+      private cb: () => void;
+      constructor(cb: () => void) {
+        this.cb = cb;
+      }
+      observe() {
+        regMOs.push(this.cb);
+      }
+      disconnect() {
+        const idx = regMOs.indexOf(this.cb);
+        if (idx >= 0) regMOs.splice(idx, 1);
+      }
+      takeRecords() {
+        return [];
+      }
+    }
+    const regWin: any = {
+      innerWidth: 390,
+      innerHeight: 844,
+      location: {
+        protocol: 'https:',
+        hostname: 'antigravity.static.usercontent.goog',
+        pathname: '/web/2.35.0/',
+        search: '?iframe=true',
+        href: 'https://antigravity.static.usercontent.goog/web/2.35.0/?iframe=true',
+      },
+      history: {
+        pushState: (_s: any, _t: string, url: string) => {
+          const parsed = new URL(url, 'https://antigravity.static.usercontent.goog');
+          regWin.location.pathname = parsed.pathname;
+          regWin.location.search = parsed.search;
+          regWin.location.href = parsed.href;
+        },
+        replaceState: () => {},
+      },
+      parent: {
+        postMessage: (msg: any, targetOrigin: string) => {
+          parentPosts.push({ msg, targetOrigin });
+        },
+      },
+      MutationObserver: RegMO,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      // Stale sessionStorage from a prior session must NOT fire route_overview on initial load
+      sessionStorage: {
+        getItem: (k: string) =>
+          k === '__agy_overview_last_route_v1'
+            ? JSON.stringify({ kind: 'detail', scope: 'frame:/web/2.35.0', key: null })
+            : null,
+        setItem: () => {},
+      },
+    };
+    const regDoc: any = {
+      visibilityState: 'visible',
+      head: regHead,
+      documentElement: regDocEl,
+      body: regBody,
+      getElementById: (id: string) =>
+        regHead.children.find((n) => n.attributes.id === id) ?? null,
+      createElement: (tag: string) => makeNode(tag),
+      querySelector: (sel: string) => regDocEl.querySelector(sel),
+      querySelectorAll: (sel: string) => regDocEl.querySelectorAll(sel),
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    };
+    vm.runInContext(
+      PROJECT_OVERVIEW_SCROLL_SCRIPT,
+      vm.createContext({
+        window: regWin,
+        document: regDoc,
+        URL,
+        URLSearchParams,
+        setTimeout: (fn: () => void) => {
+          const id = regNextId++;
+          regTimers.push({ id, fn });
+          return id;
+        },
+        clearTimeout: (id: number) => {
+          const idx = regTimers.findIndex((t) => t.id === id);
+          if (idx >= 0) regTimers.splice(idx, 1);
+        },
+      }),
+    );
+    // Stale sessionStorage did NOT false-fire on initial mount
+    expect(parentPosts).toHaveLength(0);
+
+    // Mount hidden desktop sidebar shell + progressbar -> still loading, must NOT emit yet
+    const sidebarNav = makeNode('div', { role: 'navigation', 'aria-label': 'Sidebar' });
+    const spinner = makeNode('div', { role: 'progressbar' });
+    regBody.appendChild(sidebarNav);
+    regBody.appendChild(spinner);
+    expect(regWin.__agyOverviewScrollBridge.evaluateEmptyScreenDom()).toBe(false);
+    regBody.removeChild(spinner);
+
+    // With visible composer textarea on `/` -> NOT empty
+    const composer = makeNode('textarea');
+    regBody.appendChild(composer);
+    expect(regWin.__agyOverviewScrollBridge.evaluateEmptyScreenDom()).toBe(false);
+    regBody.removeChild(composer);
+
+    // On 0x0 hidden iframe -> bails out cleanly
+    regWin.innerWidth = 0;
+    regWin.innerHeight = 0;
+    expect(regWin.__agyOverviewScrollBridge.evaluateEmptyScreenDom()).toBe(false);
+    regWin.innerWidth = 390;
+    regWin.innerHeight = 844;
+
+    // On `/?project=proj-1` -> excluded (composer route)
+    regWin.location.search = '?project=proj-1';
+    expect(regWin.__agyOverviewScrollBridge.evaluateEmptyScreenDom()).toBe(false);
+    regWin.location.search = '?iframe=true';
+
+    // With only hidden sidebar nav shell + sidebar-only dialog -> Case 1 fires `route_overview`!
+    const sidebarDialog = makeNode('div', { role: 'dialog' });
+    sidebarDialog.appendChild(makeNode('div', { role: 'navigation', 'aria-label': 'Sidebar' }));
+    regBody.appendChild(sidebarDialog);
+    expect(regWin.__agyOverviewScrollBridge.evaluateEmptyScreenDom()).toBe(true);
+    expect(parentPosts).toContainEqual({
+      msg: {
+        type: 'AGY_REMOTE_EMPTY_SCREEN',
+        reason: 'route_overview',
+        subPath: '/',
+        cascadeId: null,
+      },
+      targetOrigin: 'https://antigravity.google.com',
+    });
+
+    // Non-starving debounce: once conversation unmounts, subsequent mutations do NOT cancel & reset timer
+    regBody.removeChild(sidebarDialog);
+    regBody.removeChild(sidebarNav);
+    regWin.history.pushState(null, '', '/web/2.35.0/c/t-starve?iframe=true');
+    const liveConv = makeNode('div', { 'data-testid': 'conversation-view' });
+    regBody.appendChild(liveConv);
+    regWin.__agyOverviewScrollBridge.syncThreadProjectHeader();
+    regBody.removeChild(liveConv);
+    regTimers.length = 0;
+    regWin.__agyOverviewScrollBridge.syncThreadProjectHeader();
+    const firstTimerId = regTimers[0]?.id;
+    expect(firstTimerId).toBeDefined();
+    // Another mutation occurs while timer is pending -> original timer stays armed (not replaced!)
+    regWin.__agyOverviewScrollBridge.syncThreadProjectHeader();
+    expect(regTimers[0]?.id).toBe(firstTimerId);
   });
 });

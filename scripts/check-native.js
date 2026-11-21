@@ -2,9 +2,59 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-function checkNative(root) {
+function checkNative(root, options = {}) {
   const read = (name) => fs.readFileSync(path.join(root, name), 'utf8');
   const config = JSON.parse(read('app.json')).expo;
+  const pkg = JSON.parse(read('package.json'));
+  const pkgLock = JSON.parse(read('package-lock.json'));
+  const buildGradle = read('android/app/build.gradle');
+  assert.strictEqual(
+    pkg.version,
+    config.version,
+    `package.json version (${pkg.version}) must match app.json expo.version (${config.version})`,
+  );
+  assert.strictEqual(
+    pkgLock.version,
+    config.version,
+    `package-lock.json version (${pkgLock.version}) must match app.json expo.version (${config.version})`,
+  );
+  if (pkgLock.packages && pkgLock.packages['']) {
+    assert.strictEqual(
+      pkgLock.packages[''].version,
+      config.version,
+      `package-lock.json packages[""].version (${pkgLock.packages[''].version}) must match app.json expo.version (${config.version})`,
+    );
+  }
+  const gradleVersionNameMatch = /versionName\s+"([^"]+)"/.exec(buildGradle);
+  const gradleVersionCodeMatch = /versionCode\s+(\d+)/.exec(buildGradle);
+  assert(
+    gradleVersionNameMatch && gradleVersionNameMatch[1] === config.version,
+    `android/app/build.gradle versionName (${gradleVersionNameMatch?.[1]}) must match app.json expo.version (${config.version})`,
+  );
+  assert(
+    gradleVersionCodeMatch &&
+      Number(gradleVersionCodeMatch[1]) === Number(config.android.versionCode),
+    `android/app/build.gradle versionCode (${gradleVersionCodeMatch?.[1]}) must match app.json expo.android.versionCode (${config.android.versionCode})`,
+  );
+  if (options.checkPlayMetadata !== false) {
+    const releaseNotesPath = path.join(
+      root,
+      'android/app/src/main/play/release-notes/en-US/default.txt',
+    );
+    assert(
+      fs.existsSync(releaseNotesPath),
+      'Missing Play Store release notes file: android/app/src/main/play/release-notes/en-US/default.txt',
+    );
+    const releaseNotes = fs.readFileSync(releaseNotesPath, 'utf8').trim();
+    assert(
+      releaseNotes.length > 0,
+      'Play Store release notes (en-US/default.txt) must not be empty',
+    );
+    assert(
+      releaseNotes.length <= 500,
+      `Play Store release notes exceed 500-character Google Play limit (${releaseNotes.length} chars)`,
+    );
+  }
   const manifest = read('android/app/src/main/AndroidManifest.xml');
   for (const attribute of [
     'allowBackup="false"',

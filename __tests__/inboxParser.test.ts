@@ -303,7 +303,32 @@ describe('inboxParser', () => {
     expect(
       parseInboxBridgeMessage(JSON.stringify({ type: 'UNKNOWN_EVENT' })),
     ).toBeNull();
-    expect(parseInboxBridgeMessage('x'.repeat(2 * 1024 * 1024 + 10))).toBeNull();
+    const validUnderCap = JSON.stringify({
+      type: 'AGY_INBOX_REALTIME_HINT',
+      reason: 'notification',
+      body: 'a'.repeat(1024),
+    });
+    expect(parseInboxBridgeMessage(validUnderCap)).toMatchObject({
+      type: 'AGY_INBOX_REALTIME_HINT',
+      reason: 'notification',
+    });
+    // Valid JSON strictly exceeding the 6 MiB payload cap must be rejected by the length guard
+    const validOverCap = JSON.stringify({
+      type: 'AGY_INBOX_REALTIME_HINT',
+      reason: 'notification',
+      body: 'a'.repeat(6 * 1024 * 1024 + 64),
+    });
+    expect(validOverCap.length).toBeGreaterThan(6 * 1024 * 1024);
+    expect(parseInboxBridgeMessage(validOverCap)).toBeNull();
+    // Invalid empty-screen reason must be rejected
+    expect(
+      parseInboxBridgeMessage(
+        JSON.stringify({
+          type: 'AGY_INBOX_EMPTY_SCREEN',
+          reason: 'invalid_reason',
+        }),
+      ),
+    ).toBeNull();
 
     const parsedNav = parseInboxBridgeMessage(
       JSON.stringify({
@@ -779,7 +804,7 @@ describe('inboxParser', () => {
       const firstRefresh = sandboxWindow.__agyInboxBridge.refresh();
       // Trigger a second refresh (e.g. real-time completion event) before the first resolves
       const secondRefresh = sandboxWindow.__agyInboxBridge.refresh();
-      await Promise.resolve();
+      await new Promise((resolve) => setImmediate(resolve));
       resolveFirstList({
         getInstancesList: () => [],
       });
@@ -5073,5 +5098,592 @@ describe('inboxParser', () => {
     ).toBe(true);
 
     sandboxWin.__agyInboxBridge.stop();
+  });
+
+  it('prevents bridge RPC self-capture from breaking 60s SAPISIDHASH rotation, protects cache on Connect-RPC errors, validates event.source & host URL sync order, and cleans up on stop()', async () => {
+    const postedToNative: any[] = [];
+    const seenAuthHeaders: string[] = [];
+    const windowListeners = new Map<string, Array<(e: any) => void>>();
+    const navListeners: Array<() => void> = [];
+    const scheduledDelays: number[] = [];
+    let fakeNow = 1_762_400_000_000;
+    let authCounter = 1;
+    let trajMode: 'ok' | 'connect_error' = 'ok';
+    let currentHref = 'https://antigravity.google.com/r/box-rot?p=c%2Fthread-1';
+    const currentUrlObj = () => new URL(currentHref);
+
+    class MockDate extends Date {
+      constructor(...args: any[]) {
+        if (args.length === 0) super(fakeNow);
+        else {
+          // @ts-expect-error variadic forwarding
+          super(...args);
+        }
+      }
+      static now() {
+        return fakeNow;
+      }
+    }
+
+    class MockListInstancesRequest {}
+    class MockProxyCommandRequest {
+      rpcPath = '';
+      setTargetInstanceUuid() {}
+      setRpcPath(p: string) {
+        this.rpcPath = p;
+      }
+      setPayload() {}
+      putHeaders() {}
+      getRpcPath() {
+        return this.rpcPath;
+      }
+    }
+
+    class MockApiServicePromiseClient {
+      listInstances(_req: any, meta?: Record<string, string>) {
+        if (meta?.Authorization) seenAuthHeaders.push(meta.Authorization);
+        return Promise.resolve({
+          getInstancesList: () => [
+            {
+              getUuid: () => 'box-rot',
+              getStatus: () => 1,
+              getMetadata: () => ({
+                getName: () => 'Rotation Box',
+                getVersion: () => '2.35.0',
+              }),
+              getStatusLastUpdatedAt: () => ({
+                getSeconds: () => Math.floor(fakeNow / 1000),
+              }),
+            },
+          ],
+        });
+      }
+      proxyCommand(req: MockProxyCommandRequest) {
+        if (req.rpcPath.endsWith('/GetAllCascadeTrajectories')) {
+          if (trajMode === 'connect_error') {
+            return Promise.resolve({
+              getPayload_asU8: () =>
+                new TextEncoder().encode(
+                  JSON.stringify({
+                    code: 'unavailable',
+                    message: 'Language server restarting',
+                  }),
+                ),
+            });
+          }
+          return Promise.resolve({
+            getPayload_asU8: () =>
+              new TextEncoder().encode(
+                JSON.stringify({
+                  trajectorySummaries: {
+                    'thread-1': {
+                      summary: 'Cached thread',
+                      status: 'CASCADE_RUN_STATUS_WAITING_FOR_USER',
+                      waitingSteps: [{ step: { runCommand: { commandLine: 'make' } } }],
+                      lastModifiedTime: { seconds: 1762400000, nanos: 900_000_000 },
+                    },
+                  },
+                }),
+              ),
+          });
+        }
+        return Promise.resolve({
+          getPayload_asU8: () =>
+            new TextEncoder().encode(JSON.stringify({ tasks: [] })),
+        });
+      }
+    }
+
+    const visibleIframe = {
+      src: 'https://antigravity.static.usercontent.goog/web/2.35.0/?iframe=true',
+      getAttribute: (k: string) =>
+        k === 'src'
+          ? 'https://antigravity.static.usercontent.goog/web/2.35.0/?iframe=true'
+          : null,
+      contentWindow: { postMessage: () => {} },
+      style: { display: 'block' },
+    };
+    const hiddenIframe = {
+      src: 'https://antigravity.static.usercontent.goog/web/2.35.0/?iframe=true',
+      getAttribute: (k: string) =>
+        k === 'src'
+          ? 'https://antigravity.static.usercontent.goog/web/2.35.0/?iframe=true'
+          : null,
+      contentWindow: { postMessage: () => {} },
+      style: { display: 'none' },
+    };
+
+    const sandboxWin: any = {
+      __agyKeepAliveLockDesired: true,
+      Date: MockDate,
+      location: {
+        get href() {
+          return currentHref;
+        },
+        get origin() {
+          return currentUrlObj().origin;
+        },
+        get hostname() {
+          return currentUrlObj().hostname;
+        },
+        get pathname() {
+          return currentUrlObj().pathname;
+        },
+        get search() {
+          return currentUrlObj().search;
+        },
+      },
+      history: {
+        state: null,
+        replaceState: (_s: any, _t: string, nextRel: string) => {
+          currentHref = new URL(nextRel, currentHref).href;
+          // Simulate Chromium synchronous Navigation API `currententrychange`
+          for (const fn of [...navListeners]) fn();
+        },
+      },
+      navigation: {
+        addEventListener: (type: string, fn: () => void) => {
+          if (type === 'currententrychange') navListeners.push(fn);
+        },
+        removeEventListener: (type: string, fn: () => void) => {
+          if (type === 'currententrychange') {
+            const idx = navListeners.indexOf(fn);
+            if (idx >= 0) navListeners.splice(idx, 1);
+          }
+        },
+      },
+      navigator: { onLine: true },
+      document: {
+        cookie: 'SAPISID=cookie-1',
+        visibilityState: 'hidden',
+        querySelectorAll: (sel: string) =>
+          sel === 'iframe' ? [hiddenIframe, visibleIframe] : [],
+      },
+      default_GoogleAntigravity: {
+        K: {
+          devtools_jetski_boq_api_proto: {
+            ApiServicePromiseClient: MockApiServicePromiseClient,
+            ListInstancesRequest: MockListInstancesRequest,
+            ProxyCommandRequest: MockProxyCommandRequest,
+          },
+        },
+        pj: {
+          auth_firstparty: {
+            getAuthHeaderValueForFirstParty: () =>
+              `SAPISIDHASH ${Math.floor(fakeNow / 1000)}_rot${authCounter++}`,
+          },
+        },
+      },
+      ReactNativeWebView: {
+        postMessage: (raw: string) => postedToNative.push(JSON.parse(raw)),
+      },
+      addEventListener: (event: string, fn: (e: any) => void) => {
+        const list = windowListeners.get(event) ?? [];
+        list.push(fn);
+        windowListeners.set(event, list);
+      },
+      removeEventListener: (event: string, fn: (e: any) => void) => {
+        const list = windowListeners.get(event) ?? [];
+        const idx = list.indexOf(fn);
+        if (idx >= 0) list.splice(idx, 1);
+      },
+      TextEncoder,
+      TextDecoder,
+      URL,
+      URLSearchParams,
+      setTimeout: (_fn: () => void, ms: number) => {
+        scheduledDelays.push(ms);
+        return scheduledDelays.length;
+      },
+      clearTimeout: () => {},
+      setInterval: () => 2,
+      clearInterval: () => {},
+    };
+    sandboxWin.window = sandboxWin;
+
+    const context = vm.createContext(sandboxWin);
+    vm.runInContext(INBOX_BRIDGE_SCRIPT, context);
+    sandboxWin.__agyInboxBridge.installHooks();
+
+    // Seed initial host call at T = 0
+    const hostClient = new MockApiServicePromiseClient();
+    await (hostClient as any).listInstances(new MockListInstancesRequest(), {
+      Authorization: 'SAPISIDHASH 0_initial',
+    });
+    seenAuthHeaders.length = 0;
+
+    // C1: Polling every 20s MUST NOT reset `capturedMetadataAtMs` — rotation MUST happen at T = 60s!
+    await sandboxWin.__agyInboxBridge.backgroundTick();
+    expect(seenAuthHeaders[seenAuthHeaders.length - 1]).toBe('SAPISIDHASH 0_initial');
+    fakeNow += 20_000;
+    await sandboxWin.__agyInboxBridge.backgroundTick();
+    expect(seenAuthHeaders[seenAuthHeaders.length - 1]).toBe('SAPISIDHASH 0_initial');
+    fakeNow += 20_000;
+    await sandboxWin.__agyInboxBridge.backgroundTick();
+    expect(seenAuthHeaders[seenAuthHeaders.length - 1]).toBe('SAPISIDHASH 0_initial');
+    fakeNow += 20_000; // T = 60s
+    await sandboxWin.__agyInboxBridge.backgroundTick();
+    expect(seenAuthHeaders[seenAuthHeaders.length - 1]).toMatch(/^SAPISIDHASH \d+_rot1$/);
+    // Persisted rotated auth is reused at T = 80s, then rotates to rot2 at T = 120s
+    fakeNow += 20_000;
+    await sandboxWin.__agyInboxBridge.backgroundTick();
+    expect(seenAuthHeaders[seenAuthHeaders.length - 1]).toMatch(/^SAPISIDHASH \d+_rot1$/);
+    fakeNow += 40_000;
+    await sandboxWin.__agyInboxBridge.backgroundTick();
+    expect(seenAuthHeaders[seenAuthHeaders.length - 1]).toMatch(/^SAPISIDHASH \d+_rot2$/);
+
+    // Bridge-originated markThreadRead must NOT trigger host archive refresh hook (350ms)
+    scheduledDelays.length = 0;
+    await sandboxWin.__agyInboxBridge.markThreadRead('box-rot', 'thread-1');
+    expect(scheduledDelays).not.toContain(350);
+
+    // H2: Connect-RPC error on GetAllCascadeTrajectories must preserve cached trajectories (not wipe)
+    trajMode = 'connect_error';
+    fakeNow += 20_000;
+    postedToNative.length = 0;
+    await sandboxWin.__agyInboxBridge.backgroundTick();
+    expect(postedToNative).toHaveLength(1);
+    expect(postedToNative[0].instances[0].trajectories['thread-1']).toBeDefined();
+    expect(postedToNative[0].instances[0].error).toBe('Language server restarting');
+
+    // H3: Hidden iframe source is rejected; visible iframe source is accepted
+    postedToNative.length = 0;
+    for (const fn of windowListeners.get('message') ?? []) {
+      fn({
+        origin: 'https://antigravity.static.usercontent.goog',
+        source: hiddenIframe.contentWindow,
+        data: {
+          type: 'AGY_REMOTE_EMPTY_SCREEN',
+          reason: 'dom_empty',
+          subPath: '/',
+          cascadeId: null,
+        },
+      });
+    }
+    expect(postedToNative).toHaveLength(0);
+    expect(currentHref).toBe('https://antigravity.google.com/r/box-rot?p=c%2Fthread-1');
+
+    // H1 + H4: Navigating visible iframe to `/battle/99` suppresses re-entrant `currententrychange`
+    // and propagates `isEmptyRoute: false` onto subsequent `AGY_INBOX_SNAPSHOT` payloads!
+    for (const fn of windowListeners.get('message') ?? []) {
+      fn({
+        origin: 'https://antigravity.static.usercontent.goog',
+        source: visibleIframe.contentWindow,
+        data: { type: 'URL_CHANGED', path: '/web/2.35.0/battle/99' },
+      });
+    }
+    expect(postedToNative).toEqual([
+      {
+        type: 'AGY_INBOX_ACTIVE_ROUTE',
+        activeUrl: 'https://antigravity.google.com/r/box-rot?p=c%2Fthread-1',
+        activeInstanceUuid: 'box-rot',
+        activeCascadeId: null,
+        isEmptyRoute: false,
+      },
+    ]);
+    trajMode = 'ok';
+    fakeNow += 20_000;
+    postedToNative.length = 0;
+    await sandboxWin.__agyInboxBridge.backgroundTick();
+    expect(postedToNative[0].type).toBe('AGY_INBOX_SNAPSHOT');
+    expect(postedToNative[0].isEmptyRoute).toBe(false);
+    expect(
+      isEmptyWorkspaceRoute({
+        activeUrl: postedToNative[0].activeUrl,
+        activeInstanceUuid: postedToNative[0].activeInstanceUuid,
+        activeCascadeId: postedToNative[0].activeCascadeId,
+        isEmptyRouteHint: postedToNative[0].isEmptyRoute,
+      }),
+    ).toBe(false);
+
+    // H4: Returning to `/` clears `?p=` AFTER updating override and does NOT emit stale `thread-1`
+    // from synchronous `currententrychange`!
+    postedToNative.length = 0;
+    for (const fn of windowListeners.get('message') ?? []) {
+      fn({
+        origin: 'https://antigravity.static.usercontent.goog',
+        source: visibleIframe.contentWindow,
+        data: { type: 'URL_CHANGED', path: '/web/2.35.0/' },
+      });
+    }
+    expect(postedToNative).toEqual([
+      {
+        type: 'AGY_INBOX_ACTIVE_ROUTE',
+        activeUrl: 'https://antigravity.google.com/r/box-rot',
+        activeInstanceUuid: 'box-rot',
+        activeCascadeId: null,
+      },
+    ]);
+
+    // M12: stop() removes listeners and clears singleton so re-injection works cleanly
+    sandboxWin.__agyInboxBridge.stop();
+    expect(sandboxWin.__agyInboxBridge).toBeNull();
+    expect(windowListeners.get('message') ?? []).toHaveLength(0);
+    expect(navListeners).toHaveLength(0);
+    vm.runInContext(INBOX_BRIDGE_SCRIPT, context);
+    expect(sandboxWin.__agyInboxBridge).not.toBeNull();
+    sandboxWin.__agyInboxBridge.stop();
+  });
+
+  it('handles archived project isolation, Tier 4-6 active tie ambiguity, NFC/Indic/UNC/DevContainer URIs, updateTimeMicros, cloud archived lookup, and >4 notification swaps', () => {
+    // H1: Non-workspace `/` URL returns false even if activeInstanceUuid is stale
+    expect(
+      isEmptyWorkspaceRoute({
+        activeUrl: 'https://antigravity.google.com/',
+        activeInstanceUuid: 'box-1',
+        activeCascadeId: null,
+      }),
+    ).toBe(false);
+
+    // H12 + M15 + L6: Archived project does NOT suppress active GetWorkspaceInfos for same folder,
+    // NFC/NFD & Devanagari combining marks & UNC & DevContainer URIs match cleanly, and updateTimeMicros converts to ms
+    const nfdCafe = 'cafe\u0301';
+    const nfcCafe = 'caf\u00e9';
+    const devanagari = 'प्रोजेक्ट';
+    const rawMsg = parseInboxBridgeMessage(
+      JSON.stringify({
+        type: 'AGY_INBOX_SNAPSHOT',
+        fetchedAtMs: 1_762_500_000_000,
+        activeUrl: 'https://antigravity.google.com/r/box-1',
+        activeInstanceUuid: 'box-1',
+        activeCascadeId: null,
+        cloudTrajectories: {
+          'cloud-key': {
+            trajectory_id: 'cloud-tid-99',
+            summary: 'Archived cloud task',
+            annotations: { archived: true },
+          },
+        },
+        instances: [
+          {
+            uuid: 'box-1',
+            name: 'Dev Box',
+            status: 1,
+            projects: [
+              {
+                id: 'proj-old-archived',
+                name: 'Archived Same Folder',
+                archived: true,
+                updateTimeMicros: '1762500000123456',
+                projectResources: {
+                  resources: [{ folderUri: 'file:///home/dev/shared-repo' }],
+                },
+              },
+              {
+                id: 'proj-tie-1',
+                name: 'Ambiguous App',
+                archived: false,
+                projectResources: {
+                  resources: [{ folderUri: 'file:///home/dev/tie-a' }],
+                },
+              },
+              {
+                id: 'proj-tie-2',
+                name: 'Ambiguous App',
+                archived: false,
+                projectResources: {
+                  resources: [{ folderUri: 'file:///home/dev/tie-b' }],
+                },
+              },
+              {
+                id: 'proj-tie-archived',
+                name: 'Ambiguous App',
+                archived: true,
+                projectResources: {
+                  resources: [{ folderUri: 'file:///home/dev/tie-archived' }],
+                },
+              },
+              {
+                id: 'proj-nfc',
+                name: nfcCafe,
+                archived: false,
+                projectResources: {
+                  resources: [{ folderUri: `file:///home/dev/${encodeURIComponent(nfcCafe)}` }],
+                },
+              },
+              {
+                id: 'proj-hindi',
+                name: devanagari,
+                archived: false,
+                projectResources: {
+                  resources: [{ folderUri: 'file:///home/dev/hindi-repo' }],
+                },
+              },
+              {
+                id: 'proj-unc',
+                name: 'UNC Share',
+                archived: false,
+                projectResources: {
+                  resources: [{ folderUri: 'file://fileserver/team/unc-repo' }],
+                },
+              },
+              {
+                id: 'proj-devcontainer',
+                name: 'Container App',
+                archived: false,
+                projectResources: {
+                  resources: [
+                    {
+                      folderUri:
+                        'vscode-remote://dev-container%2B7b22hostPath%22%3A%22%2Ftmp%2Ffoo%22%7d/workspaces/container-app',
+                    },
+                  ],
+                },
+              },
+            ],
+            workspaceInfos: [
+              { workspaceUri: 'file:///home/dev/shared-repo' },
+            ],
+            trajectories: {
+              't-shared-active': {
+                summary: 'New chat in recreated active workspace',
+                workspaces: [
+                  { workspaceFolderAbsoluteUri: 'file:///home/dev/shared-repo' },
+                ],
+              },
+              't-archived-explicit': {
+                summary: 'Old archived project chat',
+                trajectoryMetadata: { projectId: 'proj-old-archived' },
+                workspaces: [
+                  { workspaceFolderAbsoluteUri: 'file:///home/dev/shared-repo' },
+                ],
+              },
+              't-tie': {
+                summary: 'Chat with ambiguous active project name',
+                workspaces: [
+                  { workspaceFolderAbsoluteUri: 'file:///home/dev/other/Ambiguous App' },
+                ],
+              },
+              't-nfd': {
+                summary: 'macOS NFD folder chat',
+                workspaces: [
+                  { workspaceFolderAbsoluteUri: `file:///home/dev/${encodeURIComponent(nfdCafe)}` },
+                ],
+              },
+              't-hindi': {
+                summary: 'Devanagari slug chat',
+                workspaces: [
+                  { workspaceFolderAbsoluteUri: `file:///home/dev/other/${encodeURIComponent(devanagari)}` },
+                ],
+              },
+              't-unc': {
+                summary: 'Windows UNC chat',
+                workspaces: [
+                  { workspaceFolderAbsoluteUri: '\\\\fileserver\\team\\unc-repo' },
+                ],
+              },
+              't-devcontainer': {
+                summary: 'DevContainer chat',
+                workspaces: [
+                  {
+                    workspaceFolderAbsoluteUri:
+                      'vscode-remote://dev-container%2B7b22other%22%3A%22%2Fbar%22%7d/workspaces/container-app',
+                  },
+                ],
+              },
+            },
+          },
+        ],
+      }),
+    ) as Extract<InboxBridgeMessage, { type: 'AGY_INBOX_SNAPSHOT' }>;
+
+    // M16: Cloud archived trajectory detection by trajectory_id
+    expect(
+      isTrajectoryMarkedArchivedInMessage(rawMsg, '__cloud__', 'cloud-tid-99'),
+    ).toBe(true);
+
+    const snapshot = buildInboxSnapshot(rawMsg);
+    // L6: updateTimeMicros divided by 1000 -> epoch ms (~1_762_500_000_123), not raw micros
+    const archivedProj = snapshot.projects!.find(
+      (p) => p.projectId === 'proj-old-archived',
+    )!;
+    expect(archivedProj.updatedAtMs).toBe(1_762_500_000_123);
+
+    // H12: Active workspace entry for shared-repo was NOT suppressed by archived project
+    const activeSharedWs = snapshot.projects!.find(
+      (p) => !p.archived && p.name === 'shared-repo',
+    );
+    expect(activeSharedWs).toBeDefined();
+
+    const groups = buildProjectGroups(snapshot);
+    const sharedGroup = groups.find((g) => g.name === 'shared-repo')!;
+    expect(sharedGroup.threads.map((t) => t.cascadeId)).toEqual(['t-shared-active']);
+
+    // M15: Active tie must NOT fall through to archived project
+    expect(
+      resolveActiveThreadProject({
+        ...snapshot,
+        activeCascadeId: 't-tie',
+      })?.projectId,
+    ).toBeNull();
+
+    // M15: NFD matches NFC, Devanagari preserves combining marks, UNC matches file:// UNC, DevContainer matches path
+    expect(
+      resolveActiveThreadProject({ ...snapshot, activeCascadeId: 't-nfd' }),
+    ).toMatchObject({ projectId: 'proj-nfc', projectName: nfcCafe });
+    expect(
+      resolveActiveThreadProject({ ...snapshot, activeCascadeId: 't-hindi' }),
+    ).toMatchObject({ projectId: 'proj-hindi', projectName: devanagari });
+    expect(
+      resolveActiveThreadProject({ ...snapshot, activeCascadeId: 't-unc' }),
+    ).toMatchObject({ projectId: 'proj-unc', projectName: 'UNC Share' });
+    expect(
+      resolveActiveThreadProject({ ...snapshot, activeCascadeId: 't-devcontainer' }),
+    ).toMatchObject({ projectId: 'proj-devcontainer', projectName: 'Container App' });
+
+    // H13 + L5: 5-thread swap at index 4 changes signature & sets shouldAlert: true; empty instanceName has clean subtitle
+    const makeThread = (id: string, instName = 'Box'): any => ({
+      id: `box:${id}`,
+      cascadeId: id,
+      trajectoryId: id,
+      instanceUuid: 'box',
+      instanceName: instName,
+      title: `Thread ${id}`,
+      attentionKind: 'unread',
+      needsAttention: true,
+      attentionReason: 'Finished',
+      stepCount: 2,
+      waitingStepCount: 0,
+      lastModifiedAtMs: 1_762_500_000_000,
+      lastUserViewAtMs: 0,
+      workspaceName: 'repo-x',
+      workspaceUri: 'file:///home/dev/repo-x',
+      childPath: `/c/${id}`,
+      targetUrl: `https://antigravity.google.com/r/box?p=c%2F${id}`,
+      isActiveThread: false,
+      isPinned: false,
+      hasRunningSubagents: false,
+      source: 'remote-control',
+    });
+
+    const firstFive = buildActionNotificationSyncState({
+      stage: 'authenticated',
+      mode: 'all_attention',
+      isAppForeground: false,
+      isDrawerOpen: false,
+      previousOpenThreadIds: new Set(),
+      threads: ['t1', 't2', 't3', 't4', 't5'].map((id) => makeThread(id)),
+    });
+    const swappedFive = buildActionNotificationSyncState({
+      stage: 'authenticated',
+      mode: 'all_attention',
+      isAppForeground: false,
+      isDrawerOpen: false,
+      previousOpenThreadIds: firstFive.openThreadIds,
+      threads: ['t1', 't2', 't3', 't4', 't6'].map((id) => makeThread(id)),
+    });
+    expect(swappedFive.signature).not.toBe(firstFive.signature);
+    expect(swappedFive.notification?.shouldAlert).toBe(true);
+
+    const blankHost = buildActionNotificationSyncState({
+      stage: 'authenticated',
+      mode: 'all_attention',
+      isAppForeground: false,
+      isDrawerOpen: false,
+      previousOpenThreadIds: new Set(),
+      threads: [makeThread('t-blank', '   ')],
+    });
+    expect(blankHost.notification?.title).toBe('1 action open');
+    expect(blankHost.notification?.items?.[0].subtitle).toBe('repo-x');
   });
 });

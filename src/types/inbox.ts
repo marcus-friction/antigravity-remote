@@ -243,6 +243,7 @@ export type InboxBridgeMessage =
       activeUrl?: string;
       activeInstanceUuid?: string | null;
       activeCascadeId?: string | null;
+      isEmptyRoute?: boolean;
       instances: RawBridgeInstancePayload[];
       cloudTrajectories?: Record<string, unknown> | null;
       usage?: RawBridgeUsagePayload | null;

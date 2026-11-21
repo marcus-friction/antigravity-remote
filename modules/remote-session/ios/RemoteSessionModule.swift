@@ -51,12 +51,17 @@ public class RemoteSessionModule: Module {
   private static let actionNotificationIdentifier = "agy_action_required"
   private static let backgroundPollIntervalSeconds: TimeInterval = 10.0
   private static let backgroundPollScript =
-    "(function(){try{if(!window.location||window.location.hostname!=='antigravity.google.com')return;window.__agyKeepAliveLockDesired=true;if(window.__agyInboxBridge&&typeof window.__agyInboxBridge.backgroundTick==='function'){window.__agyInboxBridge.backgroundTick();}else if(window.__agyInboxBridge&&typeof window.__agyInboxBridge.refresh==='function'){window.__agyInboxBridge.refresh(false,true);}}catch(_){}})();"
+    "(function(){try{if(!window.location||window.location.origin!=='https://antigravity.google.com')return;window.__agyKeepAliveLockDesired=true;if(window.__agyInboxBridge&&typeof window.__agyInboxBridge.backgroundTick==='function'){window.__agyInboxBridge.backgroundTick(8000);}else if(window.__agyInboxBridge&&typeof window.__agyInboxBridge.refresh==='function'){window.__agyInboxBridge.refresh(false,true);}}catch(_){}})();"
   private var keepAliveEnabled: Bool = false
   private var keepAliveMinutes: Int = 0
   private var sessionActive: Bool = false
   private var backgroundTaskId: UIBackgroundTaskIdentifier = .invalid
   private var backgroundPollTimer: Timer?
+
+  deinit {
+    backgroundPollTimer?.invalidate()
+    backgroundPollTimer = nil
+  }
 
   private func runOnMain(_ block: @escaping () -> Void) {
     if Thread.isMainThread {
@@ -119,11 +124,15 @@ public class RemoteSessionModule: Module {
 
   private func startBackgroundPollTimer() {
     stopBackgroundPollTimer()
-    let timer = Timer.scheduledTimer(
-      withTimeInterval: Self.backgroundPollIntervalSeconds,
+    let timer = Timer(
+      timeInterval: Self.backgroundPollIntervalSeconds,
       repeats: true
-    ) { [weak self] _ in
-      self?.triggerBackgroundStateRefresh()
+    ) { [weak self] activeTimer in
+      guard let self = self else {
+        activeTimer.invalidate()
+        return
+      }
+      self.triggerBackgroundStateRefresh()
     }
     RunLoop.main.add(timer, forMode: .common)
     backgroundPollTimer = timer
@@ -149,17 +158,27 @@ public class RemoteSessionModule: Module {
       withName: "AntigravityRemoteSessionKeepAlive"
     ) { [weak self] in
       let capturedId = newTaskId
-      self?.runOnMain {
+      let finishExpired = {
         expiredSynchronously = true
-        self?.stopBackgroundPollTimer()
+        guard let self = self else {
+          if capturedId != .invalid {
+            UIApplication.shared.endBackgroundTask(capturedId)
+          }
+          return
+        }
+        guard self.backgroundTaskId == capturedId else {
+          return
+        }
+        self.stopBackgroundPollTimer()
+        self.backgroundTaskId = .invalid
         if capturedId != .invalid {
           UIApplication.shared.endBackgroundTask(capturedId)
         }
-        if self?.backgroundTaskId == capturedId {
-          self?.backgroundTaskId = .invalid
-        } else {
-          self?.endBackgroundKeepAliveTask()
-        }
+      }
+      if Thread.isMainThread {
+        finishExpired()
+      } else {
+        DispatchQueue.main.async(execute: finishExpired)
       }
     }
     if expiredSynchronously {
@@ -304,7 +323,7 @@ public class RemoteSessionModule: Module {
     path.stroke()
   }
 
-  private func renderCardsAttachment(items: [ActionCardItem], totalCount: Int) -> UNNotificationAttachment? {
+  private func renderCardsAttachment(items: [ActionCardItem], totalCount: Int) -> (UNNotificationAttachment, URL)? {
     let rendered = Array(items.prefix(3))
     guard !rendered.isEmpty else { return nil }
 
@@ -455,11 +474,12 @@ public class RemoteSessionModule: Module {
       .appendingPathComponent("agy_action_cards_\(UUID().uuidString).png")
     do {
       try pngData.write(to: fileUrl, options: .atomic)
-      return try UNNotificationAttachment(
+      let attachment = try UNNotificationAttachment(
         identifier: "agy_action_cards",
         url: fileUrl,
         options: [UNNotificationAttachmentOptionsTypeHintKey: "public.png"]
       )
+      return (attachment, fileUrl)
     } catch {
       try? FileManager.default.removeItem(at: fileUrl)
       return nil
@@ -566,8 +586,10 @@ public class RemoteSessionModule: Module {
       content.body = expandedBody.isEmpty ? body : expandedBody
       content.threadIdentifier = "agy_action_threads"
       content.badge = NSNumber(value: count)
-      if let attachment = self.renderCardsAttachment(items: items, totalCount: count) {
+      var attachmentTempUrl: URL? = nil
+      if let (attachment, tempUrl) = self.renderCardsAttachment(items: items, totalCount: count) {
         content.attachments = [attachment]
+        attachmentTempUrl = tempUrl
       }
       if shouldAlert {
         content.sound = .default
@@ -588,7 +610,11 @@ public class RemoteSessionModule: Module {
         content: content,
         trigger: nil
       )
-      center.add(request, withCompletionHandler: nil)
+      center.add(request) { error in
+        if error != nil, let tempUrl = attachmentTempUrl {
+          try? FileManager.default.removeItem(at: tempUrl)
+        }
+      }
     }.runOnQueue(.main)
 
     AsyncFunction("clearActionNotification") {
