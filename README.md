@@ -45,13 +45,14 @@ A clean prebuild deletes the native directory, including local signing files and
 Provide `ANDROID_KEYSTORE_FILE`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD`, or an ignored `android/keystore.properties` file with `storeFile`, `storePassword`, `keyAlias`, and `keyPassword`. Relative keystore paths resolve from `android/app`. Release tasks fail if credentials are incomplete; debug signing never substitutes for release signing. The committed debug keystore uses the standard public Android development credentials.
 
 ```bash
+npm run generate:play-assets
 npm run build:play-aab
 # Also check a separately built APK/AAB:
 npm run check:16kb -- /absolute/path/to/app.apk
 ```
 
-The build script verifies native configuration and all 64-bit library LOAD alignments before accepting the AAB. APK checks additionally verify ZIP alignment for uncompressed libraries. Building a single architecture for local verification does not replace a release build with all configured architectures.
+The build script verifies native configuration, Play Store metadata/screenshot dimensions, and all 64-bit library LOAD alignments before accepting the AAB. APK checks additionally verify ZIP alignment for uncompressed libraries. Building a single architecture for local verification does not replace a release build with all configured architectures.
 
-`npm run publish:play-internal` builds and validates the AAB before invoking the Play publisher. Configure `PLAY_SERVICE_ACCOUNT_JSON` or an ignored `android/play-service-account.json` first. Publishing is a separate, explicit action.
+`npm run generate:play-assets` deterministically renders the Play Store app icon (`512x512`), feature graphic (`1024x500`), phone screenshots (`1080x1920`), and 7"/10" docked tablet screenshots (`1728x1080` / `1920x1200`) using local headless Chromium (override with `CHROME_BIN` if needed). `npm run publish:play-listing` regenerates, validates, and uploads the store listing & graphics; `npm run publish:play-internal` and `npm run publish:play-production` validate and upload release bundles. Configure `PLAY_SERVICE_ACCOUNT_JSON` or an ignored `android/play-service-account.json` first. Publishing is a separate, explicit action.
 
 See [SECURITY.md](SECURITY.md) for the threat boundaries, regression coverage, and outstanding build-tool advisory.

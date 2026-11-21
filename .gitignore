@@ -32,3 +32,4 @@ yarn-error.*
 *.tsbuildinfo
 __pycache__/
 *.pyc
+.tmp-play-assets-*

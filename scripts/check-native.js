@@ -37,23 +37,99 @@ function checkNative(root, options = {}) {
     `android/app/build.gradle versionCode (${gradleVersionCodeMatch?.[1]}) must match app.json expo.android.versionCode (${config.android.versionCode})`,
   );
   if (options.checkPlayMetadata !== false) {
-    const releaseNotesPath = path.join(
+    const playListingDir = path.join(
       root,
+      'android/app/src/main/play/listings/en-US',
+    );
+    const readPlayText = (relPath, label, maxChars) => {
+      const fullPath = path.join(root, relPath);
+      assert(fs.existsSync(fullPath), `Missing Play Store file: ${relPath}`);
+      const content = fs.readFileSync(fullPath, 'utf8').trim();
+      assert(content.length > 0, `Play Store ${label} must not be empty`);
+      assert(
+        content.length <= maxChars,
+        `Play Store ${label} exceeds ${maxChars}-character limit (${content.length} chars)`,
+      );
+    };
+    const readPngDimensions = (fullPath) => {
+      assert(fs.existsSync(fullPath), `Missing Play Store graphic: ${fullPath}`);
+      const buf = fs.readFileSync(fullPath);
+      assert(
+        buf.length >= 24 &&
+          buf[0] === 0x89 &&
+          buf[1] === 0x50 &&
+          buf[2] === 0x4e &&
+          buf[3] === 0x47,
+        `Invalid PNG header: ${fullPath}`,
+      );
+      return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+    };
+
+    readPlayText(
       'android/app/src/main/play/release-notes/en-US/default.txt',
+      'release notes (en-US/default.txt)',
+      500,
+    );
+    readPlayText(
+      'android/app/src/main/play/listings/en-US/title.txt',
+      'title',
+      30,
+    );
+    readPlayText(
+      'android/app/src/main/play/listings/en-US/short-description.txt',
+      'short description',
+      80,
+    );
+    readPlayText(
+      'android/app/src/main/play/listings/en-US/full-description.txt',
+      'full description',
+      4000,
+    );
+
+    const graphicsDir = path.join(playListingDir, 'graphics');
+    const iconDim = readPngDimensions(
+      path.join(graphicsDir, 'icon/play-icon-512.png'),
     );
     assert(
-      fs.existsSync(releaseNotesPath),
-      'Missing Play Store release notes file: android/app/src/main/play/release-notes/en-US/default.txt',
+      iconDim.width === 512 && iconDim.height === 512,
+      `Play Store icon must be 512x512 (found ${iconDim.width}x${iconDim.height})`,
     );
-    const releaseNotes = fs.readFileSync(releaseNotesPath, 'utf8').trim();
-    assert(
-      releaseNotes.length > 0,
-      'Play Store release notes (en-US/default.txt) must not be empty',
+    const featureDim = readPngDimensions(
+      path.join(graphicsDir, 'feature-graphic/feature-graphic-1024x500.png'),
     );
     assert(
-      releaseNotes.length <= 500,
-      `Play Store release notes exceed 500-character Google Play limit (${releaseNotes.length} chars)`,
+      featureDim.width === 1024 && featureDim.height === 500,
+      `Play Store feature graphic must be 1024x500 (found ${featureDim.width}x${featureDim.height})`,
     );
+
+    for (const [folder, minCount, expectedMinSide] of [
+      ['phone-screenshots', 2, 1080],
+      ['seven-inch-tablet-screenshots', 2, 1080],
+      ['large-tablet-screenshots', 2, 1080],
+    ]) {
+      const dirPath = path.join(graphicsDir, folder);
+      assert(
+        fs.existsSync(dirPath),
+        `Missing Play Store screenshots directory: ${folder}`,
+      );
+      const pngs = fs
+        .readdirSync(dirPath)
+        .filter((f) => f.endsWith('.png'))
+        .sort();
+      assert(
+        pngs.length >= minCount && pngs.length <= 8,
+        `${folder} must contain between ${minCount} and 8 PNG screenshots (found ${pngs.length})`,
+      );
+      for (const png of pngs) {
+        const { width, height } = readPngDimensions(path.join(dirPath, png));
+        const minSide = Math.min(width, height);
+        const maxSide = Math.max(width, height);
+        assert(
+          minSide >= expectedMinSide && maxSide <= 3840 && maxSide / minSide <= 2,
+          `${folder}/${png} (${width}x${height}) does not meet Play Store high-res screenshot bounds (minSide>=${expectedMinSide}, aspect<=2:1)`,
+        );
+      }
+    }
   }
   const manifest = read('android/app/src/main/AndroidManifest.xml');
   for (const attribute of [

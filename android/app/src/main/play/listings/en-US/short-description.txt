@@ -1,1 +1,1 @@
-Mobile companion wrapper for Antigravity Remote with CLI handoff & session sync.
+Mobile companion for Antigravity Remote: Inbox, Projects, Quotas & Live Alerts.
