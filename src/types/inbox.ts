@@ -47,6 +47,8 @@ export interface InboxThreadItem {
   projectId?: string | null;
   workspaceName: string | null;
   workspaceUri?: string | null;
+  /** All distinct workspace / git-root URIs associated with this conversation (for project matching). */
+  workspaceUris?: string[];
   instanceUuid: string;
   instanceName: string;
   source: 'remote-control' | 'cloud';

@@ -3534,4 +3534,439 @@ describe('inboxParser', () => {
     await sandboxWindow.__agyInboxBridge.refresh(false);
     expect(bgRpcCalls).toHaveLength(3);
   });
+
+  it('merges JetboxSubscribeToSummaries streaming updates with GetAllCascadeTrajectories so all projects show their chats', async () => {
+    const postedToNative: string[] = [];
+    const streamCalls: Array<{
+      rpcPath: string;
+      payload: Uint8Array;
+      headers: Record<string, string>;
+      cancelled: boolean;
+    }> = [];
+    const readProjectBatches: string[][] = [];
+
+    const encodeConnectJsonFrame = (flags: number, obj: unknown): Uint8Array => {
+      const jsonBytes = new TextEncoder().encode(JSON.stringify(obj));
+      const frame = new Uint8Array(5 + jsonBytes.length);
+      frame[0] = flags;
+      const len = jsonBytes.length;
+      frame[1] = (len >>> 24) & 255;
+      frame[2] = (len >>> 16) & 255;
+      frame[3] = (len >>> 8) & 255;
+      frame[4] = len & 255;
+      frame.set(jsonBytes, 5);
+      return frame;
+    };
+
+    class MockListInstancesRequest {}
+    class MockProxyCommandRequest {
+      targetUuid = '';
+      rpcPath = '';
+      payload: Uint8Array = new Uint8Array(0);
+      headers: Record<string, string> = {};
+      setTargetInstanceUuid(uuid: string) {
+        this.targetUuid = uuid;
+      }
+      setRpcPath(path: string) {
+        this.rpcPath = path;
+      }
+      setPayload(bytes: Uint8Array) {
+        this.payload = bytes;
+      }
+      putHeaders(key: string, value: string) {
+        this.headers[key] = value;
+      }
+    }
+
+    const totalIds = Array.from({ length: 70 }, (_, idx) =>
+      idx === 0
+        ? 'proj-alpha'
+        : idx === 1
+          ? 'proj-beta'
+          : idx === 2
+            ? 'proj-gamma'
+            : `proj-extra-${idx}`,
+    );
+
+    class MockApiServicePromiseClient {
+      listInstances() {
+        return Promise.resolve({
+          getInstancesList: () => [
+            {
+              getUuid: () => 'box-jetbox',
+              getStatus: () => 1,
+              getMetadata: () => ({
+                getName: () => 'Dev Workstation',
+                getVersion: () => '2.1.0',
+              }),
+              getStatusLastUpdatedAt: () => ({ getSeconds: () => 1774000000 }),
+            },
+          ],
+        });
+      }
+
+      proxyCommand(req: MockProxyCommandRequest) {
+        let body: Record<string, unknown> = {};
+        if (req.rpcPath.endsWith('/GetAllCascadeTrajectories')) {
+          // Simulates GetAllCascadeTrajectories returning ONLY the currently active
+          // in-memory thread (without projectId) while omitting historical chats in other projects.
+          body = {
+            trajectorySummaries: {
+              'chat-alpha-live': {
+                summary: 'Live Alpha Refactor',
+                status: 'CASCADE_RUN_STATUS_RUNNING',
+                notFullyIdle: true,
+                stepCount: 12,
+                lastModifiedTime: '2026-11-21T08:00:00Z',
+                latestNotifyUserStep: { giantBlob: 'x'.repeat(2000) },
+                workspaces: [
+                  {
+                    workspaceFolderAbsoluteUri: 'file:///home/marcus/projects/alpha',
+                  },
+                ],
+              },
+            },
+          };
+        } else if (req.rpcPath.endsWith('/ListProjects')) {
+          body = { projectIds: totalIds };
+        } else if (req.rpcPath.endsWith('/ReadProjects')) {
+          const parsedReq = JSON.parse(new TextDecoder().decode(req.payload));
+          const batchIds: string[] = Array.isArray(parsedReq.ids) ? parsedReq.ids : [];
+          readProjectBatches.push(batchIds);
+          body = {
+            projects: batchIds.map((id) => ({
+              id,
+              name:
+                id === 'proj-alpha'
+                  ? 'Alpha'
+                  : id === 'proj-beta'
+                    ? 'Beta'
+                    : id === 'proj-gamma'
+                      ? 'Gamma'
+                      : id,
+              projectResources: {
+                resources: [{ folderUri: `file:///home/marcus/projects/${id.replace('proj-', '')}` }],
+              },
+            })),
+          };
+        } else if (req.rpcPath.endsWith('/GetWorkspaceInfos')) {
+          body = { workspaceInfos: [] };
+        } else if (req.rpcPath.endsWith('/ListBackgroundTasks')) {
+          body = { tasks: [] };
+        }
+        const encoded = new TextEncoder().encode(JSON.stringify(body));
+        return Promise.resolve({ getPayload_asU8: () => encoded });
+      }
+
+      streamProxyCommand(req: MockProxyCommandRequest) {
+        const record = {
+          rpcPath: req.rpcPath,
+          payload: req.payload,
+          headers: { ...req.headers },
+          cancelled: false,
+        };
+        streamCalls.push(record);
+
+        const handlers: Record<string, Array<(arg?: any) => void>> = {
+          data: [],
+          end: [],
+          error: [],
+        };
+
+        const stream = {
+          on(event: string, cb: (arg?: any) => void) {
+            if (handlers[event]) handlers[event].push(cb);
+            return stream;
+          },
+          cancel() {
+            record.cancelled = true;
+          },
+        };
+
+        // Emit two Connect JSON frames, splitting the first frame across 2 chunks
+        // to test byte-buffer reassembly + multi-frame updates/deletes handling.
+        const frame1 = encodeConnectJsonFrame(0, {
+          updates: {
+            'chat-alpha-live': {
+              summary: 'Live Alpha Refactor',
+              status: 'CASCADE_RUN_STATUS_IDLE',
+              stepCount: 10,
+              lastModifiedTime: '2026-11-21T07:55:00Z',
+              trajectoryMetadata: { projectId: 'proj-alpha' },
+            },
+            'chat-beta-history': {
+              summary: 'Historical Beta Feature',
+              status: 'CASCADE_RUN_STATUS_IDLE',
+              stepCount: 24,
+              lastModifiedTime: '2026-11-20T15:00:00Z',
+              trajectoryMetadata: { projectId: 'proj-beta' },
+            },
+            'chat-deleted': {
+              summary: 'Should Be Removed',
+              status: 'CASCADE_RUN_STATUS_IDLE',
+              trajectoryMetadata: { projectId: 'proj-gamma' },
+            },
+          },
+        });
+        const frame2 = encodeConnectJsonFrame(0, {
+          updates: {
+            'chat-gamma-history': {
+              summary: 'Historical Gamma Fix',
+              status: 'CASCADE_RUN_STATUS_IDLE',
+              stepCount: 9,
+              lastModifiedTime: '2026-11-19T12:00:00Z',
+              trajectoryMetadata: { projectId: 'proj-gamma' },
+            },
+          },
+          deletes: ['chat-deleted'],
+        });
+
+        Promise.resolve().then(() => {
+          const splitAt = Math.floor(frame1.length / 2);
+          for (const cb of handlers.data) {
+            cb({ getPayload_asU8: () => frame1.subarray(0, splitAt) });
+            cb({ getPayload_asU8: () => frame1.subarray(splitAt) });
+            cb({ getPayload_asU8: () => frame2 });
+          }
+          // Close cleanly with end-of-stream Connect trailer frame (flags = 2)
+          const trailer = encodeConnectJsonFrame(2, {});
+          for (const cb of handlers.data) {
+            cb({ getPayload_asU8: () => trailer });
+          }
+        });
+
+        return stream;
+      }
+    }
+
+    const sandboxWindow: any = {
+      location: {
+        hostname: 'antigravity.google.com',
+        origin: 'https://antigravity.google.com',
+        pathname: '/r/box-jetbox',
+        search: '',
+        href: 'https://antigravity.google.com/r/box-jetbox',
+      },
+      history: { state: null, replaceState: () => {} },
+      navigator: { onLine: true },
+      document: {
+        cookie: 'SAPISID=test',
+        visibilityState: 'visible',
+        querySelectorAll: () => [],
+      },
+      default_GoogleAntigravity: {
+        K: {
+          devtools_jetski_boq_api_proto: {
+            ApiServicePromiseClient: MockApiServicePromiseClient,
+            ListInstancesRequest: MockListInstancesRequest,
+            ProxyCommandRequest: MockProxyCommandRequest,
+          },
+        },
+        pj: {
+          auth_firstparty: {
+            getAuthHeaderValueForFirstParty: () => 'SAPISIDHASH 1_a',
+          },
+        },
+      },
+      ReactNativeWebView: {
+        postMessage: (raw: string) => postedToNative.push(raw),
+      },
+      addEventListener: () => {},
+      TextEncoder,
+      TextDecoder,
+      URL,
+      URLSearchParams,
+      setTimeout: (fn: (...a: any[]) => void, ms?: number) => {
+        const t = setTimeout(fn, ms);
+        (t as { unref?: () => void }).unref?.();
+        return t;
+      },
+      clearTimeout,
+      setInterval: () => 1,
+      clearInterval: () => {},
+    };
+    sandboxWindow.window = sandboxWindow;
+
+    const context = vm.createContext(sandboxWindow);
+    vm.runInContext(INBOX_BRIDGE_SCRIPT, context);
+
+    await sandboxWindow.__agyInboxBridge.refresh(false);
+    sandboxWindow.__agyInboxBridge.stop();
+
+    // 1. ReadProjects batched 70 project IDs into 64 + 6
+    expect(readProjectBatches.map((b) => b.length)).toEqual([64, 6]);
+
+    // 2. JetboxSubscribeToSummaries stream was invoked with Connect streaming headers & cancelled cleanly
+    expect(streamCalls).toHaveLength(1);
+    expect(streamCalls[0].rpcPath).toBe(
+      '/exa.language_server_pb.LanguageServerService/JetboxSubscribeToSummaries',
+    );
+    expect(streamCalls[0].headers['content-type']).toBe('application/connect+json');
+    expect(streamCalls[0].headers['connect-protocol-version']).toBe('1');
+    expect(streamCalls[0].headers['x-is-streaming']).toBe('true');
+    expect(streamCalls[0].cancelled).toBe(true);
+
+    // 3. Snapshot contains ALL 3 projects' chats with merged live status + projectId and no bloated step fields
+    expect(postedToNative.length).toBeGreaterThanOrEqual(1);
+    const parsed = parseInboxBridgeMessage(postedToNative[0]);
+    expect(parsed?.type).toBe('AGY_INBOX_SNAPSHOT');
+    if (parsed?.type !== 'AGY_INBOX_SNAPSHOT') return;
+    const rawAlpha = (parsed.instances[0].trajectories as any)['chat-alpha-live'];
+    expect(rawAlpha.latestNotifyUserStep).toBeUndefined();
+    expect(rawAlpha.trajectoryMetadata?.projectId).toBe('proj-alpha');
+    expect(rawAlpha.status).toBe('CASCADE_RUN_STATUS_RUNNING');
+    expect((parsed.instances[0].trajectories as any)['chat-deleted']).toBeUndefined();
+
+    const snapshot = buildInboxSnapshot(parsed);
+    const groups = buildProjectGroups(snapshot);
+    const alphaGroup = groups.find((g) => g.projectId === 'proj-alpha');
+    const betaGroup = groups.find((g) => g.projectId === 'proj-beta');
+    const gammaGroup = groups.find((g) => g.projectId === 'proj-gamma');
+    expect(alphaGroup?.threads.map((t) => t.cascadeId)).toEqual(['chat-alpha-live']);
+    expect(alphaGroup?.threads[0].attentionKind).toBe('running');
+    expect(betaGroup?.threads.map((t) => t.cascadeId)).toEqual(['chat-beta-history']);
+    expect(gammaGroup?.threads.map((t) => t.cascadeId)).toEqual(['chat-gamma-history']);
+  });
+
+  it('matches conversations to server projects across worktrees, subdirectories, environments, metadata.workspaces, and mixed URI schemes', () => {
+    const rawMsg = parseInboxBridgeMessage(
+      JSON.stringify({
+        type: 'AGY_INBOX_SNAPSHOT',
+        fetchedAtMs: 1_774_000_000_000,
+        activeUrl: 'https://antigravity.google.com/r/dev-box?p=c%2Fchat-subdir',
+        instances: [
+          {
+            uuid: 'dev-box',
+            name: 'Dev Box',
+            status: 1,
+            projects: [
+              {
+                id: 'proj-worktree',
+                name: 'Mobile App',
+                projectResources: {
+                  resources: [
+                    { gitFolder: { folderUri: 'file:///home/marcus/projects/mobile-app' } },
+                  ],
+                },
+                environments: {
+                  environments: [
+                    {
+                      id: 'env-wt-1',
+                      name: 'feat-tablet',
+                      resources: {
+                        resources: [
+                          { folderUri: 'file:///home/marcus/.worktrees/mobile-app-tablet' },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              },
+              {
+                id: 'proj-win',
+                name: 'Windows Service',
+                projectResources: {
+                  resources: [
+                    { folderUri: 'file:///C%3A/Users/Marcus/Win%20Service/' },
+                  ],
+                },
+              },
+              {
+                id: 'proj-top-id',
+                name: 'Top Level ID Project',
+                projectResources: {
+                  resources: [{ folderUri: 'file:///home/marcus/projects/top-id' }],
+                },
+              },
+            ],
+            trajectories: {
+              trajectorySummaries: {
+                // 1. Subdirectory URI without projectId -> deepest-prefix match to proj-worktree
+                'chat-subdir': {
+                  summary: 'Fix Android Gradle config',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  workspaces: [
+                    {
+                      workspaceFolderAbsoluteUri:
+                        'file:///home/marcus/projects/mobile-app/android/app',
+                    },
+                  ],
+                },
+                // 2. Worktree URI stored only in trajectoryMetadata.workspaces + gitRootAbsoluteUri
+                'chat-gitroot': {
+                  summary: 'Worktree feature branch',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  trajectoryMetadata: {
+                    workspaces: [
+                      {
+                        workspaceFolderAbsoluteUri:
+                          'file:///tmp/ephemeral-worktree/mobile-app',
+                        gitRootAbsoluteUri: '/home/marcus/projects/mobile-app',
+                      },
+                    ],
+                  },
+                },
+                // 3. Environment resource URI (vscode-remote scheme) -> matches project.environments
+                'chat-env': {
+                  summary: 'Environment worktree session',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  workspaces: [
+                    {
+                      workspaceFolderAbsoluteUri:
+                        'vscode-remote://ssh-remote+dev-box/home/marcus/.worktrees/mobile-app-tablet',
+                    },
+                  ],
+                },
+                // 4. Windows bare backslash path -> matches encoded file:///C%3A/... project
+                'chat-win': {
+                  summary: 'Windows daemon fix',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  trajectoryMetadata: {
+                    workspaceUris: ['C:\\Users\\Marcus\\Win Service'],
+                  },
+                },
+                // 5. Top-level raw.projectId when trajectoryMetadata exists without projectId
+                'chat-top-id': {
+                  summary: 'Top-level project ID fallback',
+                  status: 'CASCADE_RUN_STATUS_IDLE',
+                  projectId: 'proj-top-id',
+                  trajectoryMetadata: {
+                    createdAt: '2026-11-21T07:00:00Z',
+                  },
+                },
+              },
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(rawMsg?.type).toBe('AGY_INBOX_SNAPSHOT');
+    if (rawMsg?.type !== 'AGY_INBOX_SNAPSHOT') return;
+
+    const snapshot = buildInboxSnapshot(rawMsg);
+    const groups = buildProjectGroups(snapshot);
+
+    const mobileGroup = groups.find((g) => g.projectId === 'proj-worktree');
+    expect(mobileGroup?.threads.map((t) => t.cascadeId).sort()).toEqual([
+      'chat-env',
+      'chat-gitroot',
+      'chat-subdir',
+    ]);
+
+    const winGroup = groups.find((g) => g.projectId === 'proj-win');
+    expect(winGroup?.threads.map((t) => t.cascadeId)).toEqual(['chat-win']);
+
+    const topIdGroup = groups.find((g) => g.projectId === 'proj-top-id');
+    expect(topIdGroup?.threads.map((t) => t.cascadeId)).toEqual(['chat-top-id']);
+
+    // Active thread in subdirectory also resolves cleanly to the owning server project
+    const activeCtx = resolveActiveThreadProject(snapshot, {
+      activeUrl: 'https://antigravity.google.com/r/dev-box?p=c%2Fchat-subdir',
+    });
+    expect(activeCtx).toMatchObject({
+      projectId: 'proj-worktree',
+      projectName: 'Mobile App',
+    });
+  });
 });

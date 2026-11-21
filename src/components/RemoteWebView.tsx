@@ -94,6 +94,7 @@ import {
   resolveActiveRouteFromBridgeMessage,
   resolveActiveThreadProject,
 } from '../utils/inboxParser';
+import { computeDrawerWidth, isTabletViewport } from '../utils/layout';
 import {
   isGoogleCookieErrorUrl,
   isAllowedAuthSubframeUrl,
@@ -387,9 +388,17 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   onOpenInboxConsumed,
 }) => {
   const insets = useSafeAreaInsets();
-  const { height: windowHeight } = useWindowDimensions();
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
   const windowHeightRef = useRef<number>(windowHeight);
   windowHeightRef.current = windowHeight;
+  const isTabletLayout = isTabletViewport(windowWidth, windowHeight);
+  const dockedSidebarWidth = isTabletLayout
+    ? computeDrawerWidth(windowWidth, true)
+    : 0;
+  const isTabletLayoutRef = useRef<boolean>(isTabletLayout);
+  isTabletLayoutRef.current = isTabletLayout;
+  const prevIsTabletLayoutRef = useRef<boolean>(isTabletLayout);
+  const userClosedTabletSidebarRef = useRef<boolean>(false);
   const initialIsForeground =
     AppState.currentState !== 'background' &&
     AppState.currentState !== 'inactive';
@@ -602,13 +611,14 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         restoredCount > 0 && sessionSignature.length > 0;
       wasAuthenticatedRef.current = isAuthenticatedAtLaunch;
       setStage(isAuthenticatedAtLaunch ? 'authenticated' : 'authenticating');
-      // Antigravity's native web sidebar is hidden inside the WebView: when opening
-      // the app authenticated on a non-thread route (no cascadeId), open our native
-      // Inbox sidebar automatically so the user is either in a thread or in Inbox.
+      // Antigravity's native web sidebar is hidden inside the WebView:
+      // - On tablet screens, open our native docked sidebar by default whenever authenticated.
+      // - On phones, open it automatically on non-thread overview routes (no cascadeId) so
+      //   the user is either in a thread or in Inbox.
       if (
         isAuthenticatedAtLaunch &&
-        !initialRoute.cascadeId &&
-        !pendingOpenInbox
+        !pendingOpenInbox &&
+        (isTabletLayoutRef.current || !initialRoute.cascadeId)
       ) {
         setDrawerInitialMode('inbox');
         isDrawerOpenRef.current = true;
@@ -820,7 +830,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         const effectiveForeground =
           overrides?.isAppForeground ?? isAppForegroundRef.current;
         const effectiveDrawerOpen =
-          overrides?.isDrawerOpen ?? isDrawerOpenRef.current;
+          (overrides?.isDrawerOpen ?? isDrawerOpenRef.current) &&
+          !isTabletLayoutRef.current;
 
         const rawMsg = lastSnapshotMessageRef.current;
         if (rawMsg) {
@@ -924,6 +935,42 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     [],
   );
 
+  useEffect(() => {
+    if (prevIsTabletLayoutRef.current === isTabletLayout) {
+      return;
+    }
+    prevIsTabletLayoutRef.current = isTabletLayout;
+    if (!isHydrated || isResettingSessionRef.current || resetRequest) {
+      return;
+    }
+    if (isTabletLayout) {
+      if (
+        stageRef.current === 'authenticated' &&
+        !isDrawerOpenRef.current &&
+        !userClosedTabletSidebarRef.current
+      ) {
+        setDrawerInitialMode('inbox');
+        isDrawerOpenRef.current = true;
+        setIsDrawerOpen(true);
+      }
+      recomputeSnapshotWithLocalState({ isDrawerOpen: isDrawerOpenRef.current });
+      return;
+    }
+    const route = extractActiveRouteFromUrl(currentNavUrlRef.current);
+    if (isDrawerOpenRef.current && route.cascadeId) {
+      isDrawerOpenRef.current = false;
+      setIsDrawerOpen(false);
+      recomputeSnapshotWithLocalState({ isDrawerOpen: false });
+      return;
+    }
+    recomputeSnapshotWithLocalState({ isDrawerOpen: isDrawerOpenRef.current });
+  }, [
+    isHydrated,
+    isTabletLayout,
+    recomputeSnapshotWithLocalState,
+    resetRequest,
+  ]);
+
   // Step 3: Flush & back up cookies whenever the app transitions to background/inactive,
   // and wake up active sessions + 2-Step Verification immediately when returning to active
   useEffect(() => {
@@ -944,7 +991,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           }
           if (isAppForegroundRef.current) {
             const currentSnap = inboxSnapshotRef.current;
-            if (!isDrawerOpenRef.current) {
+            if (!isDrawerOpenRef.current || isTabletLayoutRef.current) {
               const activeThread = findMatchingThread(
                 currentSnap.threads,
                 currentSnap.activeInstanceUuid,
@@ -981,7 +1028,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
               if (
                 isResettingSessionRef.current ||
                 !isAppForegroundRef.current ||
-                isDrawerOpenRef.current
+                (isDrawerOpenRef.current && !isTabletLayoutRef.current)
               ) {
                 return;
               }
@@ -1135,7 +1182,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         setRawKeyboardHeight(dockedOverlap);
         setIsKeyboardOpen(sanitizedHeight > 0);
       }
-      if (!isDrawerOpenRef.current) {
+      if (!isDrawerOpenRef.current || isTabletLayoutRef.current) {
         webViewRef.current?.injectJavaScript(KEYBOARD_ADAPTATION_SCRIPT);
       }
     };
@@ -1165,21 +1212,23 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         if (drawerBackInterceptorRef.current?.()) {
           return true;
         }
-        isDrawerOpenRef.current = false;
-        setIsDrawerOpen(false);
-        if (isAppForegroundRef.current) {
-          const currentSnap = inboxSnapshotRef.current;
-          const activeThread = findMatchingThread(
-            currentSnap.threads,
-            currentSnap.activeInstanceUuid,
-            currentSnap.activeCascadeId,
-          );
-          markThreadReadInWorkstationClock(activeThread, 'unread_only');
+        if (!isTabletLayoutRef.current) {
+          isDrawerOpenRef.current = false;
+          setIsDrawerOpen(false);
+          if (isAppForegroundRef.current) {
+            const currentSnap = inboxSnapshotRef.current;
+            const activeThread = findMatchingThread(
+              currentSnap.threads,
+              currentSnap.activeInstanceUuid,
+              currentSnap.activeCascadeId,
+            );
+            markThreadReadInWorkstationClock(activeThread, 'unread_only');
+          }
+          recomputeSnapshotWithLocalState({
+            isDrawerOpen: false,
+          });
+          return true;
         }
-        recomputeSnapshotWithLocalState({
-          isDrawerOpen: false,
-        });
-        return true;
       }
       if (canGoBackRef.current && webViewRef.current) {
         canReturnToOverviewRef.current = false;
@@ -1243,6 +1292,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       stageRef.current = 'hydrating';
       setStage('hydrating');
       isDrawerOpenRef.current = false;
+      userClosedTabletSidebarRef.current = false;
       isComposingNewThreadRef.current = false;
       wasAuthenticatedRef.current = false;
       setIsDrawerOpen(false);
@@ -1373,7 +1423,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         reconcilePendingThreadProject(route.instanceUuid, route.cascadeId);
         if (
           isAppForegroundRef.current &&
-          !isDrawerOpenRef.current &&
+          (!isDrawerOpenRef.current || isTabletLayoutRef.current) &&
           route.instanceUuid &&
           route.cascadeId
         ) {
@@ -1414,9 +1464,9 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
               }
               if (
                 becameAuthenticated &&
-                !route.cascadeId &&
                 !isComposingNewThreadRef.current &&
-                !isDrawerOpenRef.current
+                !isDrawerOpenRef.current &&
+                (isTabletLayoutRef.current || !route.cascadeId)
               ) {
                 setDrawerInitialMode('inbox');
                 isDrawerOpenRef.current = true;
@@ -1663,8 +1713,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         resumeReadSettleTimerRef.current = null;
       }
       isComposingNewThreadRef.current = false;
+      userClosedTabletSidebarRef.current = false;
       handleDismissDrawerGuidance();
-      Keyboard.dismiss?.();
+      if (!isTabletLayoutRef.current) {
+        Keyboard.dismiss?.();
+      }
       const resolvedMode: DrawerMode =
         preferredMode ??
         (stageRef.current === 'authenticated' ? 'inbox' : 'settings');
@@ -1684,6 +1737,9 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   );
 
   const handleCloseDrawer = useCallback(() => {
+    if (isTabletLayoutRef.current) {
+      userClosedTabletSidebarRef.current = true;
+    }
     isDrawerOpenRef.current = false;
     setIsDrawerOpen(false);
     if (isAppForegroundRef.current) {
@@ -1732,16 +1788,20 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         clearTimeout(resumeReadSettleTimerRef.current);
         resumeReadSettleTimerRef.current = null;
       }
-      isDrawerOpenRef.current = false;
+      const keepDockedOpen =
+        isTabletLayoutRef.current && isDrawerOpenRef.current;
+      if (!keepDockedOpen) {
+        isDrawerOpenRef.current = false;
+        setIsDrawerOpen(false);
+      }
       isComposingNewThreadRef.current = false;
-      setIsDrawerOpen(false);
       setPendingThreadProject(null);
 
       markThreadReadInWorkstationClock(thread, 'unread_only');
       recomputeSnapshotWithLocalState({
         activeInstanceUuid: thread.instanceUuid,
         activeCascadeId: thread.cascadeId,
-        isDrawerOpen: false,
+        isDrawerOpen: keepDockedOpen,
       });
 
       const currentRoute = extractActiveRouteFromUrl(currentNavUrlRef.current);
@@ -1791,9 +1851,13 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         clearTimeout(resumeReadSettleTimerRef.current);
         resumeReadSettleTimerRef.current = null;
       }
-      isDrawerOpenRef.current = false;
+      const keepDockedOpen =
+        isTabletLayoutRef.current && isDrawerOpenRef.current;
+      if (!keepDockedOpen) {
+        isDrawerOpenRef.current = false;
+        setIsDrawerOpen(false);
+      }
       isComposingNewThreadRef.current = true;
-      setIsDrawerOpen(false);
       setPendingThreadProject({
         instanceUuid: project.instanceUuid,
         cascadeId: null,
@@ -1803,7 +1867,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       recomputeSnapshotWithLocalState({
         activeInstanceUuid: project.instanceUuid,
         activeCascadeId: null,
-        isDrawerOpen: false,
+        isDrawerOpen: keepDockedOpen,
       });
 
       if (
@@ -1991,13 +2055,17 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       if (matchingThread) {
         handleSelectInboxThread(matchingThread);
       } else {
-        isDrawerOpenRef.current = false;
-        setIsDrawerOpen(false);
+        const keepDockedOpen =
+          isTabletLayoutRef.current && isDrawerOpenRef.current;
+        if (!keepDockedOpen) {
+          isDrawerOpenRef.current = false;
+          setIsDrawerOpen(false);
+        }
         if (targetRoute.instanceUuid && targetRoute.cascadeId) {
           recomputeSnapshotWithLocalState({
             activeInstanceUuid: targetRoute.instanceUuid,
             activeCascadeId: targetRoute.cascadeId,
-            isDrawerOpen: false,
+            isDrawerOpen: keepDockedOpen,
           });
         }
         if (validation.normalizedUrl !== currentNavUrlRef.current) {
@@ -2029,12 +2097,13 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       return;
     }
 
+    const isDrawerBlockingWebView = isDrawerOpen && !isTabletLayout;
     const syncResult = buildActionNotificationSyncState({
       stage,
       mode: actionNotificationMode,
       threads: inboxSnapshot.threads,
       isAppForeground,
-      isDrawerOpen,
+      isDrawerOpen: isDrawerBlockingWebView,
       previousOpenThreadIds: previousOpenActionIdsRef.current,
     });
     previousOpenActionIdsRef.current = syncResult.openThreadIds;
@@ -2057,6 +2126,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     isAppForeground,
     isDrawerOpen,
     isHydrated,
+    isTabletLayout,
     resetRequest,
     stage,
   ]);
@@ -2102,6 +2172,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           setIsInboxRefreshing(false);
           syncVerifiedActiveHostUrl(message.activeUrl);
           lastSnapshotMessageRef.current = message;
+          const drawerBlockingNow =
+            isDrawerOpenRef.current && !isTabletLayoutRef.current;
           const built = reconcileRunningThreadTransitions({
             message,
             knownRunningThreadIds: knownRunningThreadIdsRef.current,
@@ -2109,7 +2181,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             locallyReadAtByThreadId: locallyReadMapRef.current,
             fallbackActiveUrl: currentNavUrlRef.current,
             isAppForeground: isAppForegroundRef.current,
-            isDrawerOpen: isDrawerOpenRef.current,
+            isDrawerOpen: drawerBlockingNow,
           });
           lastSnapshotMessageRef.current = {
             ...message,
@@ -2123,7 +2195,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           );
           if (
             isAppForegroundRef.current &&
-            !isDrawerOpenRef.current &&
+            !drawerBlockingNow &&
             !resumeReadSettleTimerRef.current &&
             built.activeInstanceUuid &&
             built.activeCascadeId
@@ -2166,7 +2238,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           }
           if (
             isAppForegroundRef.current &&
-            !isDrawerOpenRef.current &&
+            (!isDrawerOpenRef.current || isTabletLayoutRef.current) &&
             !resumeReadSettleTimerRef.current &&
             activeInstanceUuid &&
             activeCascadeId
@@ -2445,98 +2517,109 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     <View style={styles.root}>
       <TopStatusBanner stage={stage} onRetryPress={handleReloadSession} />
 
-      <View style={styles.webViewWrapper}>
-        <WebView
-          key={`agy-webview-${webViewInstanceKey}`}
-          ref={webViewRef}
-          source={{ uri: currentSourceUrl }}
-          userAgent={getCleanMobileUserAgent()}
-          style={styles.webView}
-          containerStyle={styles.webViewContainer}
-          sharedCookiesEnabled={true}
-          thirdPartyCookiesEnabled={true}
-          domStorageEnabled={true}
-          javaScriptEnabled={true}
-          cacheEnabled={true}
-          setSupportMultipleWindows={false}
-          allowsBackForwardNavigationGestures={true}
-          pullToRefreshEnabled={true}
-          injectedJavaScriptBeforeContentLoaded={PROJECT_OVERVIEW_SCROLL_SCRIPT}
-          injectedJavaScriptBeforeContentLoadedForMainFrameOnly={false}
-          injectedJavaScript={COMBINED_INJECTED_SCRIPT}
-          originWhitelist={['*']}
-          onShouldStartLoadWithRequest={handleShouldStartLoadWithRequest}
-          onNavigationStateChange={handleNavigationStateChange}
-          onLoadStart={handleLoadStart}
-          onLoadEnd={handleLoadEnd}
-          onMessage={handleWebViewMessage}
-          onRenderProcessGone={handleWebProcessTerminated}
-          onContentProcessDidTerminate={handleWebProcessTerminated}
-          onError={() => {
-            setPageError(null);
-            setHasNetworkError(true);
-            setStage('offline');
-          }}
-          onHttpError={(syntheticEvent) => {
-            if (syntheticEvent.nativeEvent.statusCode >= 502) {
+      <View style={styles.workspaceArea}>
+        <View
+          testID="webview-wrapper"
+          style={[
+            styles.webViewWrapper,
+            isTabletLayout && isDrawerOpen
+              ? { marginLeft: dockedSidebarWidth }
+              : null,
+          ]}
+        >
+          <WebView
+            key={`agy-webview-${webViewInstanceKey}`}
+            ref={webViewRef}
+            source={{ uri: currentSourceUrl }}
+            userAgent={getCleanMobileUserAgent()}
+            style={styles.webView}
+            containerStyle={styles.webViewContainer}
+            sharedCookiesEnabled={true}
+            thirdPartyCookiesEnabled={true}
+            domStorageEnabled={true}
+            javaScriptEnabled={true}
+            cacheEnabled={true}
+            setSupportMultipleWindows={false}
+            allowsBackForwardNavigationGestures={true}
+            pullToRefreshEnabled={true}
+            injectedJavaScriptBeforeContentLoaded={PROJECT_OVERVIEW_SCROLL_SCRIPT}
+            injectedJavaScriptBeforeContentLoadedForMainFrameOnly={false}
+            injectedJavaScript={COMBINED_INJECTED_SCRIPT}
+            originWhitelist={['*']}
+            onShouldStartLoadWithRequest={handleShouldStartLoadWithRequest}
+            onNavigationStateChange={handleNavigationStateChange}
+            onLoadStart={handleLoadStart}
+            onLoadEnd={handleLoadEnd}
+            onMessage={handleWebViewMessage}
+            onRenderProcessGone={handleWebProcessTerminated}
+            onContentProcessDidTerminate={handleWebProcessTerminated}
+            onError={() => {
+              setPageError(null);
+              setHasNetworkError(true);
               setStage('offline');
-            }
-          }}
-        />
-        {hasNetworkError ? (
-          <View style={[styles.errorContainer, styles.errorOverlay]}>
-            <Text style={styles.errorHeading}>
-              Unable to reach Antigravity Remote
-            </Text>
-            <Text style={styles.errorBody}>
-              {pageError ??
-                'Check your internet connection, then reconnect to this page.'}
-            </Text>
-            <TouchableOpacity
-              style={styles.primaryRetryButton}
-              onPress={handleReloadSession}
-              accessibilityRole="button"
-            >
-              <Text style={styles.primaryRetryText}>Reconnect</Text>
-            </TouchableOpacity>
-          </View>
-        ) : null}
-      </View>
+            }}
+            onHttpError={(syntheticEvent) => {
+              if (syntheticEvent.nativeEvent.statusCode >= 502) {
+                setStage('offline');
+              }
+            }}
+          />
+          {hasNetworkError ? (
+            <View style={[styles.errorContainer, styles.errorOverlay]}>
+              <Text style={styles.errorHeading}>
+                Unable to reach Antigravity Remote
+              </Text>
+              <Text style={styles.errorBody}>
+                {pageError ??
+                  'Check your internet connection, then reconnect to this page.'}
+              </Text>
+              <TouchableOpacity
+                style={styles.primaryRetryButton}
+                onPress={handleReloadSession}
+                accessibilityRole="button"
+              >
+                <Text style={styles.primaryRetryText}>Reconnect</Text>
+              </TouchableOpacity>
+            </View>
+          ) : null}
+        </View>
 
-      <LeftNavigationDrawer
-        visible={isDrawerOpen}
-        initialMode={drawerInitialMode}
-        focusInboxRequestKey={focusInboxRequestKey}
-        isKeyboardVisible={isKeyboardVisible}
-        keyboardBottomPadding={keyboardBottomPadding}
-        hasSeenGuidance={hasSeenDrawerGuidance}
-        stage={stage}
-        activeUrl={activeHostUrl}
-        snapshot={inboxSnapshot}
-        isRefreshing={isInboxRefreshing}
-        attentionCount={inboxCounts.attention}
-        urgentAttentionCount={inboxCounts.urgent}
-        runningCount={inboxCounts.running}
-        keepAliveMinutes={keepAliveMinutes}
-        actionNotificationMode={actionNotificationMode}
-        onOpen={handleOpenDrawer}
-        onClose={handleCloseDrawer}
-        onDismissGuidance={handleDismissDrawerGuidance}
-        onRegisterBackHandler={registerDrawerBackInterceptor}
-        onRefreshInbox={handleRefreshInbox}
-        onSelectThread={handleSelectInboxThread}
-        onStartProjectThread={handleStartProjectThread}
-        onListDirectory={handleListDirectory}
-        onCreateProject={handleCreateProject}
-        onMarkThreadRead={handleMarkThreadRead}
-        onMarkAllRead={handleMarkAllRead}
-        onChangeKeepAliveMinutes={handleChangeKeepAliveMinutes}
-        onChangeActionNotificationMode={handleChangeActionNotificationMode}
-        onNavigateToUrl={handleNavigateToUrl}
-        onOpenHostSettings={handleOpenHostSettings}
-        onReloadSession={handleReloadSession}
-        onSignOut={handleSignOut}
-      />
+        <LeftNavigationDrawer
+          visible={isDrawerOpen}
+          docked={isTabletLayout}
+          initialMode={drawerInitialMode}
+          focusInboxRequestKey={focusInboxRequestKey}
+          isKeyboardVisible={isKeyboardVisible}
+          keyboardBottomPadding={keyboardBottomPadding}
+          hasSeenGuidance={hasSeenDrawerGuidance}
+          stage={stage}
+          activeUrl={activeHostUrl}
+          snapshot={inboxSnapshot}
+          isRefreshing={isInboxRefreshing}
+          attentionCount={inboxCounts.attention}
+          urgentAttentionCount={inboxCounts.urgent}
+          runningCount={inboxCounts.running}
+          keepAliveMinutes={keepAliveMinutes}
+          actionNotificationMode={actionNotificationMode}
+          onOpen={handleOpenDrawer}
+          onClose={handleCloseDrawer}
+          onDismissGuidance={handleDismissDrawerGuidance}
+          onRegisterBackHandler={registerDrawerBackInterceptor}
+          onRefreshInbox={handleRefreshInbox}
+          onSelectThread={handleSelectInboxThread}
+          onStartProjectThread={handleStartProjectThread}
+          onListDirectory={handleListDirectory}
+          onCreateProject={handleCreateProject}
+          onMarkThreadRead={handleMarkThreadRead}
+          onMarkAllRead={handleMarkAllRead}
+          onChangeKeepAliveMinutes={handleChangeKeepAliveMinutes}
+          onChangeActionNotificationMode={handleChangeActionNotificationMode}
+          onNavigateToUrl={handleNavigateToUrl}
+          onOpenHostSettings={handleOpenHostSettings}
+          onReloadSession={handleReloadSession}
+          onSignOut={handleSignOut}
+        />
+      </View>
     </View>
   );
 };
@@ -2545,6 +2628,9 @@ const styles = StyleSheet.create({
   root: {
     flex: 1,
     backgroundColor: ANTIGRAVITY_THEME.colors.canvas,
+  },
+  workspaceArea: {
+    flex: 1,
   },
   webViewWrapper: {
     flex: 1,

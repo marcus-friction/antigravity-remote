@@ -54,6 +54,7 @@ import {
   formatRelativeTime,
   formatResetCountdown,
 } from '../utils/inboxParser';
+import { computeDrawerWidth } from '../utils/layout';
 import { parseHandoffInput } from '../utils/urlValidator';
 
 export type DrawerMode = 'inbox' | 'projects' | 'usage' | 'settings';
@@ -84,6 +85,8 @@ const { colors } = ANTIGRAVITY_THEME;
 
 export interface LeftNavigationDrawerProps {
   visible: boolean;
+  /** When true (tablet viewports), renders as a docked side-by-side sidebar without a dimming backdrop. */
+  docked?: boolean;
   initialMode?: DrawerMode;
   focusInboxRequestKey?: number;
   isKeyboardVisible?: boolean;
@@ -311,6 +314,7 @@ const SettingsNavIcon: React.FC<{ color: string }> = ({ color }) => (
 
 export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   visible,
+  docked = false,
   initialMode,
   focusInboxRequestKey = 0,
   isKeyboardVisible = false,
@@ -347,10 +351,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     useWindowDimensions();
   const safeWindowWidth = rawWindowWidth > 0 ? rawWindowWidth : 390;
   const safeWindowHeight = rawWindowHeight > 0 ? rawWindowHeight : 680;
-  const drawerWidth = Math.min(
-    344,
-    Math.max(296, Math.round(safeWindowWidth * 0.86)),
-  );
+  const drawerWidth = computeDrawerWidth(safeWindowWidth, docked);
   const drawerWidthRef = useRef<number>(drawerWidth);
   drawerWidthRef.current = drawerWidth;
 
@@ -455,6 +456,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   }, [dismissGuidancePermanently, visible]);
 
   const showGuidanceHint =
+    !docked &&
     !hasSeenGuidance &&
     !localGuidanceDismissed &&
     !visible &&
@@ -1117,10 +1119,12 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
         onStartProjectThread(project);
       } else {
         onNavigateToUrl(project.newChatUrl);
-        onClose();
+        if (!docked) {
+          onClose();
+        }
       }
     },
-    [onClose, onNavigateToUrl, onStartProjectThread, resetTransientInputs],
+    [docked, onClose, onNavigateToUrl, onStartProjectThread, resetTransientInputs],
   );
 
   const loadDirectoryForInstance = useCallback(
@@ -1411,7 +1415,9 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     isDraggingOpenRef.current = false;
     setIsDraggingOpen(false);
     onNavigateToUrl(parsedUrl);
-    onClose();
+    if (!docked) {
+      onClose();
+    }
   };
 
   const handleOpenDashboard = () => {
@@ -1421,7 +1427,9 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     isDraggingOpenRef.current = false;
     setIsDraggingOpen(false);
     onNavigateToUrl(dashboardUrl);
-    onClose();
+    if (!docked) {
+      onClose();
+    }
   };
 
   const handleSelectWorkstation = (inst: InboxInstanceSummary) => {
@@ -1432,7 +1440,9 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     isDraggingOpenRef.current = false;
     setIsDraggingOpen(false);
     onNavigateToUrl(targetUrl);
-    onClose();
+    if (!docked) {
+      onClose();
+    }
   };
 
   const handleTriggerHostSettings = () => {
@@ -1444,7 +1454,9 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
     } else {
       onNavigateToUrl(dashboardUrl);
     }
-    onClose();
+    if (!docked) {
+      onClose();
+    }
   };
 
   const handleConfirmSignOut = () => {
@@ -1716,25 +1728,31 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   return (
     <View style={styles.overlayRoot} pointerEvents="box-none">
       <View
+        testID={docked ? 'docked-drawer-overlay' : 'modal-drawer-overlay'}
         style={styles.openOverlay}
-        pointerEvents={visible ? 'auto' : 'none'}
+        pointerEvents={visible ? (docked ? 'box-none' : 'auto') : 'none'}
         importantForAccessibility={visible ? 'yes' : 'no-hide-descendants'}
       >
-        <Animated.View
-          style={[styles.backdrop, { opacity: backdropOpacity }]}
-        >
-          <Pressable
-            style={StyleSheet.absoluteFillObject}
-            onPress={handleClose}
-            accessibilityRole="button"
-            accessibilityLabel="Close drawer backdrop"
-          />
-        </Animated.View>
+        {!docked ? (
+          <Animated.View
+            style={[styles.backdrop, { opacity: backdropOpacity }]}
+          >
+            <Pressable
+              style={StyleSheet.absoluteFillObject}
+              onPress={handleClose}
+              accessibilityRole="button"
+              accessibilityLabel="Close drawer backdrop"
+            />
+          </Animated.View>
+        ) : null}
 
         <Animated.View
+          testID="navigation-drawer-panel"
           style={[
             styles.drawerPanel,
-            isDrawerInteractiveOrDragging ? styles.drawerPanelElevated : null,
+            !docked && isDrawerInteractiveOrDragging
+              ? styles.drawerPanelElevated
+              : null,
             {
               width: drawerWidth,
               bottom: keyboardBottomPadding,

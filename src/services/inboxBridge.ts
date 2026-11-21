@@ -8,9 +8,11 @@ import { ActiveThreadProjectContext } from '../types/inbox';
  * - Never touches `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`,
  *   `<script>` injection, `eval`, or `new Function` (satisfies `require-trusted-types-for 'script'`).
  * - Reuses the host page's first-party / enterprise gRPC-Web `ApiServicePromiseClient`
- *   to query `ListInstances` and `ProxyCommand` (`GetAllCascadeTrajectories`,
- *   `ListBackgroundTasks`, `UpdateConversationAnnotations`, `RetrieveUserQuotaSummary`,
- *   `GetUserStatus`, and fallback `GetCommandModelConfigs`) across connected workstations.
+ *   to query `ListInstances`, `ProxyCommand` (`GetAllCascadeTrajectories`,
+ *   `ListProjects`, `ReadProjects`, `GetWorkspaceInfos`, `ListBackgroundTasks`,
+ *   `UpdateConversationAnnotations`, `RetrieveUserQuotaSummary`, `GetUserStatus`,
+ *   and fallback `GetCommandModelConfigs`), and `StreamProxyCommand`
+ *   (`JetboxSubscribeToSummaries`) across connected workstations.
  * - Never transmits data outside the local `window.ReactNativeWebView.postMessage` channel.
  */
 export const INBOX_BRIDGE_SCRIPT = `
@@ -32,6 +34,7 @@ export const INBOX_BRIDGE_SCRIPT = `
     }
 
     var GET_TRAJECTORIES_PATH = '/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories';
+    var JETBOX_SUBSCRIBE_SUMMARIES_PATH = '/exa.language_server_pb.LanguageServerService/JetboxSubscribeToSummaries';
     var LIST_BACKGROUND_TASKS_PATH = '/exa.language_server_pb.LanguageServerService/ListBackgroundTasks';
     var LIST_PROJECTS_PATH = '/exa.language_server_pb.LanguageServerService/ListProjects';
     var READ_PROJECTS_PATH = '/exa.language_server_pb.LanguageServerService/ReadProjects';
@@ -58,6 +61,9 @@ export const INBOX_BRIDGE_SCRIPT = `
     var POLL_INTERVAL_MS = 20000;
     var USAGE_POLL_MIN_INTERVAL_MS = 45000;
     var INSTANCE_RPC_TIMEOUT_MS = 8000;
+    var JETBOX_SUMMARIES_TIMEOUT_MS = 5500;
+    var JETBOX_SUMMARIES_SETTLE_MS = 220;
+    var READ_PROJECTS_BATCH_SIZE = 64;
     var BACKGROUND_TASKS_RPC_TIMEOUT_MS = 3500;
     var PROJECTS_RPC_TIMEOUT_MS = 5000;
     var START_CASCADE_TIMEOUT_MS = 5000;
@@ -72,6 +78,8 @@ export const INBOX_BRIDGE_SCRIPT = `
     var cachedAuthFirstParty = null;
     var cachedApiKey = null;
     var lastTrajectoryCache = Object.create(null);
+    var lastJetboxSummariesCache = Object.create(null);
+    var unsupportedJetboxSummariesCache = Object.create(null);
     var lastBackgroundTasksCache = Object.create(null);
     var unsupportedBackgroundTasksCache = Object.create(null);
     var lastProjectsCache = Object.create(null);
@@ -573,12 +581,12 @@ export const INBOX_BRIDGE_SCRIPT = `
       });
     }
 
-    function decodeResponseBytes(responseObj) {
-      if (!responseObj) return '';
+    function extractRawPayloadBytes(responseObj) {
+      if (!responseObj) return new Uint8Array(0);
       if (typeof responseObj.getPayload_asU8 === 'function') {
         var bytes = responseObj.getPayload_asU8();
-        if (bytes && bytes.length > 0 && typeof TextDecoder === 'function') {
-          return new TextDecoder('utf-8').decode(bytes);
+        if (bytes && bytes.length > 0) {
+          return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
         }
       }
       if (typeof responseObj.getPayload_asB64 === 'function') {
@@ -589,13 +597,17 @@ export const INBOX_BRIDGE_SCRIPT = `
           for (var i = 0; i < bin.length; i++) {
             out[i] = bin.charCodeAt(i);
           }
-          if (typeof TextDecoder === 'function') {
-            return new TextDecoder('utf-8').decode(out);
-          }
+          return out;
         }
       }
       if (typeof responseObj.getPayload === 'function') {
         var raw = responseObj.getPayload();
+        if (raw instanceof Uint8Array) {
+          return raw;
+        }
+        if (raw && typeof raw.asUint8Array === 'function') {
+          return raw.asUint8Array();
+        }
         if (typeof raw === 'string' && raw) {
           try {
             var decodedBin = atob(raw);
@@ -603,13 +615,669 @@ export const INBOX_BRIDGE_SCRIPT = `
             for (var j = 0; j < decodedBin.length; j++) {
               u8[j] = decodedBin.charCodeAt(j);
             }
-            return new TextDecoder('utf-8').decode(u8);
+            return u8;
           } catch (_) {
-            return raw;
+            if (typeof TextEncoder === 'function') {
+              return new TextEncoder().encode(raw);
+            }
           }
         }
       }
+      return new Uint8Array(0);
+    }
+
+    function decodeResponseBytes(responseObj) {
+      if (!responseObj) return '';
+      var bytes = extractRawPayloadBytes(responseObj);
+      if (bytes && bytes.length > 0 && typeof TextDecoder === 'function') {
+        return new TextDecoder('utf-8').decode(bytes);
+      }
+      if (typeof responseObj.getPayload === 'function') {
+        var raw = responseObj.getPayload();
+        if (typeof raw === 'string' && raw) {
+          return raw;
+        }
+      }
       return '';
+    }
+
+    function encodeConnectEnvelope(jsonBody) {
+      var payloadBytes =
+        typeof TextEncoder === 'function'
+          ? new TextEncoder().encode(jsonBody || '{}')
+          : new Uint8Array(0);
+      var out = new Uint8Array(5 + payloadBytes.length);
+      out[0] = 0;
+      var len = payloadBytes.length;
+      out[1] = (len >>> 24) & 255;
+      out[2] = (len >>> 16) & 255;
+      out[3] = (len >>> 8) & 255;
+      out[4] = len & 255;
+      out.set(payloadBytes, 5);
+      return out;
+    }
+
+    function concatBytes(a, b) {
+      if (!a || a.length === 0) return b || new Uint8Array(0);
+      if (!b || b.length === 0) return a;
+      var merged = new Uint8Array(a.length + b.length);
+      merged.set(a, 0);
+      merged.set(b, a.length);
+      return merged;
+    }
+
+    function decodeConnectJsonFrames(buffer) {
+      var frames = [];
+      var offset = 0;
+      var decoder = typeof TextDecoder === 'function' ? new TextDecoder('utf-8') : null;
+      if (!buffer || buffer.length === 0 || !decoder) {
+        return { frames: frames, remaining: buffer || new Uint8Array(0) };
+      }
+      // Fallback for plain unframed JSON responses (e.g. legacy proxies or test mocks).
+      if (buffer[0] === 123) {
+        try {
+          var directText = decoder.decode(buffer);
+          var directObj = JSON.parse(directText);
+          if (directObj && typeof directObj === 'object') {
+            frames.push({ flags: 0, data: directObj });
+            return { frames: frames, remaining: new Uint8Array(0) };
+          }
+        } catch (_) {
+          return { frames: frames, remaining: buffer };
+        }
+      }
+      while (offset + 5 <= buffer.length) {
+        var flags = buffer[offset];
+        var len =
+          ((buffer[offset + 1] << 24) >>> 0) +
+          (buffer[offset + 2] << 16) +
+          (buffer[offset + 3] << 8) +
+          buffer[offset + 4];
+        if (len > 32 * 1024 * 1024) {
+          // Corrupted/unexpected framing — abort parsing remaining bytes.
+          return { frames: frames, remaining: new Uint8Array(0) };
+        }
+        if (offset + 5 + len > buffer.length) {
+          break;
+        }
+        var slice = buffer.subarray(offset + 5, offset + 5 + len);
+        offset += 5 + len;
+        // Skip compressed frames (bit 0 set) since we request uncompressed JSON.
+        if ((flags & 1) !== 0) {
+          continue;
+        }
+        try {
+          var text = slice.length > 0 ? decoder.decode(slice) : '{}';
+          var parsed = text ? JSON.parse(text) : Object.create(null);
+          frames.push({ flags: flags, data: parsed });
+        } catch (_) {}
+      }
+      return {
+        frames: frames,
+        remaining: offset < buffer.length ? buffer.subarray(offset) : new Uint8Array(0)
+      };
+    }
+
+    function getSummaryTimestampScore(raw) {
+      if (!raw || typeof raw !== 'object') return 0;
+      var ts = raw.lastModifiedTime || raw.last_modified_time || raw.createdTime || raw.created_time;
+      if (!ts) return 0;
+      if (typeof ts === 'number') return ts > 1e11 ? ts : ts * 1000;
+      if (typeof ts === 'string') {
+        var parsed = Date.parse(ts);
+        return isNaN(parsed) ? 0 : parsed;
+      }
+      if (typeof ts === 'object') {
+        var sec = Number(ts.seconds || ts.secs || 0);
+        if (sec > 0) return sec * 1000;
+      }
+      return 0;
+    }
+
+    function isSummaryLiveActive(raw) {
+      if (!raw || typeof raw !== 'object' || raw.killed) return false;
+      var waiting = raw.waitingSteps || raw.waiting_steps;
+      if (Array.isArray(waiting) && waiting.length > 0) return true;
+      if (raw.notFullyIdle || raw.not_fully_idle || raw.hasRunningSubagents || raw.has_running_subagents) {
+        return true;
+      }
+      var st = raw.status;
+      if (st === 2 || st === 3 || st === 4) return true;
+      if (typeof st === 'string') {
+        var u = st.toUpperCase();
+        if (u.indexOf('RUNNING') !== -1 || u.indexOf('BUSY') !== -1 || u.indexOf('CANCELING') !== -1) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    function mergeStringArraysUnique(primary, secondary) {
+      var out = [];
+      var seen = Object.create(null);
+      var lists = [primary, secondary];
+      for (var i = 0; i < lists.length; i++) {
+        var arr = lists[i];
+        if (!Array.isArray(arr)) continue;
+        for (var j = 0; j < arr.length; j++) {
+          var val = arr[j];
+          if (typeof val === 'string' && val && !seen[val]) {
+            seen[val] = true;
+            out.push(val);
+          }
+        }
+      }
+      return out;
+    }
+
+    function mergeWorkspaceLists(primary, secondary) {
+      var out = [];
+      var seen = Object.create(null);
+      var lists = [primary, secondary];
+      for (var i = 0; i < lists.length; i++) {
+        var arr = lists[i];
+        if (!Array.isArray(arr)) continue;
+        for (var j = 0; j < arr.length; j++) {
+          var ws = arr[j];
+          if (!ws || typeof ws !== 'object') continue;
+          var key =
+            String(ws.workspaceFolderAbsoluteUri || ws.workspace_folder_absolute_uri || '') +
+            '|' +
+            String(ws.gitRootAbsoluteUri || ws.git_root_absolute_uri || '');
+          if (key !== '|' && seen[key]) continue;
+          if (key !== '|') seen[key] = true;
+          out.push(ws);
+        }
+      }
+      return out;
+    }
+
+    function mergeSingleTrajectorySummary(jetboxItem, cascadeItem) {
+      if (!jetboxItem || typeof jetboxItem !== 'object') return cascadeItem;
+      if (!cascadeItem || typeof cascadeItem !== 'object') return jetboxItem;
+
+      var jetboxTs = getSummaryTimestampScore(jetboxItem);
+      var cascadeTs = getSummaryTimestampScore(cascadeItem);
+      var jetboxSteps = Number(jetboxItem.stepCount || jetboxItem.step_count || 0) || 0;
+      var cascadeSteps = Number(cascadeItem.stepCount || cascadeItem.step_count || 0) || 0;
+      var jetboxLive = isSummaryLiveActive(jetboxItem);
+      var cascadeLive = isSummaryLiveActive(cascadeItem);
+
+      var preferCascade =
+        (cascadeLive && !jetboxLive) ||
+        (cascadeLive === jetboxLive &&
+          (cascadeTs > jetboxTs || (cascadeTs === jetboxTs && cascadeSteps >= jetboxSteps)));
+
+      var primary = preferCascade ? cascadeItem : jetboxItem;
+      var secondary = preferCascade ? jetboxItem : cascadeItem;
+
+      var merged = Object.create(null);
+      var secKeys = Object.keys(secondary);
+      for (var s = 0; s < secKeys.length; s++) {
+        merged[secKeys[s]] = secondary[secKeys[s]];
+      }
+      var priKeys = Object.keys(primary);
+      for (var p = 0; p < priKeys.length; p++) {
+        var pk = priKeys[p];
+        if (primary[pk] !== undefined && primary[pk] !== null && primary[pk] !== '') {
+          merged[pk] = primary[pk];
+        }
+      }
+
+      // Preserve projectId, workspaceUris, workspaces, and parent links across BOTH sources.
+      var priMeta = primary.trajectoryMetadata || primary.trajectory_metadata || null;
+      var secMeta = secondary.trajectoryMetadata || secondary.trajectory_metadata || null;
+      if (priMeta || secMeta) {
+        var mergedMeta = Object.create(null);
+        if (secMeta && typeof secMeta === 'object') {
+          var smKeys = Object.keys(secMeta);
+          for (var a = 0; a < smKeys.length; a++) {
+            mergedMeta[smKeys[a]] = secMeta[smKeys[a]];
+          }
+        }
+        if (priMeta && typeof priMeta === 'object') {
+          var pmKeys = Object.keys(priMeta);
+          for (var b = 0; b < pmKeys.length; b++) {
+            var pmk = pmKeys[b];
+            if (priMeta[pmk] !== undefined && priMeta[pmk] !== null && priMeta[pmk] !== '') {
+              mergedMeta[pmk] = priMeta[pmk];
+            }
+          }
+        }
+        var mergedMetaUris = mergeStringArraysUnique(
+          priMeta && (priMeta.workspaceUris || priMeta.workspace_uris),
+          secMeta && (secMeta.workspaceUris || secMeta.workspace_uris)
+        );
+        if (mergedMetaUris.length > 0) {
+          mergedMeta.workspaceUris = mergedMetaUris;
+        }
+        var mergedMetaWorkspaces = mergeWorkspaceLists(
+          priMeta && priMeta.workspaces,
+          secMeta && secMeta.workspaces
+        );
+        if (mergedMetaWorkspaces.length > 0) {
+          mergedMeta.workspaces = mergedMetaWorkspaces;
+        }
+        merged.trajectoryMetadata = mergedMeta;
+      }
+
+      var mergedWorkspaces = mergeWorkspaceLists(primary.workspaces, secondary.workspaces);
+      if (mergedWorkspaces.length > 0) {
+        merged.workspaces = mergedWorkspaces;
+      }
+
+      var priAnn = primary.annotations && typeof primary.annotations === 'object' ? primary.annotations : null;
+      var secAnn = secondary.annotations && typeof secondary.annotations === 'object' ? secondary.annotations : null;
+      if (priAnn || secAnn) {
+        var mergedAnn = Object.create(null);
+        if (secAnn) {
+          var saKeys = Object.keys(secAnn);
+          for (var c = 0; c < saKeys.length; c++) {
+            mergedAnn[saKeys[c]] = secAnn[saKeys[c]];
+          }
+        }
+        if (priAnn) {
+          var paKeys = Object.keys(priAnn);
+          for (var d = 0; d < paKeys.length; d++) {
+            var pak = paKeys[d];
+            if (priAnn[pak] !== undefined && priAnn[pak] !== null && priAnn[pak] !== '') {
+              mergedAnn[pak] = priAnn[pak];
+            }
+          }
+        }
+        merged.annotations = mergedAnn;
+      }
+
+      return merged;
+    }
+
+    function mergeTrajectorySummaryMaps(jetboxMap, cascadeMap) {
+      var out = Object.create(null);
+      if (jetboxMap && typeof jetboxMap === 'object') {
+        var jKeys = Object.keys(jetboxMap);
+        for (var i = 0; i < jKeys.length; i++) {
+          var jk = jKeys[i];
+          if (SAFE_ID_RE.test(jk) && jetboxMap[jk] && typeof jetboxMap[jk] === 'object') {
+            out[jk] = jetboxMap[jk];
+          }
+        }
+      }
+      if (cascadeMap && typeof cascadeMap === 'object') {
+        var cKeys = Object.keys(cascadeMap);
+        for (var j = 0; j < cKeys.length; j++) {
+          var ck = cKeys[j];
+          if (!SAFE_ID_RE.test(ck) || !cascadeMap[ck] || typeof cascadeMap[ck] !== 'object') {
+            continue;
+          }
+          if (out[ck]) {
+            out[ck] = mergeSingleTrajectorySummary(out[ck], cascadeMap[ck]);
+          } else {
+            out[ck] = cascadeMap[ck];
+          }
+        }
+      }
+      return out;
+    }
+
+    function compactWaitingStepEntry(entry) {
+      if (!entry || typeof entry !== 'object') return entry;
+      var step = entry.step && typeof entry.step === 'object' ? entry.step : entry;
+      var compactStep = {};
+      var rc = step.runCommand || step.run_command;
+      if (rc && typeof rc === 'object') {
+        compactStep.runCommand = {
+          commandLine: rc.commandLine || rc.command_line || rc.proposedCommandLine || rc.command
+        };
+      }
+      var aq = step.askQuestion || step.ask_question;
+      if (aq && typeof aq === 'object') {
+        compactStep.askQuestion = {
+          question: aq.question,
+          questions: Array.isArray(aq.questions) && aq.questions[0]
+            ? [{ question: aq.questions[0].question }]
+            : undefined
+        };
+      }
+      var obu = step.openBrowserUrl || step.open_browser_url;
+      if (obu && typeof obu === 'object') {
+        compactStep.openBrowserUrl = { url: obu.url };
+      }
+      var ebj = step.executeBrowserJavascript || step.execute_browser_javascript;
+      if (ebj && typeof ebj === 'object') {
+        compactStep.executeBrowserJavascript = {
+          javascriptDescription: ebj.javascriptDescription || ebj.javascript_description
+        };
+      }
+      if (step.filePermission || step.file_permission) {
+        compactStep.filePermission = {};
+      }
+      var meta = step.metadata;
+      if (meta && typeof meta === 'object') {
+        var toolSummary = meta.toolSummary || meta.tool_summary;
+        if (typeof toolSummary === 'string' && toolSummary) {
+          compactStep.metadata = { toolSummary: toolSummary.slice(0, 140) };
+        }
+      }
+      return entry.step && typeof entry.step === 'object'
+        ? { step: compactStep }
+        : compactStep;
+    }
+
+    function compactTrajectorySummary(raw) {
+      if (!raw || typeof raw !== 'object') return raw;
+      var out = {};
+      var directKeys = [
+        'summary',
+        'stepCount',
+        'step_count',
+        'lastModifiedTime',
+        'last_modified_time',
+        'createdTime',
+        'created_time',
+        'lastUserInputTime',
+        'last_user_input_time',
+        'lastUserInputStepIndex',
+        'last_user_input_step_index',
+        'trajectoryId',
+        'trajectory_id',
+        'status',
+        'source',
+        'projectId',
+        'project_id',
+        'workspaceFolderAbsoluteUri',
+        'workspace_folder_absolute_uri',
+        'gitRootAbsoluteUri',
+        'git_root_absolute_uri',
+        'workspaceUri',
+        'workspace_uri',
+        'hasActiveChildren',
+        'has_active_children',
+        'notFullyIdle',
+        'not_fully_idle',
+        'trajectoryType',
+        'trajectory_type',
+        'killed',
+        'interrupted',
+        'cloud',
+        'latestExecutorTerminationReason',
+        'latest_executor_termination_reason',
+        'backgroundTaskCount',
+        'background_task_count',
+        'hasRunningSubagents',
+        'has_running_subagents',
+        'battleModeInfo',
+        'battle_mode_info'
+      ];
+      for (var i = 0; i < directKeys.length; i++) {
+        var k = directKeys[i];
+        if (raw[k] !== undefined) {
+          out[k] = raw[k];
+        }
+      }
+      var waiting = raw.waitingSteps || raw.waiting_steps;
+      if (Array.isArray(waiting) && waiting.length > 0) {
+        var compactWaiting = [];
+        for (var w = 0; w < waiting.length && w < 8; w++) {
+          compactWaiting.push(compactWaitingStepEntry(waiting[w]));
+        }
+        out.waitingSteps = compactWaiting;
+      }
+      if (Array.isArray(raw.workspaces) && raw.workspaces.length > 0) {
+        out.workspaces = raw.workspaces;
+      }
+      if (raw.annotations && typeof raw.annotations === 'object') {
+        out.annotations = raw.annotations;
+      }
+      var meta = raw.trajectoryMetadata || raw.trajectory_metadata;
+      if (meta && typeof meta === 'object') {
+        var compactMeta = {};
+        var metaKeys = [
+          'projectId',
+          'project_id',
+          'environmentId',
+          'environment_id',
+          'workspaces',
+          'workspaceUris',
+          'workspace_uris',
+          'parentConversationId',
+          'parent_conversation_id',
+          'rootConversationId',
+          'root_conversation_id',
+          'isBattleModeFork',
+          'is_battle_mode_fork',
+          'subagentSpec',
+          'subagent_spec',
+          'sourceMetadata',
+          'source_metadata',
+          'createdAt',
+          'created_at'
+        ];
+        for (var m = 0; m < metaKeys.length; m++) {
+          var mk = metaKeys[m];
+          if (meta[mk] !== undefined) {
+            compactMeta[mk] = meta[mk];
+          }
+        }
+        out.trajectoryMetadata = compactMeta;
+      }
+      return out;
+    }
+
+    function compactTrajectorySummaries(rawMap) {
+      if (!rawMap || typeof rawMap !== 'object') return rawMap;
+      var out = Object.create(null);
+      var keys = Object.keys(rawMap);
+      for (var i = 0; i < keys.length; i++) {
+        var key = keys[i];
+        if (SAFE_ID_RE.test(key) && rawMap[key] && typeof rawMap[key] === 'object') {
+          out[key] = compactTrajectorySummary(rawMap[key]);
+        }
+      }
+      return out;
+    }
+
+    function compactProjectsList(projects) {
+      if (!Array.isArray(projects)) return projects;
+      var out = [];
+      for (var i = 0; i < projects.length; i++) {
+        var p = projects[i];
+        if (!p || typeof p !== 'object') continue;
+        var compact = {};
+        var pKeys = [
+          'id',
+          'projectId',
+          'project_id',
+          'name',
+          'title',
+          'displayName',
+          'display_name',
+          'archived',
+          'isWorkspaceOnly',
+          'is_workspace_only',
+          'updatedAt',
+          'updated_at',
+          'updateTimeMicros',
+          'backendType',
+          'backend_type',
+          'projectResources',
+          'project_resources',
+          'resources',
+          'environments',
+          'projectConversations',
+          'project_conversations',
+          'conversations',
+          'workspaceUri',
+          'workspace_uri',
+          'folderUri',
+          'folder_uri',
+          'workspaces'
+        ];
+        for (var k = 0; k < pKeys.length; k++) {
+          var pk = pKeys[k];
+          if (p[pk] !== undefined) {
+            compact[pk] = p[pk];
+          }
+        }
+        out.push(compact);
+      }
+      return out;
+    }
+
+    function fetchJetboxSummariesStream(ctx, uuid, backend, version) {
+      if (!ctx || !ctx.client || typeof ctx.client.streamProxyCommand !== 'function') {
+        return Promise.resolve({ ok: false, summaries: null });
+      }
+      var backendKey = backend ? String(backend) : 'local';
+      var cacheKey = uuid + ':' + backendKey;
+      var versionTag = version || '*';
+      if (unsupportedJetboxSummariesCache[cacheKey] === versionTag) {
+        return Promise.resolve({ ok: false, summaries: null });
+      }
+      return new Promise(function(resolve) {
+        var settled = false;
+        var stream = null;
+        var rawBuffer = new Uint8Array(0);
+        var collected = Object.create(null);
+        var receivedValidFrame = false;
+        var settleTimer = null;
+        var hardTimer = null;
+
+        function finish(ok) {
+          if (settled) return;
+          settled = true;
+          if (settleTimer) {
+            clearTimeout(settleTimer);
+            settleTimer = null;
+          }
+          if (hardTimer) {
+            clearTimeout(hardTimer);
+            hardTimer = null;
+          }
+          if (stream && typeof stream.cancel === 'function') {
+            try {
+              stream.cancel();
+            } catch (_) {}
+          }
+          resolve({
+            ok: ok,
+            summaries: ok ? collected : null
+          });
+        }
+
+        function armSettleTimer() {
+          if (settleTimer) clearTimeout(settleTimer);
+          settleTimer = setTimeout(function() {
+            settleTimer = null;
+            finish(receivedValidFrame);
+          }, JETBOX_SUMMARIES_SETTLE_MS);
+        }
+
+        hardTimer = setTimeout(function() {
+          hardTimer = null;
+          finish(receivedValidFrame);
+        }, JETBOX_SUMMARIES_TIMEOUT_MS);
+
+        try {
+          var req = new ctx.proto.ProxyCommandRequest();
+          req.setTargetInstanceUuid(uuid);
+          req.setRpcPath(JETBOX_SUBSCRIBE_SUMMARIES_PATH);
+          var bodyJson = backend ? JSON.stringify({ backend: backend }) : '{}';
+          req.setPayload(encodeConnectEnvelope(bodyJson));
+          if (typeof req.putHeaders === 'function') {
+            req.putHeaders('content-type', 'application/connect+json');
+            req.putHeaders('connect-protocol-version', '1');
+            req.putHeaders('x-is-streaming', 'true');
+          } else if (typeof req.getHeadersMap === 'function') {
+            var map = req.getHeadersMap();
+            if (map && typeof map.set === 'function') {
+              map.set('content-type', 'application/connect+json');
+              map.set('connect-protocol-version', '1');
+              map.set('x-is-streaming', 'true');
+            }
+          }
+          stream = ctx.client.streamProxyCommand(req, ctx.metadata);
+          if (!stream || typeof stream.on !== 'function') {
+            finish(false);
+            return;
+          }
+          stream.on('data', function(res) {
+            if (settled) return;
+            var chunk = extractRawPayloadBytes(res);
+            if (!chunk || chunk.length === 0) return;
+            if (receivedValidFrame) {
+              armSettleTimer();
+            }
+            rawBuffer = concatBytes(rawBuffer, chunk);
+            var decoded = decodeConnectJsonFrames(rawBuffer);
+            rawBuffer = decoded.remaining;
+            for (var i = 0; i < decoded.frames.length; i++) {
+              var frame = decoded.frames[i];
+              var payload = frame.data;
+              if (frame.flags === 2) {
+                var endErr = payload && payload.error ? payload.error : payload;
+                if (
+                  endErr &&
+                  typeof endErr === 'object' &&
+                  typeof endErr.code === 'string' &&
+                  endErr.code.toLowerCase() === 'unimplemented'
+                ) {
+                  unsupportedJetboxSummariesCache[cacheKey] = versionTag;
+                }
+                finish(receivedValidFrame);
+                return;
+              }
+              if (payload && typeof payload === 'object') {
+                if (hasConnectRpcError(payload) && !payload.updates && !payload.deletes) {
+                  if (
+                    typeof payload.code === 'string' &&
+                    payload.code.toLowerCase() === 'unimplemented'
+                  ) {
+                    unsupportedJetboxSummariesCache[cacheKey] = versionTag;
+                  }
+                  finish(receivedValidFrame);
+                  return;
+                }
+                receivedValidFrame = true;
+                var updates = payload.updates;
+                if (updates && typeof updates === 'object' && !Array.isArray(updates)) {
+                  var uKeys = Object.keys(updates);
+                  for (var u = 0; u < uKeys.length; u++) {
+                    var uk = uKeys[u];
+                    if (SAFE_ID_RE.test(uk) && updates[uk] && typeof updates[uk] === 'object') {
+                      collected[uk] = updates[uk];
+                    }
+                  }
+                }
+                if (Array.isArray(payload.deletes)) {
+                  for (var d = 0; d < payload.deletes.length; d++) {
+                    var delId = payload.deletes[d];
+                    if (typeof delId === 'string') {
+                      delete collected[delId];
+                    }
+                  }
+                }
+                armSettleTimer();
+              }
+            }
+          });
+          stream.on('end', function() {
+            finish(receivedValidFrame);
+          });
+          stream.on('error', function(err) {
+            if (
+              err &&
+              (err.code === 12 ||
+                (typeof err.message === 'string' &&
+                  err.message.toLowerCase().indexOf('unimplemented') !== -1))
+            ) {
+              unsupportedJetboxSummariesCache[cacheKey] = versionTag;
+            }
+            finish(receivedValidFrame);
+          });
+        } catch (_) {
+          finish(receivedValidFrame);
+        }
+      });
     }
 
     function callProxyJson(ctx, targetUuid, rpcPath, jsonBody, timeoutMs) {
@@ -917,26 +1585,53 @@ export const INBOX_BRIDGE_SCRIPT = `
             return resolvedEmpty;
           }
           if (inlineProjects && inlineProjects.length >= cleanIds.length) {
-            lastProjectsCache[uuid] = inlineProjects;
-            return inlineProjects;
+            var compactedInline = compactProjectsList(inlineProjects);
+            lastProjectsCache[uuid] = compactedInline;
+            return compactedInline;
           }
-          return callProxyJson(
-            ctx,
-            uuid,
-            READ_PROJECTS_PATH,
-            JSON.stringify({ ids: cleanIds }),
-            PROJECTS_RPC_TIMEOUT_MS
-          )
-            .then(function(readRes) {
-              if (readRes && Array.isArray(readRes.projects)) {
-                lastProjectsCache[uuid] = readRes.projects;
-                return readRes.projects;
+          var batchPromises = [];
+          for (var offset = 0; offset < cleanIds.length; offset += READ_PROJECTS_BATCH_SIZE) {
+            var batchIds = cleanIds.slice(offset, offset + READ_PROJECTS_BATCH_SIZE);
+            batchPromises.push(
+              callProxyJson(
+                ctx,
+                uuid,
+                READ_PROJECTS_PATH,
+                JSON.stringify({ ids: batchIds }),
+                PROJECTS_RPC_TIMEOUT_MS
+              )
+                .then(function(readRes) {
+                  return readRes && Array.isArray(readRes.projects)
+                    ? readRes.projects
+                    : null;
+                })
+                .catch(function() {
+                  return null;
+                })
+            );
+          }
+          return Promise.all(batchPromises).then(function(batches) {
+            var combined = [];
+            var anyBatchSucceeded = false;
+            for (var b = 0; b < batches.length; b++) {
+              if (Array.isArray(batches[b])) {
+                anyBatchSucceeded = true;
+                for (var p = 0; p < batches[b].length; p++) {
+                  combined.push(batches[b][p]);
+                }
               }
-              return inlineProjects || lastProjectsCache[uuid] || null;
-            })
-            .catch(function() {
-              return inlineProjects || lastProjectsCache[uuid] || null;
-            });
+            }
+            if (anyBatchSucceeded) {
+              var compactedProjects = compactProjectsList(combined);
+              lastProjectsCache[uuid] = compactedProjects;
+              return compactedProjects;
+            }
+            return (
+              (inlineProjects ? compactProjectsList(inlineProjects) : null) ||
+              lastProjectsCache[uuid] ||
+              null
+            );
+          });
         })
         .catch(function() {
           return lastProjectsCache[uuid] || null;
@@ -1130,6 +1825,10 @@ export const INBOX_BRIDGE_SCRIPT = `
 
                 if (!shouldQuery) {
                   delete lastTrajectoryCache[uuid];
+                  delete lastJetboxSummariesCache[uuid];
+                  delete unsupportedJetboxSummariesCache[uuid + ':local'];
+                  delete unsupportedJetboxSummariesCache[uuid + ':2'];
+                  delete unsupportedJetboxSummariesCache[uuid + ':3'];
                   delete lastBackgroundTasksCache[uuid];
                   delete unsupportedBackgroundTasksCache[uuid];
                   delete lastProjectsCache[uuid];
@@ -1162,7 +1861,11 @@ export const INBOX_BRIDGE_SCRIPT = `
                   usageCandidates.push(candidateEntry);
                 }
 
-                var trajJob = callProxyJson(ctx, uuid, GET_TRAJECTORIES_PATH, '{}')
+                var isHiddenBackgroundPoll =
+                  typeof document !== 'undefined' &&
+                  document.visibilityState === 'hidden';
+
+                var cascadeTrajJob = callProxyJson(ctx, uuid, GET_TRAJECTORIES_PATH, '{}')
                   .then(function(parsed) {
                     var summaries =
                       (parsed &&
@@ -1170,7 +1873,6 @@ export const INBOX_BRIDGE_SCRIPT = `
                           parsed.trajectory_summaries)) ||
                       parsed ||
                       Object.create(null);
-                    lastTrajectoryCache[uuid] = summaries;
                     return {
                       ok: true,
                       trajectories: summaries,
@@ -1180,16 +1882,33 @@ export const INBOX_BRIDGE_SCRIPT = `
                   .catch(function(err) {
                     return {
                       ok: false,
-                      trajectories: lastTrajectoryCache[uuid] || null,
+                      trajectories: null,
                       error: err && err.message ? String(err.message) : 'Unreachable'
                     };
                   });
+
+                // Antigravity's native sidebar populates all persisted conversations (and
+                // project associations) via JetboxSubscribeToSummaries; GetAllCascadeTrajectories
+                // alone can miss historical/disk-stored chats across projects.
+                var jetboxTrajJob = isHiddenBackgroundPoll
+                  ? Promise.resolve({
+                      ok: Boolean(lastJetboxSummariesCache[uuid]),
+                      summaries: lastJetboxSummariesCache[uuid] || null
+                    })
+                  : fetchJetboxSummariesStream(ctx, uuid, 0, version).then(function(res) {
+                      if (res && res.ok && res.summaries) {
+                        lastJetboxSummariesCache[uuid] = res.summaries;
+                        return res;
+                      }
+                      return {
+                        ok: false,
+                        summaries: lastJetboxSummariesCache[uuid] || null
+                      };
+                    });
+
                 // Always fetch live running background tasks (even while backgrounded) so
                 // threads waiting on background commands/timers/workflows never notify early.
                 var bgTasksJob = fetchBackgroundTasksForInstance(ctx, uuid, version);
-                var isHiddenBackgroundPoll =
-                  typeof document !== 'undefined' &&
-                  document.visibilityState === 'hidden';
                 var projectsJob = isHiddenBackgroundPoll
                   ? Promise.resolve(lastProjectsCache[uuid] || null)
                   : fetchProjectsForInstance(ctx, uuid);
@@ -1201,33 +1920,96 @@ export const INBOX_BRIDGE_SCRIPT = `
                   : fetchWorkspaceInfosForInstance(ctx, uuid);
 
                 instanceJobs.push(
-                  Promise.all([trajJob, bgTasksJob, projectsJob, wsInfoJob]).then(function(quad) {
-                    var trajResult = quad[0];
-                    var bgTasksResult = quad[1];
-                    var projectsResult = quad[2];
-                    var wsResult = quad[3] || { workspaceInfos: null, homeDirUri: null };
-                    var resolvedBgTasks =
-                      bgTasksResult && bgTasksResult.ok
-                        ? bgTasksResult.tasks
-                        : !trajResult.ok
-                          ? (lastBackgroundTasksCache[uuid] || null)
-                          : null;
-                    var payload = {
-                      uuid: uuid,
-                      name: name || uuid,
-                      status: status,
-                      version: version || undefined,
-                      updatedAtMs: updatedAtMs,
-                      homeDirUri: wsResult.homeDirUri || null,
-                      trajectories: trajResult.trajectories,
-                      backgroundTasks: resolvedBgTasks,
-                      projects: projectsResult,
-                      workspaceInfos: wsResult.workspaceInfos
-                    };
-                    if (trajResult.error) {
-                      payload.error = trajResult.error;
+                  Promise.all([
+                    cascadeTrajJob,
+                    jetboxTrajJob,
+                    bgTasksJob,
+                    projectsJob,
+                    wsInfoJob
+                  ]).then(function(results) {
+                    var cascadeResult = results[0];
+                    var jetboxResult = results[1];
+                    var bgTasksResult = results[2];
+                    var projectsResult = results[3];
+                    var wsResult = results[4] || { workspaceInfos: null, homeDirUri: null };
+
+                    var extraBackends = [];
+                    if (!isHiddenBackgroundPoll && Array.isArray(projectsResult)) {
+                      var hasCloudProj = false;
+                      var hasEntProj = false;
+                      for (var pIdx = 0; pIdx < projectsResult.length; pIdx++) {
+                        var bt = projectsResult[pIdx] && (projectsResult[pIdx].backendType || projectsResult[pIdx].backend_type);
+                        if (bt === 2 || bt === 'BACKEND_TYPE_REMOTE_AICODE') hasCloudProj = true;
+                        if (bt === 3 || bt === 'BACKEND_TYPE_REMOTE_ENTERPRISE') hasEntProj = true;
+                      }
+                      if (hasCloudProj) extraBackends.push(2);
+                      if (hasEntProj) extraBackends.push(3);
                     }
-                    return payload;
+
+                    var extraJetboxJob =
+                      extraBackends.length > 0
+                        ? Promise.all(
+                            extraBackends.map(function(b) {
+                              return fetchJetboxSummariesStream(ctx, uuid, b, version);
+                            })
+                          )
+                        : Promise.resolve([]);
+
+                    return extraJetboxJob.then(function(extraResults) {
+                      var combinedJetbox = jetboxResult && jetboxResult.summaries
+                        ? jetboxResult.summaries
+                        : null;
+                      var anyJetboxOk = Boolean(jetboxResult && jetboxResult.ok);
+                      for (var eIdx = 0; eIdx < extraResults.length; eIdx++) {
+                        if (extraResults[eIdx] && extraResults[eIdx].ok && extraResults[eIdx].summaries) {
+                          anyJetboxOk = true;
+                          combinedJetbox = mergeTrajectorySummaryMaps(
+                            combinedJetbox,
+                            extraResults[eIdx].summaries
+                          );
+                        }
+                      }
+                      if (anyJetboxOk && combinedJetbox) {
+                        lastJetboxSummariesCache[uuid] = combinedJetbox;
+                      }
+
+                      var anyTrajOk = Boolean(cascadeResult.ok || anyJetboxOk);
+                      var finalTrajectories = null;
+                      if (anyTrajOk) {
+                        finalTrajectories = compactTrajectorySummaries(
+                          mergeTrajectorySummaryMaps(
+                            combinedJetbox,
+                            cascadeResult.ok ? cascadeResult.trajectories : null
+                          )
+                        );
+                        lastTrajectoryCache[uuid] = finalTrajectories;
+                      } else {
+                        finalTrajectories = lastTrajectoryCache[uuid] || null;
+                      }
+
+                      var resolvedBgTasks =
+                        bgTasksResult && bgTasksResult.ok
+                          ? bgTasksResult.tasks
+                          : !anyTrajOk
+                            ? (lastBackgroundTasksCache[uuid] || null)
+                            : null;
+                      var payload = {
+                        uuid: uuid,
+                        name: name || uuid,
+                        status: status,
+                        version: version || undefined,
+                        updatedAtMs: updatedAtMs,
+                        homeDirUri: wsResult.homeDirUri || null,
+                        trajectories: finalTrajectories,
+                        backgroundTasks: resolvedBgTasks,
+                        projects: projectsResult,
+                        workspaceInfos: wsResult.workspaceInfos
+                      };
+                      if (!anyTrajOk && cascadeResult.error) {
+                        payload.error = cascadeResult.error;
+                      }
+                      return payload;
+                    });
                   })
                 );
               })(rawList[i]);

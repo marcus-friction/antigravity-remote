@@ -21,9 +21,9 @@ import {
 } from '../types/inbox';
 import { validateNavigationUrl } from './urlValidator';
 
-const MAX_INBOX_BRIDGE_PAYLOAD_LENGTH = 2 * 1024 * 1024;
+const MAX_INBOX_BRIDGE_PAYLOAD_LENGTH = 6 * 1024 * 1024;
 const MAX_INSTANCES_PER_SNAPSHOT = 64;
-const MAX_PROJECTS_PER_INSTANCE = 128;
+const MAX_PROJECTS_PER_INSTANCE = 256;
 const MAX_BACKGROUND_TASKS_PER_INSTANCE = 256;
 const MAX_DIR_ENTRIES = 250;
 const MAX_USAGE_GROUPS = 16;
@@ -50,13 +50,55 @@ function isHiddenCredit(rawIdOrLabelOrType: unknown): boolean {
 
 function normalizeWorkspaceUriKey(uri: string | null | undefined): string | null {
   if (!uri || typeof uri !== 'string') return null;
-  const trimmed = uri.trim().replace(/\/+$/, '');
-  if (!trimmed) return null;
+  let value = uri.trim();
+  if (!value) return null;
   try {
-    return decodeURIComponent(trimmed).toLowerCase();
+    value = decodeURIComponent(value);
   } catch {
-    return trimmed.toLowerCase();
+    // Keep original string if malformed percent-escape is present.
   }
+  value = value.replace(/\\/g, '/');
+
+  // Normalize Antigravity / VS Code local & remote file URIs and bare paths to a single
+  // canonical lowercase POSIX-style path so `file:///home/a`, `file://localhost/home/a`,
+  // `vscode-remote://ssh-remote+box/home/a`, `/home/a`, `file:///C%3A/a`, and `C:\a` all match.
+  const vscodeRemoteMatch = /^vscode-remote:\/\/[^/]+(\/.*)$/i.exec(value);
+  if (vscodeRemoteMatch) {
+    value = vscodeRemoteMatch[1];
+  } else if (/^file:\/\//i.test(value)) {
+    value = value.replace(/^file:\/\/(?:localhost)?/i, '');
+  }
+
+  if (/^[a-zA-Z]:\//.test(value)) {
+    value = `/${value}`;
+  }
+
+  if (value.startsWith('/')) {
+    value = value.replace(/\/{2,}/g, '/');
+    if (value.length > 1) {
+      value = value.replace(/\/+$/, '');
+    }
+    return value.toLowerCase();
+  }
+
+  const trimmed = value.replace(/\/+$/, '');
+  return trimmed ? trimmed.toLowerCase() : null;
+}
+
+function normalizeProjectSlugKey(name: string | null | undefined): string | null {
+  if (!name || typeof name !== 'string') return null;
+  const slug = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+  return slug.length >= 2 ? slug : null;
+}
+
+function getCanonicalPathSegmentCount(normalizedUriKey: string): number {
+  if (!normalizedUriKey.startsWith('/')) {
+    return 0;
+  }
+  return normalizedUriKey.split('/').filter(Boolean).length;
 }
 
 const ATTENTION_PRIORITY: Record<InboxAttentionKind, number> = {
@@ -284,29 +326,37 @@ function extractLastSegmentFromUri(uri: unknown): string | null {
 export function extractWorkspaceName(
   rawTrajectory: Record<string, unknown>,
 ): string | null {
+  const inspectWorkspaces = (list: unknown[]): string | null => {
+    for (const ws of list) {
+      if (!isRecord(ws)) continue;
+      const folderName =
+        extractLastSegmentFromUri(
+          ws.workspaceFolderAbsoluteUri ?? ws.workspace_folder_absolute_uri,
+        ) ??
+        extractLastSegmentFromUri(
+          ws.gitRootAbsoluteUri ?? ws.git_root_absolute_uri,
+        ) ??
+        extractLastSegmentFromUri(ws.workspaceUri ?? ws.workspace_uri ?? ws.uri);
+      if (folderName) {
+        return folderName;
+      }
+      if (isRecord(ws.repository)) {
+        const repoName =
+          ws.repository.computedName ?? ws.repository.computed_name;
+        if (typeof repoName === 'string' && repoName.trim()) {
+          return repoName.trim();
+        }
+      }
+    }
+    return null;
+  };
+
   const workspaces = Array.isArray(rawTrajectory.workspaces)
     ? rawTrajectory.workspaces
     : [];
-
-  for (const ws of workspaces) {
-    if (!isRecord(ws)) continue;
-    const folderName =
-      extractLastSegmentFromUri(
-        ws.workspaceFolderAbsoluteUri ?? ws.workspace_folder_absolute_uri,
-      ) ??
-      extractLastSegmentFromUri(
-        ws.gitRootAbsoluteUri ?? ws.git_root_absolute_uri,
-      );
-    if (folderName) {
-      return folderName;
-    }
-    if (isRecord(ws.repository)) {
-      const repoName =
-        ws.repository.computedName ?? ws.repository.computed_name;
-      if (typeof repoName === 'string' && repoName.trim()) {
-        return repoName.trim();
-      }
-    }
+  const topLevelName = inspectWorkspaces(workspaces);
+  if (topLevelName) {
+    return topLevelName;
   }
 
   const metadata = isRecord(rawTrajectory.trajectoryMetadata)
@@ -327,6 +377,13 @@ export function extractWorkspaceName(
         return folderName;
       }
     }
+    const metaWorkspaces = Array.isArray(metadata.workspaces)
+      ? metadata.workspaces
+      : [];
+    const metaWsName = inspectWorkspaces(metaWorkspaces);
+    if (metaWsName) {
+      return metaWsName;
+    }
   }
 
   const directFolderName =
@@ -336,6 +393,9 @@ export function extractWorkspaceName(
     ) ??
     extractLastSegmentFromUri(
       rawTrajectory.gitRootAbsoluteUri ?? rawTrajectory.git_root_absolute_uri,
+    ) ??
+    extractLastSegmentFromUri(
+      rawTrajectory.workspaceUri ?? rawTrajectory.workspace_uri,
     );
   if (directFolderName) {
     return directFolderName;
@@ -345,25 +405,35 @@ export function extractWorkspaceName(
 }
 
 /**
- * Extracts the primary workspace URI (e.g. `file:///home/user/project`) from a trajectory summary.
+ * Extracts all distinct workspace and git-root URIs associated with a trajectory summary
+ * (across `workspaces`, `trajectoryMetadata.workspaceUris`, `trajectoryMetadata.workspaces`,
+ * and top-level URI fields).
  */
-export function extractWorkspaceUri(
+export function extractWorkspaceUris(
   rawTrajectory: Record<string, unknown>,
-): string | null {
-  const workspaces = Array.isArray(rawTrajectory.workspaces)
-    ? rawTrajectory.workspaces
-    : [];
+): string[] {
+  const result: string[] = [];
+  const seen = new Set<string>();
+  const addUri = (candidate: unknown) => {
+    if (typeof candidate !== 'string' || !candidate.trim()) return;
+    const cleaned = candidate.trim().replace(/\/+$/, '').slice(0, 512);
+    const key = normalizeWorkspaceUriKey(cleaned);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    result.push(cleaned);
+  };
 
-  for (const ws of workspaces) {
-    if (!isRecord(ws)) continue;
-    const rawUri =
-      ws.workspaceFolderAbsoluteUri ??
-      ws.workspace_folder_absolute_uri ??
-      ws.gitRootAbsoluteUri ??
-      ws.git_root_absolute_uri;
-    if (typeof rawUri === 'string' && rawUri.trim()) {
-      return rawUri.trim().replace(/\/+$/, '').slice(0, 512);
+  const addWorkspaceEntries = (list: unknown[]) => {
+    for (const ws of list) {
+      if (!isRecord(ws)) continue;
+      addUri(ws.workspaceFolderAbsoluteUri ?? ws.workspace_folder_absolute_uri);
+      addUri(ws.gitRootAbsoluteUri ?? ws.git_root_absolute_uri);
+      addUri(ws.workspaceUri ?? ws.workspace_uri ?? ws.uri);
     }
+  };
+
+  if (Array.isArray(rawTrajectory.workspaces)) {
+    addWorkspaceEntries(rawTrajectory.workspaces);
   }
 
   const metadata = isRecord(rawTrajectory.trajectoryMetadata)
@@ -379,22 +449,32 @@ export function extractWorkspaceUri(
         ? metadata.workspace_uris
         : [];
     for (const uri of uris) {
-      if (typeof uri === 'string' && uri.trim()) {
-        return uri.trim().replace(/\/+$/, '').slice(0, 512);
-      }
+      addUri(uri);
+    }
+    if (Array.isArray(metadata.workspaces)) {
+      addWorkspaceEntries(metadata.workspaces);
     }
   }
 
-  const directUri =
+  addUri(
     rawTrajectory.workspaceFolderAbsoluteUri ??
-    rawTrajectory.workspace_folder_absolute_uri ??
-    rawTrajectory.gitRootAbsoluteUri ??
-    rawTrajectory.git_root_absolute_uri;
-  if (typeof directUri === 'string' && directUri.trim()) {
-    return directUri.trim().replace(/\/+$/, '').slice(0, 512);
-  }
+      rawTrajectory.workspace_folder_absolute_uri,
+  );
+  addUri(
+    rawTrajectory.gitRootAbsoluteUri ?? rawTrajectory.git_root_absolute_uri,
+  );
+  addUri(rawTrajectory.workspaceUri ?? rawTrajectory.workspace_uri);
 
-  return null;
+  return result;
+}
+
+/**
+ * Extracts the primary workspace URI (e.g. `file:///home/user/project`) from a trajectory summary.
+ */
+export function extractWorkspaceUri(
+  rawTrajectory: Record<string, unknown>,
+): string | null {
+  return extractWorkspaceUris(rawTrajectory)[0] ?? null;
 }
 
 /**
@@ -1369,9 +1449,11 @@ function parseTrajectoriesForSource(params: {
     );
 
     const isPinned = Boolean(annotations?.pinned || annotations?.starred);
-    const rawProjectId = metadata
-      ? (metadata.projectId ?? metadata.project_id)
-      : (raw.projectId ?? raw.project_id);
+    const rawProjectId =
+      metadata?.projectId ??
+      metadata?.project_id ??
+      raw.projectId ??
+      raw.project_id;
     const projectId =
       typeof rawProjectId === 'string' &&
       rawProjectId.trim().length > 0 &&
@@ -1379,6 +1461,7 @@ function parseTrajectoriesForSource(params: {
       SAFE_ID_PATTERN.test(rawProjectId.trim())
         ? rawProjectId.trim()
         : null;
+    const workspaceUris = extractWorkspaceUris(raw);
 
     items.push({
       id: compositeId,
@@ -1387,7 +1470,8 @@ function parseTrajectoriesForSource(params: {
       title,
       projectId,
       workspaceName: extractWorkspaceName(raw),
-      workspaceUri: extractWorkspaceUri(raw),
+      workspaceUri: workspaceUris[0] ?? null,
+      ...(workspaceUris.length > 0 ? { workspaceUris } : {}),
       instanceUuid,
       instanceName,
       source,
@@ -2195,6 +2279,25 @@ function extractProjectWorkspaceUris(rawProject: Record<string, unknown>): strin
     uris.push(cleaned);
   };
 
+  const addResourceList = (rawResList: unknown[]) => {
+    for (const res of rawResList) {
+      if (!isRecord(res)) continue;
+      addUri(res.folderUri ?? res.folder_uri);
+      const gitFolder = isRecord(res.gitFolder)
+        ? res.gitFolder
+        : isRecord(res.git_folder)
+          ? res.git_folder
+          : null;
+      if (gitFolder) {
+        addUri(gitFolder.folderUri ?? gitFolder.folder_uri ?? gitFolder.uri);
+      }
+      if (isRecord(res.google3)) {
+        addUri('file:///google/src/files/head/depot');
+      }
+      addUri(res.workspaceUri ?? res.workspace_uri ?? res.uri);
+    }
+  };
+
   const projectResources = isRecord(rawProject.projectResources)
     ? rawProject.projectResources
     : isRecord(rawProject.project_resources)
@@ -2205,19 +2308,41 @@ function extractProjectWorkspaceUris(rawProject: Record<string, unknown>): strin
     : Array.isArray(rawProject.resources)
       ? rawProject.resources
       : [];
+  addResourceList(rawResList);
 
-  for (const res of rawResList) {
-    if (!isRecord(res)) continue;
-    addUri(res.folderUri ?? res.folder_uri);
-    const gitFolder = isRecord(res.gitFolder)
-      ? res.gitFolder
-      : isRecord(res.git_folder)
-        ? res.git_folder
-        : null;
-    if (gitFolder) {
-      addUri(gitFolder.folderUri ?? gitFolder.folder_uri);
+  const environmentsContainer = isRecord(rawProject.environments)
+    ? rawProject.environments
+    : null;
+  const rawEnvList = Array.isArray(environmentsContainer?.environments)
+    ? environmentsContainer.environments
+    : Array.isArray(rawProject.environments)
+      ? rawProject.environments
+      : [];
+  for (const env of rawEnvList) {
+    if (!isRecord(env)) continue;
+    const envResContainer = isRecord(env.resources) ? env.resources : null;
+    if (Array.isArray(envResContainer?.resources)) {
+      addResourceList(envResContainer.resources);
+    } else if (Array.isArray(env.resources)) {
+      addResourceList(env.resources);
     }
-    addUri(res.workspaceUri ?? res.workspace_uri);
+    if (Array.isArray(env.workspaceUris ?? env.workspace_uris)) {
+      const envUris = (env.workspaceUris ?? env.workspace_uris) as unknown[];
+      for (const u of envUris) addUri(u);
+    }
+    addUri(env.folderUri ?? env.folder_uri ?? env.workspaceUri ?? env.workspace_uri);
+  }
+
+  if (Array.isArray(rawProject.workspaces)) {
+    for (const ws of rawProject.workspaces) {
+      if (typeof ws === 'string') {
+        addUri(ws);
+      } else if (isRecord(ws)) {
+        addUri(ws.workspaceFolderAbsoluteUri ?? ws.workspace_folder_absolute_uri);
+        addUri(ws.gitRootAbsoluteUri ?? ws.git_root_absolute_uri);
+        addUri(ws.workspaceUri ?? ws.workspace_uri ?? ws.folderUri ?? ws.folder_uri ?? ws.uri);
+      }
+    }
   }
 
   addUri(rawProject.workspaceUri ?? rawProject.workspace_uri);
@@ -2315,28 +2440,43 @@ function parseServerProjectsForInstance(params: {
   if (Array.isArray(rawWorkspaceInfos)) {
     for (const rawWs of rawWorkspaceInfos.slice(0, MAX_PROJECTS_PER_INSTANCE)) {
       if (!isRecord(rawWs)) continue;
-      const rawUri =
-        rawWs.workspaceUri ??
-        rawWs.workspace_uri ??
-        rawWs.workspaceFolderAbsoluteUri ??
-        rawWs.workspace_folder_absolute_uri ??
+      const candidateUris: string[] = [];
+      const candidateKeys: string[] = [];
+      const addWsCandidate = (rawVal: unknown) => {
+        if (typeof rawVal !== 'string' || !rawVal.trim()) return;
+        const cleaned = rawVal.trim().replace(/\/+$/, '').slice(0, 512);
+        const key = normalizeWorkspaceUriKey(cleaned);
+        if (!key || candidateKeys.includes(key)) return;
+        candidateKeys.push(key);
+        candidateUris.push(cleaned);
+      };
+      addWsCandidate(rawWs.workspaceUri ?? rawWs.workspace_uri);
+      addWsCandidate(
+        rawWs.workspaceFolderAbsoluteUri ?? rawWs.workspace_folder_absolute_uri,
+      );
+      addWsCandidate(
         rawWs.gitRootUri ??
-        rawWs.git_root_uri;
-      if (typeof rawUri !== 'string' || !rawUri.trim()) continue;
-      const cleanedUri = rawUri.trim().replace(/\/+$/, '').slice(0, 512);
-      const uriKey = normalizeWorkspaceUriKey(cleanedUri);
-      if (!uriKey || coveredWorkspaceUriKeys.has(uriKey)) continue;
-      coveredWorkspaceUriKeys.add(uriKey);
+          rawWs.git_root_uri ??
+          rawWs.gitRootAbsoluteUri ??
+          rawWs.git_root_absolute_uri,
+      );
+      if (candidateUris.length === 0) continue;
+      if (candidateKeys.some((key) => coveredWorkspaceUriKeys.has(key))) continue;
+      for (const key of candidateKeys) {
+        coveredWorkspaceUriKeys.add(key);
+      }
 
-      const folderName = extractLastSegmentFromUri(cleanedUri);
+      const primaryUri = candidateUris[0];
+      const primaryKey = candidateKeys[0];
+      const folderName = extractLastSegmentFromUri(primaryUri);
       if (!folderName) continue;
 
       parsed.push({
-        id: `${instanceUuid}:ws:${uriKey}`,
+        id: `${instanceUuid}:ws:${primaryKey}`,
         projectId: null,
         name: truncateText(folderName, 72),
-        workspaceUri: cleanedUri,
-        workspaceUris: [cleanedUri],
+        workspaceUri: primaryUri,
+        workspaceUris: candidateUris,
         instanceUuid,
         instanceName,
         updatedAtMs: 0,
@@ -2773,7 +2913,12 @@ export function buildProjectGroups(
   const groupByProjectId = new Map<string, InboxProjectGroup>();
   const groupByConversationId = new Map<string, InboxProjectGroup>();
   const groupByWorkspaceUri = new Map<string, InboxProjectGroup>();
+  const serverUriEntriesByInstance = new Map<
+    string,
+    Array<{ uriKey: string; group: InboxProjectGroup }>
+  >();
   const groupsByWorkspaceName = new Map<string, InboxProjectGroup[]>();
+  const groupsByWorkspaceSlug = new Map<string, InboxProjectGroup[]>();
   const instancesWithProjectsOrThreads = new Set<string>();
 
   const indexProjectName = (
@@ -2788,6 +2933,53 @@ export function buildProjectGroups(
       list.push(group);
       groupsByWorkspaceName.set(key, list);
     }
+    const slug = normalizeProjectSlugKey(rawName);
+    if (slug) {
+      const slugKey = `${instanceUuid}:${slug}`;
+      const slugList = groupsByWorkspaceSlug.get(slugKey) ?? [];
+      if (!slugList.includes(group)) {
+        slugList.push(group);
+        groupsByWorkspaceSlug.set(slugKey, slugList);
+      }
+    }
+  };
+
+  const findDeepestAncestorProjectGroup = (
+    instanceUuid: string,
+    threadUriKeys: readonly string[],
+  ): InboxProjectGroup | undefined => {
+    const entries = serverUriEntriesByInstance.get(instanceUuid);
+    if (!entries || entries.length === 0 || threadUriKeys.length === 0) {
+      return undefined;
+    }
+    let bestLength = 0;
+    let bestGroups: InboxProjectGroup[] = [];
+    for (const threadKey of threadUriKeys) {
+      if (!threadKey.startsWith('/')) continue;
+      for (const entry of entries) {
+        if (
+          !entry.uriKey.startsWith('/') ||
+          getCanonicalPathSegmentCount(entry.uriKey) < 2
+        ) {
+          continue;
+        }
+        if (
+          threadKey.length > entry.uriKey.length &&
+          threadKey.startsWith(`${entry.uriKey}/`)
+        ) {
+          if (entry.uriKey.length > bestLength) {
+            bestLength = entry.uriKey.length;
+            bestGroups = [entry.group];
+          } else if (
+            entry.uriKey.length === bestLength &&
+            !bestGroups.includes(entry.group)
+          ) {
+            bestGroups.push(entry.group);
+          }
+        }
+      }
+    }
+    return bestGroups.length === 1 ? bestGroups[0] : undefined;
   };
 
   // 1. Seed all non-archived server projects FIRST so projects with zero recent
@@ -2824,12 +3016,18 @@ export function buildProjectGroups(
     for (const cid of proj.conversationIds) {
       groupByConversationId.set(`${proj.instanceUuid}:${cid}`, group);
     }
+    const instUriEntries =
+      serverUriEntriesByInstance.get(proj.instanceUuid) ?? [];
     for (const uri of proj.workspaceUris) {
       const uriKey = normalizeWorkspaceUriKey(uri);
       if (uriKey) {
         groupByWorkspaceUri.set(`${proj.instanceUuid}:${uriKey}`, group);
+        instUriEntries.push({ uriKey, group });
       }
       indexProjectName(proj.instanceUuid, extractLastSegmentFromUri(uri), group);
+    }
+    if (instUriEntries.length > 0) {
+      serverUriEntriesByInstance.set(proj.instanceUuid, instUriEntries);
     }
     indexProjectName(proj.instanceUuid, proj.name, group);
   }
@@ -2838,6 +3036,20 @@ export function buildProjectGroups(
   //    workspace-derived group for standalone / legacy / cloud threads).
   for (const thread of snapshot.threads) {
     instancesWithProjectsOrThreads.add(thread.instanceUuid);
+
+    const threadUriKeys: string[] = [];
+    const candidateThreadUris =
+      thread.workspaceUris && thread.workspaceUris.length > 0
+        ? thread.workspaceUris
+        : thread.workspaceUri
+          ? [thread.workspaceUri]
+          : [];
+    for (const rawUri of candidateThreadUris) {
+      const key = normalizeWorkspaceUriKey(rawUri);
+      if (key && !threadUriKeys.includes(key)) {
+        threadUriKeys.push(key);
+      }
+    }
 
     let group: InboxProjectGroup | undefined;
     if (thread.projectId) {
@@ -2850,18 +3062,55 @@ export function buildProjectGroups(
           `${thread.instanceUuid}:${thread.trajectoryId}`,
         );
     }
-    if (!group && thread.workspaceUri) {
-      const uriKey = normalizeWorkspaceUriKey(thread.workspaceUri);
-      if (uriKey) {
-        group = groupByWorkspaceUri.get(`${thread.instanceUuid}:${uriKey}`);
+    if (!group && threadUriKeys.length > 0) {
+      for (const uriKey of threadUriKeys) {
+        const exactMatch = groupByWorkspaceUri.get(
+          `${thread.instanceUuid}:${uriKey}`,
+        );
+        if (exactMatch) {
+          group = exactMatch;
+          break;
+        }
       }
     }
-    if (!group && thread.workspaceName) {
-      const nameCandidates = groupsByWorkspaceName.get(
-        `${thread.instanceUuid}:${thread.workspaceName.trim().toLowerCase()}`,
+    if (!group && threadUriKeys.length > 0) {
+      group = findDeepestAncestorProjectGroup(
+        thread.instanceUuid,
+        threadUriKeys,
       );
-      if (nameCandidates && nameCandidates.length === 1) {
-        group = nameCandidates[0];
+    }
+    if (!group) {
+      const candidateNames: string[] = [];
+      if (thread.workspaceName && thread.workspaceName.trim()) {
+        candidateNames.push(thread.workspaceName.trim());
+      }
+      for (const rawUri of candidateThreadUris) {
+        const seg = extractLastSegmentFromUri(rawUri);
+        if (seg && !candidateNames.includes(seg)) {
+          candidateNames.push(seg);
+        }
+      }
+      for (const candName of candidateNames) {
+        const nameCandidates = groupsByWorkspaceName.get(
+          `${thread.instanceUuid}:${candName.toLowerCase()}`,
+        );
+        if (nameCandidates && nameCandidates.length === 1) {
+          group = nameCandidates[0];
+          break;
+        }
+      }
+      if (!group) {
+        for (const candName of candidateNames) {
+          const slug = normalizeProjectSlugKey(candName);
+          if (!slug) continue;
+          const slugCandidates = groupsByWorkspaceSlug.get(
+            `${thread.instanceUuid}:${slug}`,
+          );
+          if (slugCandidates && slugCandidates.length === 1) {
+            group = slugCandidates[0];
+            break;
+          }
+        }
       }
     }
 
@@ -3111,9 +3360,21 @@ export function resolveActiveThreadProject(
     if (byConversationId) {
       return byConversationId;
     }
-    if (resolvedThread?.workspaceUri) {
-      const targetUriKey = normalizeWorkspaceUriKey(resolvedThread.workspaceUri);
-      if (targetUriKey) {
+    const threadUriKeys: string[] = [];
+    const candidateThreadUris =
+      resolvedThread?.workspaceUris && resolvedThread.workspaceUris.length > 0
+        ? resolvedThread.workspaceUris
+        : resolvedThread?.workspaceUri
+          ? [resolvedThread.workspaceUri]
+          : [];
+    for (const rawUri of candidateThreadUris) {
+      const key = normalizeWorkspaceUriKey(rawUri);
+      if (key && !threadUriKeys.includes(key)) {
+        threadUriKeys.push(key);
+      }
+    }
+    if (threadUriKeys.length > 0) {
+      for (const targetUriKey of threadUriKeys) {
         const byWorkspaceUri = projects.find((proj) =>
           proj.workspaceUris.some(
             (uri) => normalizeWorkspaceUriKey(uri) === targetUriKey,
@@ -3123,22 +3384,80 @@ export function resolveActiveThreadProject(
           return byWorkspaceUri;
         }
       }
-    }
-    if (resolvedThread?.workspaceName) {
-      const targetName = resolvedThread.workspaceName.trim().toLowerCase();
-      if (targetName) {
-        const nameMatches = projects.filter((proj) => {
-          if (proj.name.trim().toLowerCase() === targetName) {
-            return true;
+      let bestLength = 0;
+      let bestMatches: InboxServerProject[] = [];
+      for (const targetUriKey of threadUriKeys) {
+        if (!targetUriKey.startsWith('/')) continue;
+        for (const proj of projects) {
+          for (const uri of proj.workspaceUris) {
+            const projKey = normalizeWorkspaceUriKey(uri);
+            if (
+              !projKey ||
+              !projKey.startsWith('/') ||
+              getCanonicalPathSegmentCount(projKey) < 2
+            ) {
+              continue;
+            }
+            if (
+              targetUriKey.length > projKey.length &&
+              targetUriKey.startsWith(`${projKey}/`)
+            ) {
+              if (projKey.length > bestLength) {
+                bestLength = projKey.length;
+                bestMatches = [proj];
+              } else if (
+                projKey.length === bestLength &&
+                !bestMatches.includes(proj)
+              ) {
+                bestMatches.push(proj);
+              }
+            }
           }
-          return proj.workspaceUris.some((uri) => {
-            const seg = extractLastSegmentFromUri(uri);
-            return seg ? seg.trim().toLowerCase() === targetName : false;
-          });
-        });
-        if (nameMatches.length === 1) {
-          return nameMatches[0];
         }
+      }
+      if (bestMatches.length === 1) {
+        return bestMatches[0];
+      }
+    }
+    const candidateNames: string[] = [];
+    if (resolvedThread?.workspaceName && resolvedThread.workspaceName.trim()) {
+      candidateNames.push(resolvedThread.workspaceName.trim());
+    }
+    for (const rawUri of candidateThreadUris) {
+      const seg = extractLastSegmentFromUri(rawUri);
+      if (seg && !candidateNames.includes(seg)) {
+        candidateNames.push(seg);
+      }
+    }
+    for (const candName of candidateNames) {
+      const targetName = candName.toLowerCase();
+      const nameMatches = projects.filter((proj) => {
+        if (proj.name.trim().toLowerCase() === targetName) {
+          return true;
+        }
+        return proj.workspaceUris.some((uri) => {
+          const seg = extractLastSegmentFromUri(uri);
+          return seg ? seg.trim().toLowerCase() === targetName : false;
+        });
+      });
+      if (nameMatches.length === 1) {
+        return nameMatches[0];
+      }
+    }
+    for (const candName of candidateNames) {
+      const targetSlug = normalizeProjectSlugKey(candName);
+      if (!targetSlug) continue;
+      const slugMatches = projects.filter((proj) => {
+        if (normalizeProjectSlugKey(proj.name) === targetSlug) {
+          return true;
+        }
+        return proj.workspaceUris.some((uri) => {
+          const seg = extractLastSegmentFromUri(uri);
+          return seg ? normalizeProjectSlugKey(seg) === targetSlug : false;
+        });
+      });
+      if (slugMatches.length === 1) {
+        return slugMatches[0];
       }
     }
     return undefined;

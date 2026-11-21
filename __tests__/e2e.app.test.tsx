@@ -18,6 +18,7 @@ const mockLinkingListeners = new Set<(event: { url: string }) => void>();
 const mockBackPressListeners = new Set<() => boolean>();
 let mockInitialUrl: string | null = null;
 let mockNextTimingInterrupted = false;
+let mockWindowDimensions = { width: 390, height: 844 };
 const mockOpenURL = jest.fn(async (_url: string) => true);
 const mockPermissionsCheck = jest.fn(async (_permission: string) => false);
 const mockPermissionsRequest = jest.fn(
@@ -59,7 +60,7 @@ jest.mock('react-native', () => {
       hairlineWidth: 1,
       absoluteFillObject: {},
     },
-    useWindowDimensions: () => ({ width: 390, height: 844 }),
+    useWindowDimensions: () => mockWindowDimensions,
     Animated: {
       Value: MockAnimatedValue,
       View: mockComponent('Animated.View'),
@@ -240,6 +241,7 @@ import {
   backupCookiesFromWebView,
   saveLastActiveUrl,
 } from '../src/services/sessionVault';
+import { computeDrawerWidth, isTabletViewport } from '../src/utils/layout';
 
 describe('End-to-End <App /> Flow', () => {
   beforeEach(() => {
@@ -251,6 +253,7 @@ describe('End-to-End <App /> Flow', () => {
     mockBackPressListeners.clear();
     mockInitialUrl = null;
     mockNextTimingInterrupted = false;
+    mockWindowDimensions = { width: 390, height: 844 };
     mockOpenURL.mockClear();
     mockWebViewReload.mockClear();
     mockWebViewGoBack.mockClear();
@@ -3870,5 +3873,234 @@ describe('Session and navigation regressions', () => {
         shouldAlert: true,
       }),
     );
+  });
+
+  describe('Tablet default-open docked sidebar', () => {
+    afterEach(() => {
+      mockWindowDimensions = { width: 390, height: 844 };
+    });
+
+    it('detects tablet viewports while excluding phones in both portrait and landscape', () => {
+      expect(isTabletViewport(390, 844)).toBe(false);
+      expect(isTabletViewport(844, 390)).toBe(false);
+      expect(isTabletViewport(932, 430)).toBe(false);
+      expect(isTabletViewport(600, 960)).toBe(true);
+      expect(isTabletViewport(744, 1133)).toBe(true);
+      expect(isTabletViewport(768, 1024)).toBe(true);
+      expect(isTabletViewport(1024, 768)).toBe(true);
+      expect(isTabletViewport(1280, 800)).toBe(true);
+      expect(computeDrawerWidth(390, false)).toBe(335);
+      expect(computeDrawerWidth(768, true)).toBe(288);
+      expect(computeDrawerWidth(1024, true)).toBe(344);
+    });
+
+    it('opens the sidebar docked side-by-side by default on tablet even when launching directly into a thread, keeps it open on thread switches, and allows manual collapse/reopen', async () => {
+      mockWindowDimensions = { width: 1024, height: 768 };
+
+      // Pre-populate authenticated session + saved active thread URL
+      mockCookieStore.set('https://antigravity.google.com', {
+        SID: { name: 'SID', value: 'tablet-sid', domain: '.google.com' },
+      });
+      await backupCookiesFromWebView();
+      await saveLastActiveUrl(
+        'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-1',
+      );
+      mockCookieStore.clear();
+
+      let tree!: ReactTestRenderer;
+      await act(async () => {
+        tree = renderer.create(<App />);
+      });
+
+      const controls = () => tree.root.findByType(LeftNavigationDrawer);
+      const webView = () => tree.root.findByType('WebView' as any);
+      const webViewWrapper = () =>
+        tree.root.find((n) => n.props.testID === 'webview-wrapper');
+
+      // 1. Sidebar opens by default in docked split-view even though launch URL is a specific thread
+      expect(controls().props.visible).toBe(true);
+      expect(controls().props.docked).toBe(true);
+
+      // WebView wrapper reserves exact docked sidebar width side-by-side
+      const expectedWidth = computeDrawerWidth(1024, true);
+      const wrapperStyles = Array.isArray(webViewWrapper().props.style)
+        ? webViewWrapper().props.style
+        : [webViewWrapper().props.style];
+      expect(wrapperStyles).toEqual(
+        expect.arrayContaining([{ marginLeft: expectedWidth }]),
+      );
+
+      // No dimming backdrop or swipe guidance pill in docked tablet mode; overlay lets touches pass to WebView
+      expect(
+        tree.root.findAll(
+          (n) => n.props.accessibilityLabel === 'Close drawer backdrop',
+        ),
+      ).toHaveLength(0);
+      expect(
+        tree.root.findAll((n) => n.props.testID === 'drawer-guidance-pill'),
+      ).toHaveLength(0);
+      const dockedOverlay = tree.root.find(
+        (n) => n.props.testID === 'docked-drawer-overlay',
+      );
+      expect(dockedOverlay.props.pointerEvents).toBe('box-none');
+
+      // 2. Active thread viewed next to docked tablet sidebar is NOT flagged unread
+      const nowIso = new Date(Date.now() - 5_000).toISOString();
+      const earlierIso = new Date(Date.now() - 60_000).toISOString();
+      await act(async () => {
+        webView().props.onMessage({
+          nativeEvent: {
+            url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-1',
+            data: JSON.stringify({
+              type: 'AGY_INBOX_SNAPSHOT',
+              fetchedAtMs: Date.now(),
+              activeUrl:
+                'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-1',
+              activeInstanceUuid: 'workstation-1',
+              activeCascadeId: 'thread-1',
+              instances: [
+                {
+                  uuid: 'workstation-1',
+                  name: 'Primary Box',
+                  status: 1,
+                  trajectories: {
+                    trajectorySummaries: {
+                      'thread-1': {
+                        summary: 'Current Tablet Thread',
+                        status: 'CASCADE_RUN_STATUS_IDLE',
+                        lastUserInputTime: earlierIso,
+                        lastModifiedTime: nowIso,
+                      },
+                      'thread-2': {
+                        summary: 'Second Unread Thread',
+                        status: 'CASCADE_RUN_STATUS_IDLE',
+                        lastUserInputTime: earlierIso,
+                        lastModifiedTime: nowIso,
+                      },
+                    },
+                  },
+                },
+              ],
+            }),
+          },
+        });
+      });
+
+      const thread1 = controls().props.snapshot.threads.find(
+        (t: any) => t.cascadeId === 'thread-1',
+      );
+      const thread2 = controls().props.snapshot.threads.find(
+        (t: any) => t.cascadeId === 'thread-2',
+      );
+      expect(thread1?.attentionKind).toBe('idle');
+      expect(thread2?.attentionKind).toBe('unread');
+
+      // 3. Selecting another thread keeps the docked tablet sidebar open!
+      const openThread2Btn = tree.root.find(
+        (n) =>
+          n.props.accessibilityLabel === 'Open thread Second Unread Thread',
+      );
+      await act(async () => {
+        openThread2Btn.props.onPress();
+      });
+      expect(controls().props.visible).toBe(true);
+      expect(controls().props.docked).toBe(true);
+
+      // 4. User can collapse the docked sidebar via the close handle, expanding WebView to full width
+      const closeHandle = tree.root.find(
+        (n) => n.props.accessibilityLabel === 'Close Antigravity drawer',
+      );
+      await act(async () => {
+        closeHandle.props.onPress();
+      });
+      expect(controls().props.visible).toBe(false);
+      const collapsedStyles = Array.isArray(webViewWrapper().props.style)
+        ? webViewWrapper().props.style
+        : [webViewWrapper().props.style];
+      expect(collapsedStyles).not.toEqual(
+        expect.arrayContaining([{ marginLeft: expectedWidth }]),
+      );
+
+      // 5. Tapping the closed left handle reopens the docked sidebar side-by-side
+      const openHandle = tree.root.find(
+        (n) => n.props.accessibilityLabel === 'Open Antigravity drawer',
+      );
+      await act(async () => {
+        openHandle.props.onPress();
+      });
+      expect(controls().props.visible).toBe(true);
+      const reopenedStyles = Array.isArray(webViewWrapper().props.style)
+        ? webViewWrapper().props.style
+        : [webViewWrapper().props.style];
+      expect(reopenedStyles).toEqual(
+        expect.arrayContaining([{ marginLeft: expectedWidth }]),
+      );
+
+      await act(async () => {
+        tree.unmount();
+      });
+    });
+
+    it('keeps sidebar closed during first-time tablet sign-in and auto-opens once authenticated', async () => {
+      mockWindowDimensions = { width: 820, height: 1180 };
+
+      let tree!: ReactTestRenderer;
+      await act(async () => {
+        tree = renderer.create(<App />);
+      });
+
+      const controls = () => tree.root.findByType(LeftNavigationDrawer);
+      const webView = () => tree.root.findByType('WebView' as any);
+
+      // Closed during Google Sign-In so OAuth flow has full viewport
+      expect(controls().props.stage).toBe('authenticating');
+      expect(controls().props.docked).toBe(true);
+      expect(controls().props.visible).toBe(false);
+
+      // Complete sign-in directly onto a thread route -> sidebar auto-opens on tablet!
+      mockCookieStore.set('https://antigravity.google.com', {
+        SID: { name: 'SID', value: 'fresh-tablet-sid', domain: '.google.com' },
+      });
+      await act(async () => {
+        webView().props.onNavigationStateChange({
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-after-login',
+          loading: false,
+          canGoBack: false,
+        });
+      });
+
+      expect(controls().props.stage).toBe('authenticated');
+      expect(controls().props.visible).toBe(true);
+
+      await act(async () => {
+        tree.unmount();
+      });
+    });
+
+    it('keeps landscape phones in closed-by-default overlay mode rather than tablet split-view', async () => {
+      mockWindowDimensions = { width: 844, height: 390 };
+
+      mockCookieStore.set('https://antigravity.google.com', {
+        SID: { name: 'SID', value: 'phone-land-sid', domain: '.google.com' },
+      });
+      await backupCookiesFromWebView();
+      await saveLastActiveUrl(
+        'https://antigravity.google.com/r/workstation-1?p=c%2Fthread-1',
+      );
+      mockCookieStore.clear();
+
+      let tree!: ReactTestRenderer;
+      await act(async () => {
+        tree = renderer.create(<App />);
+      });
+
+      const controls = () => tree.root.findByType(LeftNavigationDrawer);
+      expect(controls().props.docked).toBe(false);
+      expect(controls().props.visible).toBe(false);
+
+      await act(async () => {
+        tree.unmount();
+      });
+    });
   });
 });
