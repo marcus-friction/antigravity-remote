@@ -3318,7 +3318,8 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                   </Text>
                   <Text style={styles.keepAliveDescription}>
                     Avoid reconnecting while switching to 2FA, chat, or browser
-                    apps.
+                    apps, and keep updating state for alerts while the phone is
+                    locked.
                   </Text>
                   <View style={styles.keepAliveRow}>
                     {isAndroid

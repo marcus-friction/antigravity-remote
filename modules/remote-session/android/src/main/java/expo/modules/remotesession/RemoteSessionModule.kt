@@ -2,12 +2,15 @@ package expo.modules.remotesession
 
 import android.app.Activity
 import android.app.Application
+import android.app.KeyguardManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Color
 import android.graphics.Rect
 import android.net.Uri
@@ -15,6 +18,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.view.View
 import android.view.ViewGroup
 import android.widget.RemoteViews
@@ -63,8 +67,13 @@ class RemoteSessionModule : Module() {
   @Volatile private var keepAliveMinutes: Int = 0
   @Volatile private var sessionActive: Boolean = false
   @Volatile private var stoppedForCurrentBackgroundStay: Boolean = false
+  @Volatile private var serviceStartRequested: Boolean = false
+  @Volatile private var isActivityStarted: Boolean = false
+  @Volatile private var isActivityResumed: Boolean = false
   @Volatile private var desiredDocumentStartScript: String? = null
   private var registeredApplication: Application? = null
+  private var screenStateReceiverContext: Context? = null
+  private var lastActivityRef: WeakReference<Activity>? = null
   private var cachedWebViewRef: WeakReference<WebView>? = null
   private val observedDecorViews = WeakHashMap<View, View.OnLayoutChangeListener>()
   private val installedDocumentStartScripts =
@@ -73,27 +82,60 @@ class RemoteSessionModule : Module() {
     applyDocumentStartScriptIfNeeded()
   }
 
+  private val screenStateReceiver = object : BroadcastReceiver() {
+    override fun onReceive(context: Context?, intent: Intent?) {
+      when (intent?.action) {
+        Intent.ACTION_SCREEN_OFF -> {
+          runOnMain {
+            if (
+              shouldKeepAlive() &&
+              !stoppedForCurrentBackgroundStay &&
+              (isActivityStarted || serviceStartRequested || RemoteKeepAliveService.isRunning)
+            ) {
+              startBackgroundKeepAliveIfEligible()
+            }
+          }
+        }
+        Intent.ACTION_USER_PRESENT -> {
+          runOnMain {
+            if (isActivityResumed) {
+              handleReturnedToInteractiveForeground()
+            }
+          }
+        }
+      }
+    }
+  }
+
   private val activityLifecycleCallbacks = object : Application.ActivityLifecycleCallbacks {
     override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
 
     override fun onActivityStarted(activity: Activity) {
       val current = appContext.currentActivity
       if (current != null && activity !== current) return
-      stoppedForCurrentBackgroundStay = false
+      lastActivityRef = WeakReference(activity)
+      isActivityStarted = true
       runOnMain {
-        stopKeepAliveServiceIfRunning()
-        applyDrawerGestureExclusion(activity)
-        applyDocumentStartScriptIfNeeded(activity)
-        applyWebViewKeepAlivePolicy(
-          protectInBackground = shouldKeepAlive(),
-          wakeTimers = true,
-          hostActivity = activity
-        )
+        handleReturnedToInteractiveForeground(activity)
       }
     }
 
-    override fun onActivityResumed(activity: Activity) = Unit
-    override fun onActivityPaused(activity: Activity) = Unit
+    override fun onActivityResumed(activity: Activity) {
+      val current = appContext.currentActivity
+      if (current != null && activity !== current) return
+      lastActivityRef = WeakReference(activity)
+      isActivityStarted = true
+      isActivityResumed = true
+      runOnMain {
+        handleReturnedToInteractiveForeground(activity)
+      }
+    }
+
+    override fun onActivityPaused(activity: Activity) {
+      val current = appContext.currentActivity
+      if (current != null && activity !== current) return
+      isActivityResumed = false
+    }
 
     override fun onActivityStopped(activity: Activity) {
       // Ignore configuration changes (e.g. screen rotation) and unrelated activities;
@@ -102,33 +144,19 @@ class RemoteSessionModule : Module() {
       if (activity.isChangingConfigurations) return
       val current = appContext.currentActivity
       if (current != null && activity !== current) return
+      lastActivityRef = WeakReference(activity)
+      isActivityStarted = false
+      isActivityResumed = false
       runOnMain {
-        if (shouldKeepAlive() && !stoppedForCurrentBackgroundStay) {
-          applyWebViewKeepAlivePolicy(
-            protectInBackground = true,
-            hostActivity = activity
-          )
-          val context = appContext.reactContext ?: activity.applicationContext
-          if (!RemoteKeepAliveService.start(context, keepAliveMinutes)) {
-            applyWebViewKeepAlivePolicy(
-              protectInBackground = false,
-              releaseWebLock = true,
-              hostActivity = activity
-            )
-          }
-        } else {
-          applyWebViewKeepAlivePolicy(
-            protectInBackground = false,
-            releaseWebLock = true,
-            hostActivity = activity
-          )
-          stopKeepAliveServiceIfRunning()
-        }
+        startBackgroundKeepAliveIfEligible(hostActivity = activity)
       }
     }
 
     override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
     override fun onActivityDestroyed(activity: Activity) {
+      if (lastActivityRef?.get() === activity) {
+        lastActivityRef = null
+      }
       val decorView = activity.window?.decorView
       val contentView = activity.findViewById<View>(android.R.id.content)
       runOnMain {
@@ -154,7 +182,69 @@ class RemoteSessionModule : Module() {
     }
   }
 
+  private fun isInteractiveAndUnlocked(context: Context?): Boolean {
+    val ctx = context ?: appContext.reactContext ?: appContext.currentActivity?.applicationContext ?: return true
+    val powerManager = ctx.getSystemService(Context.POWER_SERVICE) as? PowerManager
+    val isInteractive = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT_WATCH) {
+      powerManager?.isInteractive ?: true
+    } else {
+      @Suppress("DEPRECATION")
+      powerManager?.isScreenOn ?: true
+    }
+    if (!isInteractive) {
+      return false
+    }
+    val keyguardManager = ctx.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+    return keyguardManager?.isKeyguardLocked != true
+  }
+
+  private fun isTrustedAntigravityUrl(rawUrl: String?): Boolean {
+    if (rawUrl.isNullOrBlank()) return false
+    return runCatching {
+      val uri = Uri.parse(rawUrl)
+      uri.scheme.equals("https", ignoreCase = true) &&
+        uri.host.equals("antigravity.google.com", ignoreCase = true) &&
+        uri.port == -1 &&
+        uri.userInfo == null
+    }.getOrDefault(false)
+  }
+
+  private fun registerScreenStateReceiverIfNeeded() {
+    if (screenStateReceiverContext != null) return
+    val ctx = (appContext.reactContext?.applicationContext ?: appContext.currentActivity?.applicationContext)
+      ?: return
+    val filter = IntentFilter().apply {
+      addAction(Intent.ACTION_SCREEN_OFF)
+      addAction(Intent.ACTION_USER_PRESENT)
+    }
+    runCatching {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        ctx.registerReceiver(screenStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+      } else {
+        @Suppress("UnspecifiedRegisterReceiverFlag")
+        ctx.registerReceiver(screenStateReceiver, filter)
+      }
+      screenStateReceiverContext = ctx
+    }
+  }
+
+  private fun unregisterScreenStateReceiver() {
+    val ctx = screenStateReceiverContext ?: return
+    screenStateReceiverContext = null
+    runCatching {
+      ctx.unregisterReceiver(screenStateReceiver)
+    }
+  }
+
   private fun registerActivityLifecycleObserverIfNeeded() {
+    registerScreenStateReceiverIfNeeded()
+    val current = appContext.currentActivity
+    if (current != null && !current.isFinishing) {
+      lastActivityRef = WeakReference(current)
+      if (!isActivityStarted && isInteractiveAndUnlocked(current)) {
+        isActivityStarted = true
+      }
+    }
     if (registeredApplication != null) return
     val app = (appContext.reactContext?.applicationContext ?: appContext.currentActivity?.application)
       as? Application ?: return
@@ -189,8 +279,91 @@ class RemoteSessionModule : Module() {
     return found
   }
 
+  private fun resolveActiveWebView(hostActivity: Activity? = null): WebView? {
+    val cached = cachedWebViewRef?.get()
+    if (cached != null && cached.isAttachedToWindow && cached.parent != null) {
+      return cached
+    }
+    val activity = hostActivity ?: appContext.currentActivity ?: lastActivityRef?.get() ?: return null
+    return resolveWebView(activity.window?.decorView)
+  }
+
   private fun shouldKeepAlive(): Boolean {
     return keepAliveEnabled && keepAliveMinutes > 0 && sessionActive
+  }
+
+  private fun handleReturnedToInteractiveForeground(hostActivity: Activity? = null) {
+    val activity = hostActivity ?: appContext.currentActivity ?: lastActivityRef?.get()
+    if (!isInteractiveAndUnlocked(activity ?: appContext.reactContext)) {
+      return
+    }
+    stoppedForCurrentBackgroundStay = false
+    serviceStartRequested = false
+    stopKeepAliveServiceIfRunning()
+    if (activity != null) {
+      applyDrawerGestureExclusion(activity)
+      applyDocumentStartScriptIfNeeded(activity)
+    } else {
+      applyDrawerGestureExclusion()
+      applyDocumentStartScriptIfNeeded()
+    }
+    applyWebViewKeepAlivePolicy(
+      protectInBackground = shouldKeepAlive(),
+      wakeTimers = true,
+      hostActivity = activity
+    )
+  }
+
+  private fun startBackgroundKeepAliveIfEligible(hostActivity: Activity? = null) {
+    if (!shouldKeepAlive() || stoppedForCurrentBackgroundStay) {
+      applyWebViewKeepAlivePolicy(
+        protectInBackground = false,
+        releaseWebLock = true,
+        hostActivity = hostActivity
+      )
+      stopKeepAliveServiceIfRunning()
+      return
+    }
+    applyWebViewKeepAlivePolicy(
+      protectInBackground = true,
+      wakeTimers = true,
+      hostActivity = hostActivity
+    )
+    if (serviceStartRequested || RemoteKeepAliveService.isRunning) {
+      return
+    }
+    val context = appContext.reactContext
+      ?: hostActivity?.applicationContext
+      ?: appContext.currentActivity?.applicationContext
+      ?: lastActivityRef?.get()?.applicationContext
+      ?: return
+    serviceStartRequested = true
+    if (!RemoteKeepAliveService.start(context, keepAliveMinutes)) {
+      serviceStartRequested = false
+      applyWebViewKeepAlivePolicy(
+        protectInBackground = false,
+        releaseWebLock = true,
+        hostActivity = hostActivity
+      )
+    }
+  }
+
+  private fun triggerBackgroundStateRefresh() {
+    if (!shouldKeepAlive() || stoppedForCurrentBackgroundStay) {
+      return
+    }
+    val webView = resolveActiveWebView() ?: return
+    if (!isTrustedAntigravityUrl(webView.url)) {
+      return
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      webView.setRendererPriorityPolicy(
+        WebView.RENDERER_PRIORITY_IMPORTANT,
+        /* waivedWhenNotVisible = */ false
+      )
+    }
+    webView.resumeTimers()
+    webView.evaluateJavascript(BACKGROUND_POLL_SCRIPT, null)
   }
 
   private fun applyWebViewKeepAlivePolicy(
@@ -199,8 +372,7 @@ class RemoteSessionModule : Module() {
     releaseWebLock: Boolean = false,
     hostActivity: Activity? = null
   ) {
-    val activity = hostActivity ?: appContext.currentActivity ?: return
-    val webView = resolveWebView(activity.window?.decorView) ?: return
+    val webView = resolveActiveWebView(hostActivity) ?: return
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
       webView.setRendererPriorityPolicy(
         WebView.RENDERER_PRIORITY_IMPORTANT,
@@ -320,7 +492,11 @@ class RemoteSessionModule : Module() {
   }
 
   private fun stopKeepAliveServiceIfRunning() {
-    val context = appContext.reactContext ?: appContext.currentActivity?.applicationContext ?: return
+    serviceStartRequested = false
+    val context = appContext.reactContext
+      ?: appContext.currentActivity?.applicationContext
+      ?: lastActivityRef?.get()?.applicationContext
+      ?: return
     RemoteKeepAliveService.stop(context)
   }
 
@@ -622,6 +798,8 @@ class RemoteSessionModule : Module() {
       .setContentTitle(title)
       .setContentText(body)
       .setNumber(count)
+      .setWhen(System.currentTimeMillis())
+      .setShowWhen(true)
       .setAutoCancel(true)
       .setOnlyAlertOnce(!shouldAlert)
       .setCategory(Notification.CATEGORY_MESSAGE)
@@ -629,7 +807,29 @@ class RemoteSessionModule : Module() {
       .setContentIntent(contentPendingIntent)
 
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-      builder.setColor(primaryStyle?.headerAccentColor ?: Color.parseColor("#3279F9"))
+      val accentColor = primaryStyle?.headerAccentColor ?: Color.parseColor("#3279F9")
+      builder.setColor(accentColor)
+      // Non-sensitive lock-screen summary shown when the user hides sensitive
+      // notification details on a locked screen (never includes titles/hosts/commands).
+      val publicBuilder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        Notification.Builder(context, ACTION_CHANNEL_ID)
+      } else {
+        @Suppress("DEPRECATION")
+        Notification.Builder(context)
+      }
+      val publicSummary = if (count == 1) {
+        "1 action requires your attention"
+      } else {
+        "$count actions require your attention"
+      }
+      publicBuilder
+        .setSmallIcon(R.drawable.ic_stat_keep_alive)
+        .setContentTitle("Antigravity Remote")
+        .setContentText(publicSummary)
+        .setNumber(count)
+        .setColor(accentColor)
+        .setCategory(Notification.CATEGORY_MESSAGE)
+      builder.setPublicVersion(publicBuilder.build())
     }
 
     val appliedCustomCards = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && cards.isNotEmpty()) {
@@ -677,15 +877,19 @@ class RemoteSessionModule : Module() {
     OnCreate {
       registerActivityLifecycleObserverIfNeeded()
       runOnMain { applyDrawerGestureExclusion() }
-      RemoteKeepAliveService.registerKeepAliveEndedListener(this@RemoteSessionModule) { stoppedByUser ->
-        if (stoppedByUser) {
-          stoppedForCurrentBackgroundStay = true
-        }
+      RemoteKeepAliveService.registerKeepAliveEndedListener(this@RemoteSessionModule) { _ ->
+        stoppedForCurrentBackgroundStay = true
+        serviceStartRequested = false
         runOnMain {
           applyWebViewKeepAlivePolicy(
             protectInBackground = false,
             releaseWebLock = true
           )
+        }
+      }
+      RemoteKeepAliveService.registerKeepAlivePollListener(this@RemoteSessionModule) {
+        runOnMain {
+          triggerBackgroundStateRefresh()
         }
       }
     }
@@ -694,6 +898,7 @@ class RemoteSessionModule : Module() {
       try {
         sessionActive = false
         stoppedForCurrentBackgroundStay = false
+        serviceStartRequested = false
         desiredDocumentStartScript = null
         removeInstalledDocumentStartScripts()
         cancelActionNotification()
@@ -778,16 +983,9 @@ class RemoteSessionModule : Module() {
     }.runOnQueue(Queues.MAIN)
 
     OnActivityEntersForeground {
-      stoppedForCurrentBackgroundStay = false
       runOnMain {
         registerActivityLifecycleObserverIfNeeded()
-        stopKeepAliveServiceIfRunning()
-        applyDrawerGestureExclusion()
-        applyDocumentStartScriptIfNeeded()
-        applyWebViewKeepAlivePolicy(
-          protectInBackground = shouldKeepAlive(),
-          wakeTimers = true
-        )
+        handleReturnedToInteractiveForeground()
       }
     }
 
@@ -803,7 +1001,9 @@ class RemoteSessionModule : Module() {
         clearDrawerGestureExclusionObservers()
         removeInstalledDocumentStartScripts()
       }
+      unregisterScreenStateReceiver()
       unregisterActivityLifecycleObserver()
+      RemoteKeepAliveService.unregisterKeepAlivePollListener(this@RemoteSessionModule)
       RemoteKeepAliveService.unregisterKeepAliveEndedListener(this@RemoteSessionModule)
       stopKeepAliveServiceIfRunning()
     }
@@ -823,5 +1023,7 @@ class RemoteSessionModule : Module() {
     )
     private const val RELEASE_WEB_LOCK_SCRIPT =
       "(function(){try{window.__agyKeepAliveLockDesired=false;if(typeof window.__agyReleaseKeepAliveLock==='function'){window.__agyReleaseKeepAliveLock();}window.__agyKeepAliveLockHeld=false;}catch(_){}})();"
+    private const val BACKGROUND_POLL_SCRIPT =
+      "(function(){try{if(!window.location||window.location.hostname!=='antigravity.google.com')return;window.__agyKeepAliveLockDesired=true;if(!window.__agyKeepAliveLockHeld&&!window.__agyKeepAliveLockPending&&navigator&&navigator.locks&&typeof navigator.locks.request==='function'){window.__agyKeepAliveLockPending=true;navigator.locks.request('__agy_remote_keep_alive',function(){window.__agyKeepAliveLockPending=false;if(!window.__agyKeepAliveLockDesired){window.__agyKeepAliveLockHeld=false;return Promise.resolve();}window.__agyKeepAliveLockHeld=true;return new Promise(function(resolve){window.__agyReleaseKeepAliveLock=function(){window.__agyKeepAliveLockHeld=false;window.__agyReleaseKeepAliveLock=null;resolve();};if(!window.__agyKeepAliveLockDesired){window.__agyReleaseKeepAliveLock();}});}).catch(function(){window.__agyKeepAliveLockPending=false;window.__agyKeepAliveLockHeld=false;});}if(window.__agyInboxBridge&&typeof window.__agyInboxBridge.backgroundTick==='function'){window.__agyInboxBridge.backgroundTick();}else if(window.__agyInboxBridge&&typeof window.__agyInboxBridge.refresh==='function'){window.__agyInboxBridge.refresh(false,true);}}catch(_){}})();"
   }
 }

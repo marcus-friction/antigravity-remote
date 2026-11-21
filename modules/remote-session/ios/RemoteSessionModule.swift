@@ -49,10 +49,14 @@ private final class ActionNotificationDelegate: NSObject, UNUserNotificationCent
 
 public class RemoteSessionModule: Module {
   private static let actionNotificationIdentifier = "agy_action_required"
+  private static let backgroundPollIntervalSeconds: TimeInterval = 10.0
+  private static let backgroundPollScript =
+    "(function(){try{if(!window.location||window.location.hostname!=='antigravity.google.com')return;window.__agyKeepAliveLockDesired=true;if(window.__agyInboxBridge&&typeof window.__agyInboxBridge.backgroundTick==='function'){window.__agyInboxBridge.backgroundTick();}else if(window.__agyInboxBridge&&typeof window.__agyInboxBridge.refresh==='function'){window.__agyInboxBridge.refresh(false,true);}}catch(_){}})();"
   private var keepAliveEnabled: Bool = false
   private var keepAliveMinutes: Int = 0
   private var sessionActive: Bool = false
   private var backgroundTaskId: UIBackgroundTaskIdentifier = .invalid
+  private var backgroundPollTimer: Timer?
 
   private func runOnMain(_ block: @escaping () -> Void) {
     if Thread.isMainThread {
@@ -62,7 +66,71 @@ public class RemoteSessionModule: Module {
     }
   }
 
+  private func findWebView(in view: UIView) -> WKWebView? {
+    if let webView = view as? WKWebView {
+      return webView
+    }
+    for subview in view.subviews {
+      if let found = findWebView(in: subview) {
+        return found
+      }
+    }
+    return nil
+  }
+
+  private func resolveActiveWebView() -> WKWebView? {
+    for scene in UIApplication.shared.connectedScenes {
+      guard let windowScene = scene as? UIWindowScene else { continue }
+      for window in windowScene.windows {
+        if let found = findWebView(in: window) {
+          return found
+        }
+      }
+    }
+    return nil
+  }
+
+  private func isTrustedAntigravityUrl(_ url: URL?) -> Bool {
+    guard let url = url,
+          url.scheme?.lowercased() == "https",
+          url.host?.lowercased() == "antigravity.google.com",
+          url.port == nil,
+          url.user == nil,
+          url.password == nil else {
+      return false
+    }
+    return true
+  }
+
+  private func triggerBackgroundStateRefresh() {
+    guard keepAliveEnabled, keepAliveMinutes > 0, sessionActive, backgroundTaskId != .invalid else {
+      return
+    }
+    guard let webView = resolveActiveWebView(), isTrustedAntigravityUrl(webView.url) else {
+      return
+    }
+    webView.evaluateJavaScript(Self.backgroundPollScript, completionHandler: nil)
+  }
+
+  private func stopBackgroundPollTimer() {
+    backgroundPollTimer?.invalidate()
+    backgroundPollTimer = nil
+  }
+
+  private func startBackgroundPollTimer() {
+    stopBackgroundPollTimer()
+    let timer = Timer.scheduledTimer(
+      withTimeInterval: Self.backgroundPollIntervalSeconds,
+      repeats: true
+    ) { [weak self] _ in
+      self?.triggerBackgroundStateRefresh()
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    backgroundPollTimer = timer
+  }
+
   private func endBackgroundKeepAliveTask() {
+    stopBackgroundPollTimer()
     if backgroundTaskId != .invalid {
       let taskToEnd = backgroundTaskId
       backgroundTaskId = .invalid
@@ -83,6 +151,7 @@ public class RemoteSessionModule: Module {
       let capturedId = newTaskId
       self?.runOnMain {
         expiredSynchronously = true
+        self?.stopBackgroundPollTimer()
         if capturedId != .invalid {
           UIApplication.shared.endBackgroundTask(capturedId)
         }
@@ -100,6 +169,9 @@ public class RemoteSessionModule: Module {
       backgroundTaskId = .invalid
     } else {
       backgroundTaskId = newTaskId
+      if newTaskId != .invalid {
+        startBackgroundPollTimer()
+      }
     }
   }
 

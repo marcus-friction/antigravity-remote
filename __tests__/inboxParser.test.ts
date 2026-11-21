@@ -4802,4 +4802,276 @@ describe('inboxParser', () => {
     expect(scheduledDelays).toContain(350);
   });
 
+  it('drives locked-screen backgroundTick updates with deduplication, stalled-RPC recovery, fresh SAPISIDHASH rotation, error-cache preservation, and immediate real-time hint refresh', async () => {
+    const postedToNative: any[] = [];
+    const windowListeners = new Map<string, Array<(e: any) => void>>();
+    const seenAuthHeaders: string[] = [];
+    const seenProxyPaths: string[] = [];
+    let fakeNow = 1_762_300_000_000;
+    let authCounter = 1;
+    let listMode: 'ok' | 'hang' | 'error' = 'ok';
+    let resolveHungList: ((val: any) => void) | null = null;
+    let currentSummaryTitle = 'Initial prompt';
+    let currentWaiting = false;
+
+    class MockDate extends Date {
+      constructor(...args: any[]) {
+        if (args.length === 0) {
+          super(fakeNow);
+        } else {
+          // @ts-expect-error variadic Date constructor forwarding
+          super(...args);
+        }
+      }
+      static now() {
+        return fakeNow;
+      }
+    }
+
+    class MockListInstancesRequest {}
+    class MockProxyCommandRequest {
+      uuid = '';
+      rpcPath = '';
+      payload: Uint8Array = new Uint8Array();
+      setTargetInstanceUuid(u: string) {
+        this.uuid = u;
+      }
+      setRpcPath(p: string) {
+        this.rpcPath = p;
+      }
+      setPayload(bytes: Uint8Array) {
+        this.payload = bytes;
+      }
+      putHeaders() {}
+    }
+
+    const makeInstancesResponse = (label: string) => ({
+      getInstancesList: () => [
+        {
+          getUuid: () => 'lock-box',
+          getStatus: () => 1,
+          getMetadata: () => ({
+            getName: () => label,
+            getVersion: () => '2.34.0',
+          }),
+          getStatusLastUpdatedAt: () => ({ getSeconds: () => Math.floor(fakeNow / 1000) }),
+        },
+      ],
+    });
+
+    class MockApiServicePromiseClient {
+      listInstances(_req: any, meta?: Record<string, string>) {
+        if (meta && meta.Authorization) {
+          seenAuthHeaders.push(meta.Authorization);
+        }
+        if (listMode === 'hang') {
+          return new Promise((resolve) => {
+            resolveHungList = resolve;
+          });
+        }
+        if (listMode === 'error') {
+          return Promise.reject(new Error('Network offline during handoff'));
+        }
+        return Promise.resolve(makeInstancesResponse('Primary Box'));
+      }
+      proxyCommand(req: MockProxyCommandRequest) {
+        seenProxyPaths.push(req.rpcPath);
+        if (req.rpcPath.endsWith('/GetAllCascadeTrajectories')) {
+          const payload = JSON.stringify({
+            trajectorySummaries: {
+              'thread-lock': {
+                summary: currentSummaryTitle,
+                status: currentWaiting
+                  ? 'CASCADE_RUN_STATUS_WAITING_FOR_USER'
+                  : 'CASCADE_RUN_STATUS_RUNNING',
+                waitingSteps: currentWaiting
+                  ? [{ step: { runCommand: { commandLine: 'npm run deploy' } } }]
+                  : [],
+                lastModifiedTime: new Date(fakeNow).toISOString(),
+              },
+            },
+          });
+          return Promise.resolve({
+            getPayload_asU8: () => new TextEncoder().encode(payload),
+          });
+        }
+        return Promise.resolve({
+          getPayload_asU8: () => new TextEncoder().encode(JSON.stringify({ tasks: [] })),
+        });
+      }
+    }
+
+    const sandboxWin: any = {
+      __agyKeepAliveLockDesired: true,
+      Date: MockDate,
+      location: {
+        hostname: 'antigravity.google.com',
+        origin: 'https://antigravity.google.com',
+        pathname: '/r/lock-box',
+        search: '?p=c%2Fthread-lock',
+        href: 'https://antigravity.google.com/r/lock-box?p=c%2Fthread-lock',
+      },
+      history: { state: null, replaceState: () => {} },
+      // Simulate stale navigator.onLine=false while screen is locked
+      navigator: { onLine: false },
+      document: {
+        cookie: 'SAPISID=test-cookie',
+        visibilityState: 'hidden',
+        querySelectorAll: () => [],
+      },
+      default_GoogleAntigravity: {
+        K: {
+          devtools_jetski_boq_api_proto: {
+            ApiServicePromiseClient: MockApiServicePromiseClient,
+            ListInstancesRequest: MockListInstancesRequest,
+            ProxyCommandRequest: MockProxyCommandRequest,
+          },
+        },
+        pj: {
+          auth_firstparty: {
+            getAuthHeaderValueForFirstParty: () =>
+              `SAPISIDHASH ${Math.floor(fakeNow / 1000)}_fresh${authCounter++}`,
+          },
+        },
+      },
+      ReactNativeWebView: {
+        postMessage: (raw: string) => postedToNative.push(JSON.parse(raw)),
+      },
+      addEventListener: (event: string, fn: (e: any) => void) => {
+        const list = windowListeners.get(event) ?? [];
+        list.push(fn);
+        windowListeners.set(event, list);
+      },
+      TextEncoder,
+      TextDecoder,
+      URL,
+      URLSearchParams,
+      // Simulate Blink completely throttling/freezing setTimeout while the phone is locked
+      setTimeout: () => 1,
+      clearTimeout: () => undefined,
+      setInterval: () => 2,
+      clearInterval: () => undefined,
+    };
+    sandboxWin.window = sandboxWin;
+
+    const context = vm.createContext(sandboxWin);
+    vm.runInContext(INBOX_BRIDGE_SCRIPT, context);
+    sandboxWin.__agyInboxBridge.installHooks();
+
+    // Seed a captured client + initial Authorization metadata
+    const hostClient = new MockApiServicePromiseClient();
+    await (hostClient as any).listInstances(new MockListInstancesRequest(), {
+      Authorization: 'SAPISIDHASH 1000_stale',
+    });
+    seenAuthHeaders.length = 0;
+
+    // 1. Native backgroundTick runs while hidden even if navigator.onLine is stale-false,
+    //    and queries ONLY lightweight trajectory + background task RPCs.
+    await sandboxWin.__agyInboxBridge.backgroundTick();
+    expect(postedToNative).toHaveLength(1);
+    expect(postedToNative[0].instances[0].uuid).toBe('lock-box');
+    expect(seenProxyPaths).toEqual([
+      '/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories',
+      '/exa.language_server_pb.LanguageServerService/ListBackgroundTasks',
+    ]);
+    expect(seenAuthHeaders[seenAuthHeaders.length - 1]).toBe(
+      'SAPISIDHASH 1000_stale',
+    );
+
+    // 2. Deduplication: calling backgroundTick again 4s later (< 12s) is a no-op
+    fakeNow += 4_000;
+    postedToNative.length = 0;
+    seenProxyPaths.length = 0;
+    await sandboxWin.__agyInboxBridge.backgroundTick();
+    expect(postedToNative).toHaveLength(0);
+    expect(seenProxyPaths).toHaveLength(0);
+
+    // 3. After 65s (>= 60s), backgroundTick rotates stale captured SAPISIDHASH automatically
+    fakeNow += 61_000;
+    currentWaiting = true;
+    currentSummaryTitle = 'Deploy release';
+    await sandboxWin.__agyInboxBridge.backgroundTick();
+    expect(postedToNative).toHaveLength(1);
+    expect(seenAuthHeaders[seenAuthHeaders.length - 1]).toMatch(
+      /^SAPISIDHASH \d+_fresh1$/,
+    );
+    expect(
+      postedToNative[0].instances[0].trajectories['thread-lock'].waitingSteps,
+    ).toHaveLength(1);
+
+    // 4. Stalled in-flight RPC recovery when Blink freezes setTimeout:
+    //    Start a hung refresh, advance 16s (>= 15s), invoke backgroundTick() ->
+    //    flushes expired deadlines, supersedes hung refresh, succeeds on new poll,
+    //    and ignores late zombie resolution from the hung call!
+    fakeNow += 20_000;
+    listMode = 'hang';
+    postedToNative.length = 0;
+    const hungPromise = sandboxWin.__agyInboxBridge.backgroundTick();
+    await Promise.resolve();
+    expect(resolveHungList).not.toBeNull();
+
+    // Still young (5s): second tick reuses the active in-flight refresh without duplicating
+    fakeNow += 5_000;
+    const youngTick = sandboxWin.__agyInboxBridge.backgroundTick();
+    expect(youngTick).toBe(hungPromise);
+    expect(postedToNative).toHaveLength(0);
+
+    // Past stale threshold (16s total): recovers immediately on next native heartbeat!
+    fakeNow += 11_000;
+    listMode = 'ok';
+    currentSummaryTitle = 'Recovered after stall';
+    await sandboxWin.__agyInboxBridge.backgroundTick();
+    expect(postedToNative).toHaveLength(1);
+    expect(
+      postedToNative[0].instances[0].trajectories['thread-lock'].summary,
+    ).toBe('Recovered after stall');
+
+    // Late zombie resolution from the superseded hung promise must be ignored
+    resolveHungList!(makeInstancesResponse('Stale Zombie Box'));
+    await hungPromise;
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(postedToNative).toHaveLength(1);
+
+    // 5. Transient listInstances failure preserves cached instances alongside error
+    fakeNow += 20_000;
+    listMode = 'error';
+    postedToNative.length = 0;
+    await sandboxWin.__agyInboxBridge.backgroundTick();
+    expect(postedToNative).toHaveLength(1);
+    expect(postedToNative[0].error).toBe('Network offline during handoff');
+    expect(postedToNative[0].instances).toHaveLength(1);
+    expect(postedToNative[0].instances[0].uuid).toBe('lock-box');
+
+    // 6. Real-time NOTIFICATION_REQUEST while hidden + keep-alive active triggers immediate
+    //    microtask refresh without depending on throttled setTimeout(300)!
+    listMode = 'ok';
+    currentSummaryTitle = 'Urgent approval while locked';
+    postedToNative.length = 0;
+    for (const listener of windowListeners.get('message') ?? []) {
+      listener({
+        origin: 'https://antigravity.static.usercontent.goog',
+        data: {
+          jspbPayload: JSON.stringify([
+            null,
+            null,
+            null,
+            null,
+            [['n-lock', 'Approval needed', 'npm run deploy', false, '/c/thread-lock', 'thread-lock']],
+          ]),
+        },
+      });
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(
+      postedToNative.some(
+        (m) =>
+          m.type === 'AGY_INBOX_SNAPSHOT' &&
+          m.instances?.[0]?.trajectories?.['thread-lock']?.summary ===
+            'Urgent approval while locked',
+      ),
+    ).toBe(true);
+
+    sandboxWin.__agyInboxBridge.stop();
+  });
 });

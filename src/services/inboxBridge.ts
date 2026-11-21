@@ -59,6 +59,9 @@ export const INBOX_BRIDGE_SCRIPT = `
       metadata: DEFAULT_LS_METADATA_OBJ
     });
     var POLL_INTERVAL_MS = 20000;
+    var BACKGROUND_TICK_MIN_GAP_MS = 12000;
+    var STALE_INFLIGHT_REFRESH_MS = 15000;
+    var CAPTURED_AUTH_REFRESH_MS = 60000;
     var USAGE_POLL_MIN_INTERVAL_MS = 45000;
     var INSTANCE_RPC_TIMEOUT_MS = 8000;
     var JETBOX_SUMMARIES_TIMEOUT_MS = 5500;
@@ -73,6 +76,7 @@ export const INBOX_BRIDGE_SCRIPT = `
 
     var capturedApiClient = null;
     var capturedMetadata = null;
+    var capturedMetadataAtMs = 0;
     var standaloneApiClient = null;
     var cachedProtoNs = null;
     var cachedAuthFirstParty = null;
@@ -91,6 +95,7 @@ export const INBOX_BRIDGE_SCRIPT = `
     var inFlightUsagePromise = null;
     var pendingFollowUpRefresh = false;
     var pendingForcedUsageRefresh = false;
+    var pendingBackgroundFollowUp = false;
     var cloudTrajectoriesCache = null;
     var activeIframeCascadeId = null;
     var activeIframeInstanceUuid = null;
@@ -102,6 +107,10 @@ export const INBOX_BRIDGE_SCRIPT = `
     var START_NAV_CONFIRM_MS = 1200;
     var refreshTimer = null;
     var inFlightRefresh = null;
+    var inFlightRefreshStartedAtMs = 0;
+    var activeRefreshToken = 0;
+    var lastBackgroundRefreshCompletedAtMs = 0;
+    var pendingRpcDeadlines = [];
     var isStopped = false;
 
     function generateUuidV4() {
@@ -406,6 +415,7 @@ export const INBOX_BRIDGE_SCRIPT = `
                     }
                   }
                   capturedMetadata = copy;
+                  capturedMetadataAtMs = Date.now();
                 } catch (_) {}
               }
               var result = orig.apply(this, arguments);
@@ -527,11 +537,30 @@ export const INBOX_BRIDGE_SCRIPT = `
 
       if (capturedApiClient) {
         var meta = Object.create(null);
+        var authHeaderKey = null;
         if (capturedMetadata) {
           var capKeys = Object.keys(capturedMetadata);
           for (var c = 0; c < capKeys.length; c++) {
-            meta[capKeys[c]] = capturedMetadata[capKeys[c]];
+            var ck = capKeys[c];
+            meta[ck] = capturedMetadata[ck];
+            if (ck.toLowerCase() === 'authorization') {
+              authHeaderKey = ck;
+            }
           }
+        }
+        var authAgeMs =
+          capturedMetadataAtMs > 0 ? Date.now() - capturedMetadataAtMs : 0;
+        if (authHeaderKey && authAgeMs >= CAPTURED_AUTH_REFRESH_MS) {
+          return buildStandaloneAuthHeader().then(function(freshAuth) {
+            if (freshAuth) {
+              meta[authHeaderKey] = freshAuth;
+            }
+            return {
+              proto: proto,
+              client: capturedApiClient,
+              metadata: meta
+            };
+          });
         }
         return Promise.resolve({
           proto: proto,
@@ -578,20 +607,59 @@ export const INBOX_BRIDGE_SCRIPT = `
       });
     }
 
+    function removePendingRpcDeadline(entry) {
+      for (var i = pendingRpcDeadlines.length - 1; i >= 0; i--) {
+        if (pendingRpcDeadlines[i] === entry) {
+          pendingRpcDeadlines.splice(i, 1);
+          break;
+        }
+      }
+    }
+
+    function flushExpiredRpcDeadlines(nowMs) {
+      var now = typeof nowMs === 'number' ? nowMs : Date.now();
+      var remaining = [];
+      var expired = [];
+      for (var i = 0; i < pendingRpcDeadlines.length; i++) {
+        var entry = pendingRpcDeadlines[i];
+        if (entry.deadlineMs <= now) {
+          expired.push(entry);
+        } else {
+          remaining.push(entry);
+        }
+      }
+      pendingRpcDeadlines = remaining;
+      for (var j = 0; j < expired.length; j++) {
+        try {
+          expired[j].fire();
+        } catch (_) {}
+      }
+    }
+
     function withTimeout(promise, timeoutMs, label) {
       return new Promise(function(resolve, reject) {
         var settled = false;
-        var timer = setTimeout(function() {
-          if (!settled) {
-            settled = true;
-            reject(new Error(label || 'RPC timeout'));
+        var deadlineEntry = {
+          deadlineMs: Date.now() + timeoutMs,
+          fire: function() {
+            if (!settled) {
+              settled = true;
+              clearTimeout(timer);
+              reject(new Error(label || 'RPC timeout'));
+            }
           }
+        };
+        pendingRpcDeadlines.push(deadlineEntry);
+        var timer = setTimeout(function() {
+          removePendingRpcDeadline(deadlineEntry);
+          deadlineEntry.fire();
         }, timeoutMs);
         promise.then(
           function(value) {
             if (!settled) {
               settled = true;
               clearTimeout(timer);
+              removePendingRpcDeadline(deadlineEntry);
               resolve(value);
             }
           },
@@ -599,6 +667,7 @@ export const INBOX_BRIDGE_SCRIPT = `
             if (!settled) {
               settled = true;
               clearTimeout(timer);
+              removePendingRpcDeadline(deadlineEntry);
               reject(err);
             }
           }
@@ -1613,13 +1682,16 @@ export const INBOX_BRIDGE_SCRIPT = `
       });
     }
 
-    function fetchUsageFromCandidates(ctx, candidates, forceUsage) {
+    function fetchUsageFromCandidates(ctx, candidates, forceUsage, isBackgroundPoll) {
       if (!candidates || candidates.length === 0) {
         lastUsageCache = null;
         lastUsageFetchedAtMs = 0;
         return Promise.resolve(null);
       }
-      if (!forceUsage && document && document.visibilityState === 'hidden') {
+      if (
+        !forceUsage &&
+        (isBackgroundPoll || (document && document.visibilityState === 'hidden'))
+      ) {
         return Promise.resolve(lastUsageCache);
       }
       var now = Date.now();
@@ -1905,23 +1977,37 @@ export const INBOX_BRIDGE_SCRIPT = `
         });
     }
 
-    function refresh(forceUsage) {
-      syncFullBleedWorkspace();
+    function refresh(forceUsage, isBackgroundPoll) {
+      var isHiddenBackgroundPoll =
+        Boolean(isBackgroundPoll) ||
+        (typeof document !== 'undefined' &&
+          document.visibilityState === 'hidden');
+      if (!isHiddenBackgroundPoll) {
+        syncFullBleedWorkspace();
+      }
       var wantForcedUsage = Boolean(forceUsage);
       if (inFlightRefresh) {
         pendingFollowUpRefresh = true;
         if (wantForcedUsage) {
           pendingForcedUsageRefresh = true;
         }
+        if (isHiddenBackgroundPoll && !wantForcedUsage) {
+          pendingBackgroundFollowUp = true;
+        } else {
+          pendingBackgroundFollowUp = false;
+        }
         return inFlightRefresh;
       }
       var didForceUsageThisRun = wantForcedUsage || pendingForcedUsageRefresh;
       pendingFollowUpRefresh = false;
       pendingForcedUsageRefresh = false;
+      pendingBackgroundFollowUp = false;
+      var runToken = ++activeRefreshToken;
+      inFlightRefreshStartedAtMs = Date.now();
 
       inFlightRefresh = getClientWithMetadata()
         .then(function(ctx) {
-          if (!ctx) {
+          if (!ctx || isStopped || runToken !== activeRefreshToken) {
             return null;
           }
           var listReq = new ctx.proto.ListInstancesRequest();
@@ -1930,6 +2016,9 @@ export const INBOX_BRIDGE_SCRIPT = `
             INSTANCE_RPC_TIMEOUT_MS,
             'ListInstances timeout'
           ).then(function(listRes) {
+            if (isStopped || runToken !== activeRefreshToken) {
+              return null;
+            }
             var rawList =
               listRes && typeof listRes.getInstancesList === 'function'
                 ? listRes.getInstancesList() || []
@@ -2011,10 +2100,6 @@ export const INBOX_BRIDGE_SCRIPT = `
                 } else {
                   usageCandidates.push(candidateEntry);
                 }
-
-                var isHiddenBackgroundPoll =
-                  typeof document !== 'undefined' &&
-                  document.visibilityState === 'hidden';
 
                 var cascadeTrajJob = callProxyJson(ctx, uuid, GET_TRAJECTORIES_PATH, '{}')
                   .then(function(parsed) {
@@ -2209,35 +2294,49 @@ export const INBOX_BRIDGE_SCRIPT = `
             var usageJob = fetchUsageFromCandidates(
               ctx,
               usageCandidates,
-              didForceUsageThisRun
+              didForceUsageThisRun,
+              isHiddenBackgroundPoll
             );
 
             return instancesPromise.then(function(instancesPayload) {
+              if (isStopped || runToken !== activeRefreshToken) {
+                return;
+              }
               lastInstancesPayloadCache = instancesPayload;
 
               return new Promise(function(resolveSnapshot) {
                 var emittedInitialSnapshot = false;
-                var inlineBudgetTimer = setTimeout(function() {
-                  if (emittedInitialSnapshot || isStopped) return;
-                  emittedInitialSnapshot = true;
-                  var fallbackRoute = parseRouteFromLocation();
-                  postToNative({
-                    type: 'AGY_INBOX_SNAPSHOT',
-                    fetchedAtMs: Date.now(),
-                    activeUrl: window.location.href,
-                    activeInstanceUuid: fallbackRoute.instanceUuid,
-                    activeCascadeId: fallbackRoute.cascadeId,
-                    instances: instancesPayload,
-                    cloudTrajectories: cloudTrajectoriesCache,
-                    usage: lastUsageCache,
-                    error: null
-                  });
-                  resolveSnapshot();
-                }, USAGE_INLINE_BUDGET_MS);
+                var inlineBudgetTimer = isHiddenBackgroundPoll
+                  ? null
+                  : setTimeout(function() {
+                      if (
+                        emittedInitialSnapshot ||
+                        isStopped ||
+                        runToken !== activeRefreshToken
+                      ) {
+                        return;
+                      }
+                      emittedInitialSnapshot = true;
+                      var fallbackRoute = parseRouteFromLocation();
+                      postToNative({
+                        type: 'AGY_INBOX_SNAPSHOT',
+                        fetchedAtMs: Date.now(),
+                        activeUrl: window.location.href,
+                        activeInstanceUuid: fallbackRoute.instanceUuid,
+                        activeCascadeId: fallbackRoute.cascadeId,
+                        instances: instancesPayload,
+                        cloudTrajectories: cloudTrajectoriesCache,
+                        usage: lastUsageCache,
+                        error: null
+                      });
+                      resolveSnapshot();
+                    }, USAGE_INLINE_BUDGET_MS);
 
                 usageJob.then(function(usagePayload) {
-                  clearTimeout(inlineBudgetTimer);
-                  if (isStopped) {
+                  if (inlineBudgetTimer) {
+                    clearTimeout(inlineBudgetTimer);
+                  }
+                  if (isStopped || runToken !== activeRefreshToken) {
                     if (!emittedInitialSnapshot) {
                       emittedInitialSnapshot = true;
                       resolveSnapshot();
@@ -2280,6 +2379,9 @@ export const INBOX_BRIDGE_SCRIPT = `
           });
         })
         .catch(function(err) {
+          if (isStopped || runToken !== activeRefreshToken) {
+            return;
+          }
           var latestRoute = parseRouteFromLocation();
           postToNative({
             type: 'AGY_INBOX_SNAPSHOT',
@@ -2287,17 +2389,28 @@ export const INBOX_BRIDGE_SCRIPT = `
             activeUrl: window.location.href,
             activeInstanceUuid: latestRoute.instanceUuid,
             activeCascadeId: latestRoute.cascadeId,
-            instances: [],
+            instances:
+              lastInstancesPayloadCache.length > 0
+                ? lastInstancesPayloadCache
+                : [],
             cloudTrajectories: cloudTrajectoriesCache,
             usage: lastUsageCache,
             error: err && err.message ? String(err.message) : 'Unable to query Antigravity instances'
           });
         })
         .then(function() {
+          if (runToken !== activeRefreshToken) {
+            return;
+          }
           inFlightRefresh = null;
+          inFlightRefreshStartedAtMs = 0;
+          if (isHiddenBackgroundPoll) {
+            lastBackgroundRefreshCompletedAtMs = Date.now();
+          }
           if (isStopped) {
             pendingFollowUpRefresh = false;
             pendingForcedUsageRefresh = false;
+            pendingBackgroundFollowUp = false;
             return;
           }
           if (
@@ -2306,14 +2419,58 @@ export const INBOX_BRIDGE_SCRIPT = `
           ) {
             var nextForceUsage =
               pendingForcedUsageRefresh && !didForceUsageThisRun;
+            var nextIsBg = pendingBackgroundFollowUp && !nextForceUsage;
             pendingFollowUpRefresh = false;
             pendingForcedUsageRefresh = false;
-            return refresh(nextForceUsage);
+            pendingBackgroundFollowUp = false;
+            return refresh(nextForceUsage, nextIsBg);
           }
           pendingForcedUsageRefresh = false;
+          pendingBackgroundFollowUp = false;
         });
 
       return inFlightRefresh;
+    }
+
+    function backgroundTick(minGapMs) {
+      if (isStopped) {
+        return Promise.resolve(null);
+      }
+      var now = Date.now();
+      flushExpiredRpcDeadlines(now);
+
+      if (inFlightRefresh) {
+        if (
+          inFlightRefreshStartedAtMs > 0 &&
+          now - inFlightRefreshStartedAtMs >= STALE_INFLIGHT_REFRESH_MS
+        ) {
+          // Supersede a stalled in-flight refresh whose Blink setTimeout may
+          // have been throttled while the phone was locked.
+          activeRefreshToken += 1;
+          inFlightRefresh = null;
+          inFlightRefreshStartedAtMs = 0;
+          pendingFollowUpRefresh = false;
+          pendingForcedUsageRefresh = false;
+          pendingBackgroundFollowUp = false;
+        } else {
+          return inFlightRefresh;
+        }
+      }
+
+      var effectiveMinGap =
+        typeof minGapMs === 'number' && minGapMs >= 0
+          ? minGapMs
+          : BACKGROUND_TICK_MIN_GAP_MS;
+      if (
+        effectiveMinGap > 0 &&
+        lastBackgroundRefreshCompletedAtMs > 0 &&
+        now - lastBackgroundRefreshCompletedAtMs < effectiveMinGap
+      ) {
+        return Promise.resolve(null);
+      }
+
+      installHooks();
+      return refresh(false, true);
     }
 
     function scheduleRefresh(delayMs) {
@@ -3956,7 +4113,19 @@ export const INBOX_BRIDGE_SCRIPT = `
             title: typeof notif[1] === 'string' ? notif[1] : null,
             body: typeof notif[2] === 'string' ? notif[2] : null
           });
-          scheduleRefresh(300);
+          if (
+            document &&
+            document.visibilityState === 'hidden' &&
+            window.__agyKeepAliveLockDesired
+          ) {
+            Promise.resolve().then(function() {
+              if (!isStopped) {
+                refresh(false, true);
+              }
+            });
+          } else {
+            scheduleRefresh(300);
+          }
         }
 
         // Field 18 (index 17): FAVICON_BADGE_CHANGE
@@ -3965,7 +4134,19 @@ export const INBOX_BRIDGE_SCRIPT = `
             type: 'AGY_INBOX_REALTIME_HINT',
             reason: 'badge'
           });
-          scheduleRefresh(350);
+          if (
+            document &&
+            document.visibilityState === 'hidden' &&
+            window.__agyKeepAliveLockDesired
+          ) {
+            Promise.resolve().then(function() {
+              if (!isStopped) {
+                refresh(false, true);
+              }
+            });
+          } else {
+            scheduleRefresh(350);
+          }
         }
       } catch (_) {}
     });
@@ -4040,7 +4221,14 @@ export const INBOX_BRIDGE_SCRIPT = `
     });
 
     var pollId = setInterval(function() {
-      if (document.visibilityState === 'hidden' && !window.__agyKeepAliveLockDesired) {
+      if (document.visibilityState === 'hidden') {
+        if (!window.__agyKeepAliveLockDesired) {
+          return;
+        }
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+          return;
+        }
+        backgroundTick(BACKGROUND_TICK_MIN_GAP_MS);
         return;
       }
       if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
@@ -4063,6 +4251,7 @@ export const INBOX_BRIDGE_SCRIPT = `
     window.__agyInboxBridge = {
       installHooks: installHooks,
       refresh: refresh,
+      backgroundTick: backgroundTick,
       scheduleRefresh: scheduleRefresh,
       markThreadRead: markThreadRead,
       fastNavigate: fastNavigate,
@@ -4076,6 +4265,8 @@ export const INBOX_BRIDGE_SCRIPT = `
       syncActiveThreadContext: syncActiveThreadContext,
       stop: function() {
         isStopped = true;
+        activeRefreshToken += 1;
+        pendingRpcDeadlines = [];
         activeThreadContext = null;
         clearPendingFastNav();
         clearPendingStartNav();

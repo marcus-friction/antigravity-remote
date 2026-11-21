@@ -26,14 +26,15 @@ class RemoteKeepAliveService : Service() {
   private var wakeLock: PowerManager.WakeLock? = null
   private var deadlineElapsedRealtimeMs: Long = 0L
 
-  private val deadlineCheckRunnable = object : Runnable {
+  private val keepAliveTickRunnable = object : Runnable {
     override fun run() {
       val remainingMs = deadlineElapsedRealtimeMs - SystemClock.elapsedRealtime()
       if (remainingMs <= 0L) {
         notifyKeepAliveEnded(stoppedByUser = false)
         stopKeepAliveAndSelf()
       } else {
-        handler.postDelayed(this, minOf(remainingMs, DEADLINE_CHECK_INTERVAL_MS))
+        notifyKeepAlivePollTick()
+        handler.postDelayed(this, minOf(remainingMs, POLL_INTERVAL_MS))
       }
     }
   }
@@ -71,12 +72,13 @@ class RemoteKeepAliveService : Service() {
       return START_NOT_STICKY
     }
 
+    isRunning = true
     deadlineElapsedRealtimeMs = SystemClock.elapsedRealtime() + durationMs
     acquireBoundedWakeLock(durationMs)
-    handler.removeCallbacks(deadlineCheckRunnable)
+    handler.removeCallbacks(keepAliveTickRunnable)
     handler.postDelayed(
-      deadlineCheckRunnable,
-      minOf(durationMs, DEADLINE_CHECK_INTERVAL_MS)
+      keepAliveTickRunnable,
+      minOf(durationMs, POLL_INTERVAL_MS)
     )
 
     return START_NOT_STICKY
@@ -99,13 +101,15 @@ class RemoteKeepAliveService : Service() {
   }
 
   override fun onDestroy() {
-    handler.removeCallbacks(deadlineCheckRunnable)
+    isRunning = false
+    handler.removeCallbacks(keepAliveTickRunnable)
     releaseWakeLock()
     super.onDestroy()
   }
 
   private fun stopKeepAliveAndSelf() {
-    handler.removeCallbacks(deadlineCheckRunnable)
+    isRunning = false
+    handler.removeCallbacks(keepAliveTickRunnable)
     releaseWakeLock()
     try {
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -159,7 +163,7 @@ class RemoteKeepAliveService : Service() {
       "Background Session Keep-Alive",
       NotificationManager.IMPORTANCE_LOW
     ).apply {
-      description = "Keeps active Antigravity Remote connections open while multitasking."
+      description = "Keeps active Antigravity Remote sessions open and checks for alerts in the background."
       setShowBadge(false)
     }
     manager.createNotificationChannel(channel)
@@ -204,7 +208,7 @@ class RemoteKeepAliveService : Service() {
     builder
       .setSmallIcon(R.drawable.ic_stat_keep_alive)
       .setContentTitle("Antigravity Remote connected")
-      .setContentText("Keeping session open in background (up to ${durationMinutes}m)")
+      .setContentText("Keeping session awake & checking for alerts (up to ${durationMinutes}m)")
       .setOngoing(true)
       .setOnlyAlertOnce(true)
       .setCategory(Notification.CATEGORY_SERVICE)
@@ -222,13 +226,19 @@ class RemoteKeepAliveService : Service() {
     private const val NOTIFICATION_ID = 4201
     private const val DEFAULT_MINUTES = 30
     private const val MAX_MINUTES = 60
-    private const val DEADLINE_CHECK_INTERVAL_MS = 60_000L
+    private const val POLL_INTERVAL_MS = 20_000L
     const val ACTION_STOP_KEEP_ALIVE = "expo.modules.remotesession.STOP_KEEP_ALIVE"
     const val EXTRA_DURATION_MINUTES = "duration_minutes"
+
+    @Volatile
+    var isRunning: Boolean = false
+      private set
 
     private val listenerLock = Any()
     private var listenerOwner: Any? = null
     private var onKeepAliveEndedListener: ((Boolean) -> Unit)? = null
+    private var pollListenerOwner: Any? = null
+    private var onKeepAlivePollTickListener: (() -> Unit)? = null
 
     fun registerKeepAliveEndedListener(owner: Any, listener: (stoppedByUser: Boolean) -> Unit) {
       synchronized(listenerLock) {
@@ -246,9 +256,30 @@ class RemoteKeepAliveService : Service() {
       }
     }
 
+    fun registerKeepAlivePollListener(owner: Any, listener: () -> Unit) {
+      synchronized(listenerLock) {
+        pollListenerOwner = owner
+        onKeepAlivePollTickListener = listener
+      }
+    }
+
+    fun unregisterKeepAlivePollListener(owner: Any) {
+      synchronized(listenerLock) {
+        if (pollListenerOwner === owner) {
+          pollListenerOwner = null
+          onKeepAlivePollTickListener = null
+        }
+      }
+    }
+
     private fun notifyKeepAliveEnded(stoppedByUser: Boolean) {
       val callback = synchronized(listenerLock) { onKeepAliveEndedListener }
       callback?.invoke(stoppedByUser)
+    }
+
+    private fun notifyKeepAlivePollTick() {
+      val callback = synchronized(listenerLock) { onKeepAlivePollTickListener }
+      callback?.invoke()
     }
 
     fun start(context: Context, durationMinutes: Int): Boolean {

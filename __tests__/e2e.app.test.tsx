@@ -4716,4 +4716,141 @@ describe('Session and navigation regressions', () => {
     }
   });
 
+  it('pushes proactive lock-screen notifications immediately on background snapshot arrival without waiting for UI frame commits, and preserves active alerts across transient network errors', async () => {
+    const RNPlatform = require('react-native').Platform;
+    RNPlatform.OS = 'android';
+    RNPlatform.Version = 34;
+
+    mockCookieStore.set('https://antigravity.google.com', {
+      SID: { name: 'SID', value: 'lock-screen-sid', domain: '.google.com' },
+    });
+    await navigate(
+      'https://antigravity.google.com/r/workstation-1?p=c%2Flock-thread-1',
+      false,
+    );
+
+    const startIso = new Date(Date.now() - 90_000).toISOString();
+    const waitIso = new Date(Date.now() - 5_000).toISOString();
+
+    // 1. Thread starts running in foreground, then phone locks (`AppState` -> 'background')
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Flock-thread-1',
+          data: JSON.stringify({
+            type: 'AGY_INBOX_SNAPSHOT',
+            fetchedAtMs: Date.now(),
+            activeUrl:
+              'https://antigravity.google.com/r/workstation-1?p=c%2Flock-thread-1',
+            activeInstanceUuid: 'workstation-1',
+            activeCascadeId: 'lock-thread-1',
+            instances: [
+              {
+                uuid: 'workstation-1',
+                name: 'Primary Box',
+                status: 1,
+                trajectories: {
+                  trajectorySummaries: {
+                    'lock-thread-1': {
+                      summary: 'Run production migration',
+                      status: 'CASCADE_RUN_STATUS_RUNNING',
+                      notFullyIdle: true,
+                      lastUserInputTime: startIso,
+                      lastModifiedTime: startIso,
+                    },
+                  },
+                },
+              },
+            ],
+          }),
+        },
+      });
+    });
+
+    await act(async () => {
+      for (const listener of mockAppStateListeners) {
+        listener('background');
+      }
+    });
+
+    (syncNativeActionNotification as jest.Mock).mockClear();
+    (clearNativeActionNotification as jest.Mock).mockClear();
+
+    // 2. While phone is locked, native background heartbeat delivers a snapshot where
+    //    `lock-thread-1` asks for command approval. Verify `syncNativeActionNotification`
+    //    is invoked SYNCHRONOUSLY inside `onMessage` before React flushes passive effects,
+    //    and is NOT double-posted once `act()` completes!
+    const approvalPayload = {
+      type: 'AGY_INBOX_SNAPSHOT',
+      fetchedAtMs: Date.now(),
+      activeUrl:
+        'https://antigravity.google.com/r/workstation-1?p=c%2Flock-thread-1',
+      activeInstanceUuid: 'workstation-1',
+      activeCascadeId: 'lock-thread-1',
+      instances: [
+        {
+          uuid: 'workstation-1',
+          name: 'Primary Box',
+          status: 1,
+          trajectories: {
+            trajectorySummaries: {
+              'lock-thread-1': {
+                summary: 'Run production migration',
+                status: 'CASCADE_RUN_STATUS_WAITING_FOR_USER',
+                waitingSteps: [
+                  { step: { runCommand: { commandLine: 'psql -f prod.sql' } } },
+                ],
+                lastUserInputTime: startIso,
+                lastModifiedTime: waitIso,
+              },
+            },
+          },
+        },
+      ],
+    };
+
+    let syncCallsBeforeReactFlush = 0;
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Flock-thread-1',
+          data: JSON.stringify(approvalPayload),
+        },
+      });
+      syncCallsBeforeReactFlush = (syncNativeActionNotification as jest.Mock)
+        .mock.calls.length;
+    });
+
+    expect(syncCallsBeforeReactFlush).toBe(1);
+    expect(syncNativeActionNotification).toHaveBeenCalledTimes(1);
+    expect(syncNativeActionNotification).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        count: 1,
+        title: '1 action open • Primary Box',
+        body: 'Run production migration — Approve command: psql -f prod.sql',
+        deepLinkUrl:
+          'antigravity-remote://r/workstation-1?p=c%2Flock-thread-1',
+        shouldAlert: true,
+      }),
+    );
+
+    // 3. A transient background poll error snapshot preserving cached instances
+    //    must NOT cancel the lock-screen notification or cause a duplicate re-chime.
+    (syncNativeActionNotification as jest.Mock).mockClear();
+    (clearNativeActionNotification as jest.Mock).mockClear();
+    await act(async () => {
+      webView().props.onMessage({
+        nativeEvent: {
+          url: 'https://antigravity.google.com/r/workstation-1?p=c%2Flock-thread-1',
+          data: JSON.stringify({
+            ...approvalPayload,
+            fetchedAtMs: Date.now() + 20_000,
+            error: 'ListInstances timeout',
+          }),
+        },
+      });
+    });
+    expect(clearNativeActionNotification).not.toHaveBeenCalled();
+    expect(syncNativeActionNotification).not.toHaveBeenCalled();
+  });
 });

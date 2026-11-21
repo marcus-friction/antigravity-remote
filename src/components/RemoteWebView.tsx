@@ -519,6 +519,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     reason: 'signout' | 'recovery';
     attempt: number;
   } | null>(null);
+  const isResetRequestRef = useRef<boolean>(false);
+  isResetRequestRef.current = Boolean(resetRequest);
   const [resetError, setResetError] = useState<string | null>(null);
   const [initializationError, setInitializationError] = useState(false);
   const [initializationAttempt, setInitializationAttempt] = useState(0);
@@ -635,7 +637,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       const isAuthenticatedAtLaunch =
         restoredCount > 0 && sessionSignature.length > 0;
       wasAuthenticatedRef.current = isAuthenticatedAtLaunch;
-      setStage(isAuthenticatedAtLaunch ? 'authenticated' : 'authenticating');
+      const initialStage: AuthFlowStage = isAuthenticatedAtLaunch
+        ? 'authenticated'
+        : 'authenticating';
+      stageRef.current = initialStage;
+      setStage(initialStage);
       // Antigravity's native web sidebar is hidden inside the WebView:
       // - On tablet screens, open our native docked sidebar by default whenever authenticated.
       // - On phones, open it automatically on non-thread overview routes (no cascadeId) so
@@ -836,6 +842,67 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     };
   }, [clearInboxTimers]);
 
+  const syncActionNotificationFromState = useCallback(
+    (
+      snapshot: InboxSnapshot,
+      overrides?: {
+        stage?: AuthFlowStage;
+        mode?: ActionNotificationMode;
+        isAppForeground?: boolean;
+        isDrawerOpen?: boolean;
+        isTabletLayout?: boolean;
+      },
+    ) => {
+      if (
+        !hydratedRef.current ||
+        isResettingSessionRef.current ||
+        isResetRequestRef.current
+      ) {
+        return;
+      }
+      const effectiveStage = overrides?.stage ?? stageRef.current;
+      const effectiveMode = overrides?.mode ?? actionNotificationModeRef.current;
+      if (
+        effectiveStage === 'authenticated' &&
+        effectiveMode !== 'off' &&
+        snapshot.fetchedAtMs === 0
+      ) {
+        return;
+      }
+      const effectiveForeground =
+        overrides?.isAppForeground ?? isAppForegroundRef.current;
+      const effectiveDrawerOpen =
+        overrides?.isDrawerOpen ?? isDrawerOpenRef.current;
+      const effectiveTablet =
+        overrides?.isTabletLayout ?? isTabletLayoutRef.current;
+      const isDrawerBlockingWebView = effectiveDrawerOpen && !effectiveTablet;
+
+      const syncResult = buildActionNotificationSyncState({
+        stage: effectiveStage,
+        mode: effectiveMode,
+        threads: snapshot.threads,
+        isAppForeground: effectiveForeground,
+        isDrawerOpen: isDrawerBlockingWebView,
+        isDrawerVisible: effectiveDrawerOpen,
+        previousOpenThreadIds: previousOpenActionIdsRef.current,
+      });
+      previousOpenActionIdsRef.current = syncResult.openThreadIds;
+
+      if (syncResult.signature === lastActionNotifSigRef.current) {
+        return;
+      }
+      lastActionNotifSigRef.current = syncResult.signature;
+
+      if (!syncResult.notification) {
+        void clearNativeActionNotification?.();
+        return;
+      }
+
+      void syncNativeActionNotification?.(syncResult.notification);
+    },
+    [],
+  );
+
   const recomputeSnapshotWithLocalState = useCallback(
     (overrides?: {
       activeInstanceUuid?: string | null;
@@ -843,60 +910,63 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       isAppForeground?: boolean;
       isDrawerOpen?: boolean;
     }) => {
-      setInboxSnapshot((previous) => {
-        const effectiveActiveInstanceUuid =
-          overrides && 'activeInstanceUuid' in overrides
-            ? (overrides.activeInstanceUuid ?? null)
-            : previous.activeInstanceUuid;
-        const effectiveActiveCascadeId =
-          overrides && 'activeCascadeId' in overrides
-            ? (overrides.activeCascadeId ?? null)
-            : previous.activeCascadeId;
-        const effectiveForeground =
-          overrides?.isAppForeground ?? isAppForegroundRef.current;
-        const effectiveDrawerOpen =
-          (overrides?.isDrawerOpen ?? isDrawerOpenRef.current) &&
-          !isTabletLayoutRef.current;
+      const previous = inboxSnapshotRef.current;
+      const effectiveActiveInstanceUuid =
+        overrides && 'activeInstanceUuid' in overrides
+          ? (overrides.activeInstanceUuid ?? null)
+          : previous.activeInstanceUuid;
+      const effectiveActiveCascadeId =
+        overrides && 'activeCascadeId' in overrides
+          ? (overrides.activeCascadeId ?? null)
+          : previous.activeCascadeId;
+      const effectiveForeground =
+        overrides?.isAppForeground ?? isAppForegroundRef.current;
+      const rawDrawerOpen = overrides?.isDrawerOpen ?? isDrawerOpenRef.current;
+      const effectiveDrawerOpen = rawDrawerOpen && !isTabletLayoutRef.current;
 
-        const rawMsg = lastSnapshotMessageRef.current;
-        if (rawMsg) {
-          return buildInboxSnapshot(
-            {
-              ...rawMsg,
-              activeInstanceUuid: effectiveActiveInstanceUuid,
-              activeCascadeId: effectiveActiveCascadeId,
-            },
-            locallyReadMapRef.current,
-            currentNavUrlRef.current,
-            effectiveForeground,
-            completedUnreadMapRef.current,
-            effectiveDrawerOpen,
-          );
-        }
-
-        if (previous.threads.length === 0) {
-          if (
-            previous.activeInstanceUuid === effectiveActiveInstanceUuid &&
-            previous.activeCascadeId === effectiveActiveCascadeId
-          ) {
-            return previous;
-          }
-          return {
-            ...previous,
+      let next: InboxSnapshot;
+      const rawMsg = lastSnapshotMessageRef.current;
+      if (rawMsg) {
+        next = buildInboxSnapshot(
+          {
+            ...rawMsg,
             activeInstanceUuid: effectiveActiveInstanceUuid,
             activeCascadeId: effectiveActiveCascadeId,
-          };
-        }
-        return applyLocalStateToSnapshot(previous, {
+          },
+          locallyReadMapRef.current,
+          currentNavUrlRef.current,
+          effectiveForeground,
+          completedUnreadMapRef.current,
+          effectiveDrawerOpen,
+        );
+      } else if (previous.threads.length === 0) {
+        next =
+          previous.activeInstanceUuid === effectiveActiveInstanceUuid &&
+          previous.activeCascadeId === effectiveActiveCascadeId
+            ? previous
+            : {
+                ...previous,
+                activeInstanceUuid: effectiveActiveInstanceUuid,
+                activeCascadeId: effectiveActiveCascadeId,
+              };
+      } else {
+        next = applyLocalStateToSnapshot(previous, {
           activeInstanceUuid: effectiveActiveInstanceUuid,
           activeCascadeId: effectiveActiveCascadeId,
           locallyReadAtByThreadId: locallyReadMapRef.current,
           isAppForeground: effectiveForeground,
           isDrawerOpen: effectiveDrawerOpen,
         });
+      }
+
+      inboxSnapshotRef.current = next;
+      setInboxSnapshot(next);
+      syncActionNotificationFromState(next, {
+        isAppForeground: effectiveForeground,
+        isDrawerOpen: rawDrawerOpen,
       });
     },
-    [],
+    [syncActionNotificationFromState],
   );
 
   const markThreadReadInWorkstationClock = useCallback(
@@ -1439,11 +1509,13 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       wasAuthenticatedRef.current = false;
       setIsDrawerOpen(false);
       setIsInboxRefreshing(false);
+      inboxSnapshotRef.current = EMPTY_INBOX_SNAPSHOT;
       setInboxSnapshot(EMPTY_INBOX_SNAPSHOT);
       setPendingThreadProject(null);
       activeThreadProjectRef.current = null;
       lastSyncedThreadProjectSigRef.current = null;
       setResetError(null);
+      isResetRequestRef.current = true;
       setResetRequest({ reason, attempt: 0 });
     },
     [clearInboxTimers],
@@ -1474,9 +1546,11 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           actionNotificationModeRef.current = DEFAULT_ACTION_NOTIFICATION_MODE;
         }
         setWebViewInstanceKey((prev) => prev + 1);
+        stageRef.current = 'authenticating';
         setStage('authenticating');
         isResettingSessionRef.current = false;
         resumeSessionPersistence();
+        isResetRequestRef.current = false;
         setResetRequest(null);
       })
       .catch(() => {
@@ -1547,6 +1621,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         return;
       }
       if (validation.isAuthHost) {
+        stageRef.current = 'authenticating';
         setStage('authenticating');
         if (!navState.loading) void checkPost2faSessionAndAdvance();
         return;
@@ -2255,47 +2330,23 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     if (!isHydrated || isResettingSessionRef.current || resetRequest) {
       return;
     }
-    if (
-      stage === 'authenticated' &&
-      actionNotificationMode !== 'off' &&
-      inboxSnapshot.fetchedAtMs === 0
-    ) {
-      return;
-    }
-
-    const isDrawerBlockingWebView = isDrawerOpen && !isTabletLayout;
-    const syncResult = buildActionNotificationSyncState({
+    syncActionNotificationFromState(inboxSnapshot, {
       stage,
       mode: actionNotificationMode,
-      threads: inboxSnapshot.threads,
       isAppForeground,
-      isDrawerOpen: isDrawerBlockingWebView,
-      isDrawerVisible: isDrawerOpen,
-      previousOpenThreadIds: previousOpenActionIdsRef.current,
+      isDrawerOpen,
+      isTabletLayout,
     });
-    previousOpenActionIdsRef.current = syncResult.openThreadIds;
-
-    if (syncResult.signature === lastActionNotifSigRef.current) {
-      return;
-    }
-    lastActionNotifSigRef.current = syncResult.signature;
-
-    if (!syncResult.notification) {
-      void clearNativeActionNotification?.();
-      return;
-    }
-
-    void syncNativeActionNotification?.(syncResult.notification);
   }, [
     actionNotificationMode,
-    inboxSnapshot.fetchedAtMs,
-    inboxSnapshot.threads,
+    inboxSnapshot,
     isAppForeground,
     isDrawerOpen,
     isHydrated,
     isTabletLayout,
     resetRequest,
     stage,
+    syncActionNotificationFromState,
   ]);
 
   const syncVerifiedActiveHostUrl = useCallback((rawActiveUrl?: string) => {
@@ -2440,6 +2491,12 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
             );
             markThreadReadInWorkstationClock(activeThread, 'none');
           }
+          inboxSnapshotRef.current = finalBuilt;
+          // Push OS notification immediately from the direct WebView message handler so
+          // proactive lock-screen alerts fire without waiting on paused React UI frames.
+          syncActionNotificationFromState(finalBuilt, {
+            isDrawerOpen: openedEmptyDrawer ? true : isDrawerOpenRef.current,
+          });
           setInboxSnapshot(finalBuilt);
           break;
         }
@@ -2524,8 +2581,10 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         }
 
         case 'AGY_INBOX_REALTIME_HINT': {
-          setIsInboxRefreshing(true);
-          armInboxRefreshTimeout();
+          if (isAppForegroundRef.current) {
+            setIsInboxRefreshing(true);
+            armInboxRefreshTimeout();
+          }
           break;
         }
 
@@ -2710,6 +2769,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       recomputeSnapshotWithLocalState,
       reconcilePendingThreadProject,
       recordActiveRouteForBackNavigation,
+      syncActionNotificationFromState,
       syncVerifiedActiveHostUrl,
     ],
   );
