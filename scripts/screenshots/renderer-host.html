@@ -1,0 +1,54 @@
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>html,body,iframe{margin:0;width:100%;height:100%;border:0;overflow:hidden;background:#161616;color-scheme:dark}</style>
+</head>
+<body>
+  <iframe id="app" src="/web/__RENDERER_VERSION__/?iframe=true&amp;hostTheme=dark"></iframe>
+  <script>
+    // This host supplies local RPC fixtures to the unmodified upstream iframe.
+    // It does not style or replace any of the Antigravity conversation UI.
+    const app = document.getElementById('app');
+    app.onload = () => {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = async event => {
+        const message = event.data;
+        if (!['unary', 'stream'].includes(message.kind)) return;
+        const result = await fetch('/sample/rpc?path=' + encodeURIComponent(message.path) + '&stream=' + (message.kind === 'stream')).then(response => {
+          if (!response.ok) throw new Error('Sample RPC failed: ' + message.path);
+          return response.arrayBuffer();
+        });
+        channel.port1.postMessage({ sessionId: message.sessionId, id: message.id, kind: 'data', chunk: new Uint8Array(result) });
+        if (message.kind === 'unary') channel.port1.postMessage({ sessionId: message.sessionId, id: message.id, kind: 'done' });
+      };
+      app.contentWindow.postMessage({
+        type: 'INITIAL_CONFIG', parentOrigin: location.origin, initialPath: '/c/workspace-search',
+        remoteControlVersion: 'v2', binaryUnaryEnabled: false, messagePortEnabled: true, portSessionId: 'local-sample',
+      }, location.origin, [channel.port2]);
+    };
+    const ready = setInterval(async () => {
+      const doc = app.contentDocument;
+      if (!doc) return;
+      // Complete the sample profile through the real upstream dialog control.
+      if (doc.querySelector('[data-testid="post-onboarding-terms-body"]')) {
+        [...doc.querySelectorAll('button')].find(button => button.textContent.trim() === 'Continue')?.click();
+        return;
+      }
+      if (!doc.body.innerText.includes('48 tests pass.') || !doc.body.innerText.includes('Gemini 4 Neon')) return;
+      // The native drawer already provides navigation. Close the web sidebar
+      // through its own control, as a user would, on wider tablet viewports.
+      const sidebar = doc.querySelector('[data-testid="sidebar-toggle"][aria-expanded="true"]');
+      if (sidebar) { sidebar.click(); return; }
+      const model = doc.querySelector('[data-testid="model-selector-trigger"]');
+      const bounds = model?.getBoundingClientRect();
+      if (!bounds || bounds.height === 0 || bounds.bottom > doc.documentElement.clientHeight + 1) return;
+      clearInterval(ready);
+      await doc.fonts.ready;
+      await new Promise(resolve => setTimeout(resolve, 500));
+      await fetch('/sample/ready', { method: 'POST' });
+      window.ReactNativeWebView?.postMessage('capture-ready');
+    }, 100);
+  </script>
+</body>
+</html>

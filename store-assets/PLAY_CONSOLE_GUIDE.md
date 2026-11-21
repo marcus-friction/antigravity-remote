@@ -13,8 +13,11 @@ Use the answers below to complete the mandatory **Monitor and improve → Policy
 | **Full description** (<= 4000 chars) | Copy from [`android/app/src/main/play/listings/en-US/full-description.txt`](../android/app/src/main/play/listings/en-US/full-description.txt) |
 | **App icon** (`512 x 512 px`) | Upload [`store-assets/play-icon-512.png`](./play-icon-512.png) |
 | **Feature graphic** (`1024 x 500 px`) | Upload [`store-assets/feature-graphic-1024x500.png`](./feature-graphic-1024x500.png) |
-| **Phone screenshots** (`1080 x 1920 px`) | Upload [`phone-1.png`](./screenshots/phone-1.png), [`phone-2.png`](./screenshots/phone-2.png), [`phone-3.png`](./screenshots/phone-3.png), [`phone-4.png`](./screenshots/phone-4.png) |
-| **7-inch & 10-inch tablet screenshots** (`1200 x 1920 px`) | Upload [`tablet-1.png`](./screenshots/tablet-1.png), [`tablet-2.png`](./screenshots/tablet-2.png) |
+| **Phone screenshots** (`1428 x 2856 px`) | Upload all six PNGs from [`phone-screenshots`](../android/app/src/main/play/listings/en-US/graphics/phone-screenshots): thread, Inbox, notifications, Projects, Usage, Settings |
+| **7-inch tablet screenshots** (`1728 x 1080 px`) | Upload all three PNGs from [`tablet-screenshots`](../android/app/src/main/play/listings/en-US/graphics/tablet-screenshots) |
+| **10-inch tablet screenshots** (`1920 x 1200 px`) | Upload all three PNGs from [`large-tablet-screenshots`](../android/app/src/main/play/listings/en-US/graphics/large-tablet-screenshots) |
+
+These are native Android captures with local sample data rendered by the unmodified upstream Antigravity thread UI. The unedited Pixel 10 Pro display-profile originals are [`1280 x 2856 px`](./screenshots/pixel-10-pro); Play exports add plain side gutters without resizing the app. Retake with `npm run capture:play-screenshots -- --build`, then export with `npm run generate:play-assets -- --screenshots-only`.
 
 ### Store Settings (`Grow users → Store presence → Store settings`)
 - **App or game**: `App`

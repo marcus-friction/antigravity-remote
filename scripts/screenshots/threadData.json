@@ -1,0 +1,284 @@
+{
+  "GetLocalUserInfo": {
+    "username": "demo",
+    "homeDirUri": "file:///home/demo",
+    "machineType": "linux"
+  },
+  "GetServerConfiguration": {
+    "config": {
+      "isJetski": true,
+      "standalone": true
+    }
+  },
+  "HasAuthToken": {
+    "hasToken": true
+  },
+  "GetUserStatus": {
+    "userStatus": {
+      "name": "Alex",
+      "email": "alex@example.com",
+      "pro": true,
+      "acceptedLatestTermsOfService": true,
+      "hasUsedAntigravity": true,
+      "disableTelemetry": true,
+      "userDataCollectionForceDisabled": true,
+      "cascadeModelConfigData": {
+        "clientModelConfigs": [
+          {
+            "label": "Gemini 4 Neon (High)",
+            "modelOrAlias": {
+              "alias": 8
+            },
+            "supportsImages": true,
+            "isRecommended": true,
+            "modelId": "gemini-4-neon-high"
+          }
+        ],
+        "defaultOverrideModelConfig": {
+          "modelOrAlias": {
+            "alias": 8
+          },
+          "versionId": "sample-current-model"
+        }
+      }
+    }
+  },
+  "JetboxSubscribeToState": {
+    "appState": {
+      "agentOnboardingCompleted": 2,
+      "sidebarWorkspacesMigrated": true,
+      "userConfigMigrated": true,
+      "productSkin": 1,
+      "postOnboarding": {
+        "completedSteps": [
+          1,
+          2,
+          3,
+          4
+        ]
+      }
+    },
+    "userConfig": {
+      "userSettings": {
+        "themeMode": 1
+      }
+    },
+    "state": {
+      "agentOnboardingCompleted": 2,
+      "postOnboarding": {
+        "completedSteps": [
+          1,
+          2,
+          3,
+          4
+        ]
+      },
+      "themeMode": 1
+    }
+  },
+  "JetboxSubscribeToSummaries": {
+    "updates": {
+      "workspace-search": {
+        "summary": "Add workspace search",
+        "trajectoryId": "workspace-search",
+        "stepCount": 5,
+        "status": 2,
+        "lastModifiedTime": "2026-11-21T10:24:00Z",
+        "createdTime": "2026-11-21T10:24:00Z",
+        "workspaces": [
+          {
+            "workspaceFolderAbsoluteUri": "file:///home/demo/projects/web-dashboard"
+          }
+        ]
+      }
+    }
+  },
+  "GetAllCascadeTrajectories": {
+    "trajectorySummaries": {
+      "workspace-search": {
+        "summary": "Add workspace search",
+        "trajectoryId": "workspace-search",
+        "stepCount": 5,
+        "status": 2,
+        "lastModifiedTime": "2026-11-21T10:24:00Z",
+        "createdTime": "2026-11-21T10:24:00Z",
+        "workspaces": [
+          {
+            "workspaceFolderAbsoluteUri": "file:///home/demo/projects/web-dashboard"
+          }
+        ]
+      }
+    }
+  },
+  "GetCascadeTrajectory": {
+    "trajectory": {
+      "trajectoryId": "workspace-search",
+      "cascadeId": "workspace-search",
+      "steps": [
+        {
+          "type": 14,
+          "status": 3,
+          "userInput": {
+            "userResponse": "Add search to the workspace. Show matching projects and conversations as I type.",
+            "items": [
+              {
+                "text": "Add search to the workspace. Show matching projects and conversations as I type."
+              }
+            ]
+          }
+        },
+        {
+          "type": 15,
+          "status": 3,
+          "plannerResponse": {
+            "response": "I\u2019ll connect search to both lists and group the results by project."
+          },
+          "metadata": {
+            "toolSummary": "Adding workspace search",
+            "createdAt": "2026-11-21T10:24:00Z"
+          }
+        },
+        {
+          "type": 8,
+          "status": 3,
+          "viewFile": {
+            "absolutePathUri": "file:///home/demo/projects/web-dashboard/src/components/WorkspaceSearch.tsx",
+            "startLine": 1,
+            "endLine": 42,
+            "numLines": 42,
+            "content": "export function WorkspaceSearch() {\n  return <SearchInput />;\n}"
+          }
+        },
+        {
+          "type": 21,
+          "status": 3,
+          "runCommand": {
+            "commandLine": "npm test -- --run",
+            "cwd": "/home/demo/projects/web-dashboard",
+            "exitCode": 0,
+            "stdout": "Test Files  6 passed (6)\nTests       48 passed (48)\nDuration    2.4s",
+            "combinedOutput": {
+              "full": "Test Files  6 passed (6)\nTests       48 passed (48)\nDuration    2.4s"
+            }
+          }
+        },
+        {
+          "type": 15,
+          "status": 3,
+          "plannerResponse": {
+            "response": "Search now filters projects and conversations.\n\n**48 tests pass.** Checking mobile layout\u2026"
+          }
+        }
+      ]
+    },
+    "status": 2,
+    "numTotalSteps": 5
+  },
+  "StreamAgentStateUpdates": {
+    "update": {
+      "conversationId": "workspace-search",
+      "trajectoryId": "workspace-search",
+      "status": 2,
+      "fullyIdle": false,
+      "mainTrajectoryUpdate": {
+        "stepsUpdate": {
+          "indices": [
+            0,
+            1,
+            2,
+            3,
+            4
+          ],
+          "steps": [
+            {
+              "type": 14,
+              "status": 3,
+              "userInput": {
+                "userResponse": "Add search to the workspace. Show matching projects and conversations as I type.",
+                "items": [
+                  {
+                    "text": "Add search to the workspace. Show matching projects and conversations as I type."
+                  }
+                ]
+              }
+            },
+            {
+              "type": 15,
+              "status": 3,
+              "plannerResponse": {
+                "response": "I\u2019ll connect search to both lists and group the results by project."
+              },
+              "metadata": {
+                "toolSummary": "Adding workspace search",
+                "createdAt": "2026-11-21T10:24:00Z"
+              }
+            },
+            {
+              "type": 8,
+              "status": 3,
+              "viewFile": {
+                "absolutePathUri": "file:///home/demo/projects/web-dashboard/src/components/WorkspaceSearch.tsx",
+                "startLine": 1,
+                "endLine": 42,
+                "numLines": 42,
+                "content": "export function WorkspaceSearch() {\n  return <SearchInput />;\n}"
+              }
+            },
+            {
+              "type": 21,
+              "status": 3,
+              "runCommand": {
+                "commandLine": "npm test -- --run",
+                "cwd": "/home/demo/projects/web-dashboard",
+                "exitCode": 0,
+                "stdout": "Test Files  6 passed (6)\nTests       48 passed (48)\nDuration    2.4s",
+                "combinedOutput": {
+                  "full": "Test Files  6 passed (6)\nTests       48 passed (48)\nDuration    2.4s"
+                }
+              }
+            },
+            {
+              "type": 15,
+              "status": 3,
+              "plannerResponse": {
+                "response": "Search now filters projects and conversations.\n\n**48 tests pass.** Checking mobile layout\u2026"
+              }
+            }
+          ],
+          "totalLength": 5
+        }
+      },
+      "turnsUpdate": {
+        "turns": [
+          {
+            "index": 0,
+            "startStepIndex": 0,
+            "startTime": "2026-11-21T10:24:00Z"
+          }
+        ],
+        "totalLength": 1
+      }
+    }
+  },
+  "GetAuthStatus": {
+    "authResult": {
+      "hasValidAuth": true,
+      "authMode": 1
+    }
+  },
+  "FetchUserInfo": {
+    "userSettings": {
+      "consumerTermsAccepted": true,
+      "gcpTermsAccepted": true,
+      "telemetryEnabled": false,
+      "userDataCollectionForceDisabled": true
+    }
+  },
+  "GetUserSettings": {
+    "userSettings": {
+      "lastSelectedCascadeModelOrAlias": {
+        "alias": 8
+      }
+    }
+  }
+}

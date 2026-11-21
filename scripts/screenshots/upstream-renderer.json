@@ -1,0 +1,10 @@
+{
+  "version": "1.0.20261121051938",
+  "url": "https://antigravity.static.usercontent.goog/web/1.0.20261121051938/",
+  "sha256": {
+    "main.js": "c80a2fc1b1a158464118ec3bb5daaf65e59dbede8e3ddde46128baa8c4b72e17",
+    "jetbox.css": "c1938159348c6986ab39baf0784812a973d28f321ec11a2445e780404118df20",
+    "compiled_tailwind.css": "ceb6532a3e6163475182dc62eef1fcf9856e8c32cb2a51f257d8c2a0f79f7ba8",
+    "prism_bundle.js": "2f72caa6baa9cd65c4cf72b923ce00821841911f995557645859c468f8eea94b"
+  }
+}

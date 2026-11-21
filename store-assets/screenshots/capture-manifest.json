@@ -1,0 +1,164 @@
+{
+  "capturedAt": "2026-11-21T11:15:00.459Z",
+  "method": "Android emulator / adb exec-out screencap -p",
+  "data": "Local sample RPC responses rendered by the unmodified upstream Antigravity Remote Control web UI. Drawer and notifications use production components.",
+  "upstreamRenderer": {
+    "version": "1.0.20261121051938",
+    "url": "https://antigravity.static.usercontent.goog/web/1.0.20261121051938/",
+    "sha256": {
+      "main.js": "c80a2fc1b1a158464118ec3bb5daaf65e59dbede8e3ddde46128baa8c4b72e17",
+      "jetbox.css": "c1938159348c6986ab39baf0784812a973d28f321ec11a2445e780404118df20",
+      "compiled_tailwind.css": "ceb6532a3e6163475182dc62eef1fcf9856e8c32cb2a51f257d8c2a0f79f7ba8",
+      "prism_bundle.js": "2f72caa6baa9cd65c4cf72b923ce00821841911f995557645859c468f8eea94b"
+    },
+    "assets": {
+      "index.html": "3c179e738dc8cc350774ad17f55aae864def28d437ca4a2be84deb1b44a4bbc1",
+      "main.js": "c80a2fc1b1a158464118ec3bb5daaf65e59dbede8e3ddde46128baa8c4b72e17",
+      "jetbox.css": "c1938159348c6986ab39baf0784812a973d28f321ec11a2445e780404118df20",
+      "compiled_tailwind.css": "ceb6532a3e6163475182dc62eef1fcf9856e8c32cb2a51f257d8c2a0f79f7ba8",
+      "prism_bundle.js": "2f72caa6baa9cd65c4cf72b923ce00821841911f995557645859c468f8eea94b"
+    }
+  },
+  "phone": {
+    "profile": "Pixel 10 Pro display configuration",
+    "width": 1280,
+    "height": 2856,
+    "densityDpi": 495,
+    "androidVersion": "16"
+  },
+  "apkSha256": "f8b10ff607698bc686b58a0659883d87458116f4ae71548546d0684c40ab81b5",
+  "sources": {
+    "src/components/LeftNavigationDrawer.tsx": "b32e35ce218cbb32e9f21a937f241237926d4efc6054d7734a3db87a32207cdc",
+    "src/constants/theme.ts": "ecf0274ca3d2a5ee1626fa656d66dd4ac9cdca9cf6986caa6b77011d858c81bb",
+    "modules/remote-session/android/src/main/java/expo/modules/remotesession/RemoteSessionModule.kt": "dcfb2ee7373817a3286aef92fa215058729c699bddf2789fabf86ac9e3ecf307",
+    "scripts/screenshots/CaptureApp.tsx": "608e650c616af8953dd1f7eadbfb27319ad4200da92989d62639383fd1b9b41a",
+    "scripts/screenshots/sampleData.ts": "7d4e4244fc16cb000365d7df9b2b517ef5fc50b306e32589713ee14b6708d686",
+    "scripts/screenshots/threadData.json": "96a77bc9b6f1d9e040f922b436be70182a8ec203bac09927cab535741ea4791c",
+    "scripts/screenshots/upstream-renderer.json": "744f65342c75effcaccb627eb43fe9da5832cc90de2d752280b1b02c03288b0d",
+    "scripts/screenshots/renderer-host.html": "c59300e2fda67294db613d57e31a74cdbca40d8eba53671aebf36e92dadca194",
+    "scripts/screenshots/renderer-server.js": "a93fc0d54ff77aadae80a3ce6f7dfc937b1d7b6d58ab2b41a7635b47158dda70",
+    "scripts/screenshots/protobuf-fixtures.js": "4af6f12f31c428772d481c90385278c7d284831bb4bf0fae912784b3ccee8688"
+  },
+  "captures": [
+    {
+      "file": "store-assets/screenshots/pixel-10-pro/1-thread.png",
+      "playPath": "phone-screenshots/1.png",
+      "width": 1280,
+      "height": 2856,
+      "playWidth": 1428,
+      "playHeight": 2856,
+      "profile": "Pixel 10 Pro display profile / Android 16",
+      "sha256": "47d15d9032b7d44026f01546c2d17da08e8f21bcf1f3d15fa877ca0db9e2d8ca"
+    },
+    {
+      "file": "store-assets/screenshots/pixel-10-pro/2-inbox.png",
+      "playPath": "phone-screenshots/2.png",
+      "width": 1280,
+      "height": 2856,
+      "playWidth": 1428,
+      "playHeight": 2856,
+      "profile": "Pixel 10 Pro display profile / Android 16",
+      "sha256": "07606f3e7d9dbc6446889c72a915a7939010b529564f9f664cfa89f751c957ac"
+    },
+    {
+      "file": "store-assets/screenshots/pixel-10-pro/3-notifications.png",
+      "playPath": "phone-screenshots/3.png",
+      "width": 1280,
+      "height": 2856,
+      "playWidth": 1428,
+      "playHeight": 2856,
+      "profile": "Pixel 10 Pro display profile / Android 16",
+      "sha256": "89cd9786fcdde569450811a574b472ed84e34e409b699db59a6344f2db92050e"
+    },
+    {
+      "file": "store-assets/screenshots/pixel-10-pro/4-projects.png",
+      "playPath": "phone-screenshots/4.png",
+      "width": 1280,
+      "height": 2856,
+      "playWidth": 1428,
+      "playHeight": 2856,
+      "profile": "Pixel 10 Pro display profile / Android 16",
+      "sha256": "a5efac513161134c57485faee8bc90ed155a005413d88698f69cac399136c896"
+    },
+    {
+      "file": "store-assets/screenshots/pixel-10-pro/5-usage.png",
+      "playPath": "phone-screenshots/5.png",
+      "width": 1280,
+      "height": 2856,
+      "playWidth": 1428,
+      "playHeight": 2856,
+      "profile": "Pixel 10 Pro display profile / Android 16",
+      "sha256": "11019885b5a5612eb8e178321968c9f6a2b1637ed2ef47a0288ac0dc58496331"
+    },
+    {
+      "file": "store-assets/screenshots/pixel-10-pro/6-settings.png",
+      "playPath": "phone-screenshots/6.png",
+      "width": 1280,
+      "height": 2856,
+      "playWidth": 1428,
+      "playHeight": 2856,
+      "profile": "Pixel 10 Pro display profile / Android 16",
+      "sha256": "c2404a02584d9896f87ed69d6ef068be701c4610d4bfbebd80bd6536d770c80a"
+    },
+    {
+      "file": "store-assets/screenshots/tablet-7/1-inbox.png",
+      "playPath": "tablet-screenshots/1.png",
+      "width": 1728,
+      "height": 1080,
+      "playWidth": 1728,
+      "playHeight": 1080,
+      "profile": "Android tablet viewport / 220 dpi",
+      "sha256": "999d51b0ca7c9c3d131f98312716aac66eaadb21fff5854fc596b59467900205"
+    },
+    {
+      "file": "store-assets/screenshots/tablet-7/2-projects.png",
+      "playPath": "tablet-screenshots/2.png",
+      "width": 1728,
+      "height": 1080,
+      "playWidth": 1728,
+      "playHeight": 1080,
+      "profile": "Android tablet viewport / 220 dpi",
+      "sha256": "77c776a088850e13cadf4d50771376f23de74395862596b9180a28473c2cc100"
+    },
+    {
+      "file": "store-assets/screenshots/tablet-7/3-usage.png",
+      "playPath": "tablet-screenshots/3.png",
+      "width": 1728,
+      "height": 1080,
+      "playWidth": 1728,
+      "playHeight": 1080,
+      "profile": "Android tablet viewport / 220 dpi",
+      "sha256": "0d080b78c3177cebd33cb3d6defd8997cdfc32a113ea2ec9361891c1e81b1779"
+    },
+    {
+      "file": "store-assets/screenshots/tablet-10/1-inbox.png",
+      "playPath": "large-tablet-screenshots/1.png",
+      "width": 1920,
+      "height": 1200,
+      "playWidth": 1920,
+      "playHeight": 1200,
+      "profile": "Android tablet viewport / 240 dpi",
+      "sha256": "456cfbd1bb998d65cc21c656b03d8201520f2d07e3d1f0d56a7d07a8e685fa6d"
+    },
+    {
+      "file": "store-assets/screenshots/tablet-10/2-projects.png",
+      "playPath": "large-tablet-screenshots/2.png",
+      "width": 1920,
+      "height": 1200,
+      "playWidth": 1920,
+      "playHeight": 1200,
+      "profile": "Android tablet viewport / 240 dpi",
+      "sha256": "bc9d84d952c95083b865ba1a99f08ccf057002a491c046843dc275bf8611d090"
+    },
+    {
+      "file": "store-assets/screenshots/tablet-10/3-usage.png",
+      "playPath": "large-tablet-screenshots/3.png",
+      "width": 1920,
+      "height": 1200,
+      "playWidth": 1920,
+      "playHeight": 1200,
+      "profile": "Android tablet viewport / 240 dpi",
+      "sha256": "9ed123589597a428b04b42e18084502a928a29d7c6b1b88ab6d542412400ef50"
+    }
+  ]
+}

@@ -2,12 +2,13 @@
 /**
  * Deterministic Google Play Store visual asset generator for Antigravity Remote.
  *
- * Uses local headless Chromium (zero external npm packages) to render pixel-exact
- * Onyx Dark UI screens matching `src/constants/theme.ts`, `LeftNavigationDrawer.tsx`,
- * and Android `RemoteViews` notification layouts, producing:
+ * Uses local headless Chromium for branding. Screenshots come from native Android
+ * captures with local sample data, recorded in store-assets/screenshots/capture-manifest.json.
+ * Pixel 10 Pro originals remain 1280x2856; Play exports add plain side gutters to
+ * satisfy the existing 2:1 store asset bounds without resizing the captured UI.
  *   - icon/play-icon-512.png                      (512x512)
  *   - feature-graphic/feature-graphic-1024x500.png (1024x500)
- *   - phone-screenshots/1.png .. 6.png            (1080x1920)
+ *   - phone-screenshots/1.png .. 6.png            (1428x2856)
  *   - tablet-screenshots/1.png .. 3.png           (1728x1080, 7-inch tablet)
  *   - large-tablet-screenshots/1.png .. 3.png     (1920x1200, 10-inch tablet)
  */
@@ -16,6 +17,7 @@
 const { execFileSync, spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 const ROOT = path.resolve(__dirname, '..');
 const GRAPHICS_DIR = path.join(
@@ -2165,11 +2167,39 @@ function buildAssetSpecs() {
       ),
     },
   ];
-  return specs;
+  const manifestPath = path.join(ROOT, 'store-assets/screenshots/capture-manifest.json');
+  if (!fs.existsSync(manifestPath)) {
+    throw new Error('Native screenshots are missing. Run npm run capture:play-screenshots first.');
+  }
+  const captured = new Map(JSON.parse(fs.readFileSync(manifestPath, 'utf8')).captures.map(item => [item.playPath, item]));
+  return specs.map(spec => {
+    if (!/(?:^|\/)(?:phone|tablet|large-tablet)-screenshots\//.test(spec.relPath)) return spec;
+    const item = captured.get(spec.relPath);
+    if (!item) throw new Error(`Missing native capture for ${spec.relPath}. Retake the screenshot set.`);
+    const sourcePath = path.join(ROOT, item.file);
+    const png = fs.readFileSync(sourcePath);
+    if (crypto.createHash('sha256').update(png).digest('hex') !== item.sha256) {
+      throw new Error(`Native screenshot checksum changed: ${item.file}`);
+    }
+    if (item.playWidth === item.width && item.playHeight === item.height) {
+      return { ...spec, width: item.width, height: item.height, copyFrom: sourcePath };
+    }
+    return {
+      ...spec, width: item.playWidth, height: item.playHeight,
+      html: `<!doctype html><html><head><style>*{box-sizing:border-box;margin:0}html,body{width:${item.playWidth}px;height:${item.playHeight}px;overflow:hidden;background:#0B0B0E}body{display:flex;justify-content:center}img{display:block;flex-shrink:0;width:${item.width}px;height:${item.height}px}</style></head><body><img src="data:image/png;base64,${png.toString('base64')}" alt="Native Android sample-data screenshot"></body></html>`,
+    };
+  });
 }
 
 function renderOne(chromeBin, tmpDir, spec, index) {
   return new Promise((resolve, reject) => {
+    if (spec.copyFrom) {
+      const outPath = spec.outPath || path.join(GRAPHICS_DIR, spec.relPath);
+      fs.mkdirSync(path.dirname(outPath), { recursive: true });
+      fs.copyFileSync(spec.copyFrom, outPath);
+      resolve({ relPath: spec.relPath, width: spec.width, height: spec.height, bytes: fs.statSync(outPath).size });
+      return;
+    }
     const htmlPath = path.join(tmpDir, `asset-${index}.html`);
     const outPath = path.join(GRAPHICS_DIR, spec.relPath);
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
@@ -2224,9 +2254,9 @@ function renderOne(chromeBin, tmpDir, spec, index) {
   });
 }
 
-async function generatePlayAssets() {
+async function generatePlayAssets(options = {}) {
   const chromeBin = findChromiumBinary();
-  const specs = buildAssetSpecs();
+  const specs = buildAssetSpecs().filter(spec => !options.screenshotsOnly || /(?:^|\/)(?:phone|tablet|large-tablet)-screenshots\//.test(spec.relPath));
 
   // Remove stale extra PNGs in managed graphic directories so Play Publisher
   // never uploads obsolete screenshots from earlier releases.
@@ -2273,7 +2303,7 @@ async function generatePlayAssets() {
 module.exports = { generatePlayAssets, buildAssetSpecs };
 
 if (require.main === module) {
-  generatePlayAssets().catch((err) => {
+  generatePlayAssets({ screenshotsOnly: process.argv.includes('--screenshots-only') }).catch((err) => {
     console.error(err);
     process.exit(1);
   });
