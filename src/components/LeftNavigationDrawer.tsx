@@ -53,6 +53,7 @@ import {
   extractAccountPathPrefix,
   formatRelativeTime,
   formatResetCountdown,
+  resolveThreadProjectName,
 } from '../utils/inboxParser';
 import { computeDrawerWidth } from '../utils/layout';
 import { parseHandoffInput } from '../utils/urlValidator';
@@ -266,6 +267,13 @@ const ProjectsNavIcon: React.FC<{ color: string }> = ({ color }) => (
       <View style={[styles.projectsIconTab, { borderColor: color }]} />
       <View style={[styles.projectsIconFolder, { borderColor: color }]} />
     </View>
+  </View>
+);
+
+const CompactFolderIcon: React.FC<{ color: string }> = ({ color }) => (
+  <View style={styles.cardProjectIconWrapper}>
+    <View style={[styles.cardProjectIconTab, { borderColor: color }]} />
+    <View style={[styles.cardProjectIconBody, { borderColor: color }]} />
   </View>
 );
 
@@ -1043,6 +1051,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
       return (
         thread.title.toLowerCase().includes(query) ||
         thread.instanceName.toLowerCase().includes(query) ||
+        (thread.projectName?.toLowerCase().includes(query) ?? false) ||
         (thread.workspaceName?.toLowerCase().includes(query) ?? false) ||
         thread.attentionReason.toLowerCase().includes(query)
       );
@@ -1564,6 +1573,9 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
           snapshot.activeCascadeId === thread.trajectoryId)) ||
       Boolean(activeUrl && activeUrl === thread.targetUrl);
     const isProjectVariant = variant === 'project';
+    const projectLabel = !isProjectVariant
+      ? resolveThreadProjectName(thread)
+      : null;
     const showReason =
       thread.needsAttention ||
       thread.attentionKind === 'running' ||
@@ -1625,6 +1637,15 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
           ) : null}
         </View>
 
+        {projectLabel ? (
+          <View style={styles.cardProjectRow} testID="inbox-card-project-row">
+            <CompactFolderIcon color={colors.textSecondary} />
+            <Text style={styles.cardProjectText} numberOfLines={1}>
+              {projectLabel}
+            </Text>
+          </View>
+        ) : null}
+
         <Text style={styles.threadTitle} numberOfLines={2}>
           {thread.title}
         </Text>
@@ -1658,9 +1679,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
           >
             {!isProjectVariant ? (
               <Text style={styles.metaText} numberOfLines={1}>
-                {thread.workspaceName
-                  ? `${thread.instanceName} • ${thread.workspaceName}`
-                  : thread.instanceName}
+                {thread.instanceName}
               </Text>
             ) : (
               <View style={styles.projectFooterSpacer} />
@@ -4633,6 +4652,40 @@ const styles = StyleSheet.create({
     color: colors.textMuted,
     fontSize: 10.5,
     fontWeight: '500',
+  },
+  cardProjectRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    marginBottom: 2,
+  },
+  cardProjectIconWrapper: {
+    width: 11,
+    height: 10,
+    justifyContent: 'flex-end',
+  },
+  cardProjectIconTab: {
+    width: 5,
+    height: 2.5,
+    borderTopLeftRadius: 1.5,
+    borderTopRightRadius: 1.5,
+    borderWidth: 1.2,
+    borderBottomWidth: 0,
+    marginBottom: -0.8,
+  },
+  cardProjectIconBody: {
+    width: 11,
+    height: 8,
+    borderRadius: 1.8,
+    borderWidth: 1.2,
+  },
+  cardProjectText: {
+    flex: 1,
+    color: colors.textSecondary,
+    fontSize: 11,
+    fontWeight: '600',
+    lineHeight: 14,
+    letterSpacing: 0.1,
   },
   threadTitle: {
     color: colors.textPrimary,

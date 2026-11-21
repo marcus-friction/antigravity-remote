@@ -7,6 +7,10 @@ export interface ActionNotificationThreadItem {
   attentionKind: InboxAttentionKind;
   statusLabel: string;
   attentionReason: string;
+  /** Resolved project name shown as a folder eyebrow above the title (mirrors thread header & Inbox cards). */
+  projectName?: string | null;
+  /** Workstation display name (e.g., `Primary Box`). */
+  instanceName?: string | null;
   subtitle: string;
   deepLinkUrl: string;
 }

@@ -2409,6 +2409,8 @@ describe('inboxParser', () => {
         attentionKind: 'approval',
         statusLabel: 'NEEDS APPROVAL',
         attentionReason: 'Approve command: prisma migrate deploy',
+        projectName: 'backend-api',
+        instanceName: 'Mac Studio',
         subtitle: 'Mac Studio • backend-api',
         deepLinkUrl: 'antigravity-remote://r/box-1?p=c%2Fc-1',
       },
@@ -2418,12 +2420,14 @@ describe('inboxParser', () => {
         attentionKind: 'unread',
         statusLabel: 'FINISHED',
         attentionReason: 'Finished — unread updates',
+        projectName: 'frontend',
+        instanceName: 'Mac Studio',
         subtitle: 'Mac Studio • frontend',
         deepLinkUrl: 'antigravity-remote://r/box-1?p=c%2Fc-2',
       },
     ]);
-    expect(sync.notification!.expandedBody).toContain('🟠 NEEDS APPROVAL');
-    expect(sync.notification!.expandedBody).toContain('🔵 FINISHED');
+    expect(sync.notification!.expandedBody).toContain('🟠 NEEDS APPROVAL · Mac Studio\n📁 backend-api\nDeploy database migration');
+    expect(sync.notification!.expandedBody).toContain('🔵 FINISHED · Mac Studio\n📁 frontend\nRun unit tests');
   });
 
   it('resolves the active thread project across server projects, workspaces, subagents, URL params, and pending new chats', () => {
@@ -3968,5 +3972,88 @@ describe('inboxParser', () => {
       projectId: 'proj-worktree',
       projectName: 'Mobile App',
     });
+
+    // Every thread in Inbox snapshot carries its resolved server projectName (even when workspaceName differs or is absent)
+    const subdirThread = snapshot.threads.find((t) => t.cascadeId === 'chat-subdir');
+    const topIdThread = snapshot.threads.find((t) => t.cascadeId === 'chat-top-id');
+    const winThread = snapshot.threads.find((t) => t.cascadeId === 'chat-win');
+    expect(subdirThread?.projectName).toBe('Mobile App');
+    expect(subdirThread?.projectId).toBe('proj-worktree');
+    expect(topIdThread?.projectName).toBe('Top Level ID Project');
+    expect(winThread?.projectName).toBe('Windows Service');
+  });
+
+  it('prefers server-resolved projectName over raw workspace folder name in action notifications', () => {
+    const rawMsg = parseInboxBridgeMessage(
+      JSON.stringify({
+        type: 'AGY_INBOX_SNAPSHOT',
+        fetchedAtMs: 1_774_000_000_000,
+        activeUrl: 'https://antigravity.google.com/r/dev-box',
+        instances: [
+          {
+            uuid: 'dev-box',
+            name: 'Mac Studio',
+            status: 1,
+            projects: [
+              {
+                id: 'proj-remote',
+                name: 'Antigravity Remote',
+                projectResources: {
+                  resources: [
+                    { folderUri: 'file:///home/marcus/projects/antigravity-remote' },
+                  ],
+                },
+              },
+            ],
+            trajectories: {
+              trajectorySummaries: {
+                'chat-approval': {
+                  summary: 'Ship tablet layout',
+                  status: 'CASCADE_RUN_STATUS_WAITING_FOR_USER',
+                  waitingSteps: [
+                    { step: { runCommand: { commandLine: 'npm test' } } },
+                  ],
+                  trajectoryMetadata: { projectId: 'proj-remote' },
+                  workspaces: [
+                    {
+                      workspaceFolderAbsoluteUri:
+                        'file:///home/marcus/projects/antigravity-remote/android',
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(rawMsg?.type).toBe('AGY_INBOX_SNAPSHOT');
+    if (rawMsg?.type !== 'AGY_INBOX_SNAPSHOT') return;
+
+    const snapshot = buildInboxSnapshot(rawMsg);
+    expect(snapshot.threads[0].workspaceName).toBe('android');
+    expect(snapshot.threads[0].projectName).toBe('Antigravity Remote');
+
+    const notifSync = buildActionNotificationSyncState({
+      stage: 'authenticated',
+      mode: 'all_attention',
+      threads: snapshot.threads,
+      isAppForeground: false,
+      isDrawerOpen: false,
+      previousOpenThreadIds: new Set(),
+    });
+
+    expect(notifSync.notification?.items).toEqual([
+      expect.objectContaining({
+        id: 'dev-box:chat-approval',
+        projectName: 'Antigravity Remote',
+        instanceName: 'Mac Studio',
+        subtitle: 'Mac Studio • Antigravity Remote',
+      }),
+    ]);
+    expect(notifSync.notification?.expandedBody).toBe(
+      '🟠 NEEDS APPROVAL · Mac Studio\n📁 Antigravity Remote\nShip tablet layout — Approve command: npm test',
+    );
   });
 });

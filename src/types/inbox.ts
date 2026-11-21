@@ -45,6 +45,8 @@ export interface InboxThreadItem {
   trajectoryId: string;
   title: string;
   projectId?: string | null;
+  /** Resolved Antigravity project display name (server Project name or workspace folder fallback). */
+  projectName?: string | null;
   workspaceName: string | null;
   workspaceUri?: string | null;
   /** All distinct workspace / git-root URIs associated with this conversation (for project matching). */

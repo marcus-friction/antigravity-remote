@@ -108,6 +108,8 @@ public class RemoteSessionModule: Module {
     let attentionKind: String
     let statusLabel: String
     let attentionReason: String
+    let projectName: String
+    let instanceName: String
     let subtitle: String
   }
 
@@ -136,12 +138,16 @@ public class RemoteSessionModule: Module {
         }
       }
       let reason = (dict["attentionReason"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+      let projectName = (dict["projectName"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+      let instanceName = (dict["instanceName"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
       let subtitle = (dict["subtitle"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
       items.append(ActionCardItem(
         title: title,
         attentionKind: kind,
         statusLabel: statusLabel,
         attentionReason: reason,
+        projectName: projectName,
+        instanceName: instanceName,
         subtitle: subtitle
       ))
     }
@@ -201,18 +207,44 @@ public class RemoteSessionModule: Module {
     }
   }
 
+  private func drawFolderIcon(in rect: CGRect, color: UIColor) {
+    let sx = rect.width / 16.0
+    let sy = rect.height / 16.0
+    func pt(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+      CGPoint(x: rect.minX + x * sx, y: rect.minY + y * sy)
+    }
+    let path = UIBezierPath()
+    path.move(to: pt(2.0, 4.5))
+    path.addQuadCurve(to: pt(3.5, 3.0), controlPoint: pt(2.0, 3.0))
+    path.addLine(to: pt(6.2, 3.0))
+    path.addLine(to: pt(7.7, 4.7))
+    path.addLine(to: pt(12.5, 4.7))
+    path.addQuadCurve(to: pt(14.0, 6.2), controlPoint: pt(14.0, 4.7))
+    path.addLine(to: pt(14.0, 11.5))
+    path.addQuadCurve(to: pt(12.5, 13.0), controlPoint: pt(14.0, 13.0))
+    path.addLine(to: pt(3.5, 13.0))
+    path.addQuadCurve(to: pt(2.0, 11.5), controlPoint: pt(2.0, 13.0))
+    path.close()
+    path.lineWidth = 1.25
+    path.lineCapStyle = .round
+    path.lineJoinStyle = .round
+    color.setStroke()
+    path.stroke()
+  }
+
   private func renderCardsAttachment(items: [ActionCardItem], totalCount: Int) -> UNNotificationAttachment? {
     let rendered = Array(items.prefix(3))
     guard !rendered.isEmpty else { return nil }
 
     let width: CGFloat = 340
     let pad: CGFloat = 10
-    let cardHeight: CGFloat = 68
     let cardGap: CGFloat = 7
+    let cardHeights = rendered.map { $0.projectName.isEmpty ? CGFloat(68) : CGFloat(82) }
     let remaining = max(0, totalCount - rendered.count)
     let footerHeight: CGFloat = remaining > 0 ? 22 : 0
+    let totalCardsHeight = cardHeights.reduce(0, +)
     let totalHeight = pad * 2
-      + CGFloat(rendered.count) * cardHeight
+      + totalCardsHeight
       + CGFloat(max(0, rendered.count - 1)) * cardGap
       + footerHeight
 
@@ -232,8 +264,11 @@ public class RemoteSessionModule: Module {
       rightParagraph.alignment = .right
       rightParagraph.lineBreakMode = .byTruncatingTail
 
+      let projectColor = UIColor(red: 0.737, green: 0.741, blue: 0.776, alpha: 1.0)
+
       var y = pad
-      for item in rendered {
+      for (index, item) in rendered.enumerated() {
+        let cardHeight = cardHeights[index]
         let palette = cardPalette(for: item.attentionKind)
         let cardRect = CGRect(x: pad, y: y, width: width - pad * 2, height: cardHeight)
         let cardPath = UIBezierPath(roundedRect: cardRect, cornerRadius: 10)
@@ -272,7 +307,8 @@ public class RemoteSessionModule: Module {
           withAttributes: badgeAttrs
         )
 
-        if !item.subtitle.isEmpty {
+        let rightMeta = item.projectName.isEmpty ? item.subtitle : item.instanceName
+        if !rightMeta.isEmpty {
           let subX = badgeRect.maxX + 6
           let subWidth = max(0, cardRect.maxX - subX - 10)
           if subWidth > 20 {
@@ -281,11 +317,27 @@ public class RemoteSessionModule: Module {
               .foregroundColor: UIColor(red: 0.529, green: 0.533, blue: 0.561, alpha: 1.0),
               .paragraphStyle: rightParagraph,
             ]
-            (item.subtitle as NSString).draw(
+            (rightMeta as NSString).draw(
               in: CGRect(x: subX, y: cardRect.minY + 9, width: subWidth, height: 13),
               withAttributes: subAttrs
             )
           }
+        }
+
+        var nextY = cardRect.minY + 27
+        if !item.projectName.isEmpty {
+          let iconRect = CGRect(x: contentX, y: nextY + 1, width: 11, height: 11)
+          drawFolderIcon(in: iconRect, color: projectColor)
+          let projAttrs: [NSAttributedString.Key: Any] = [
+            .font: UIFont.systemFont(ofSize: 10.5, weight: .semibold),
+            .foregroundColor: projectColor,
+            .paragraphStyle: truncatingParagraph,
+          ]
+          (item.projectName as NSString).draw(
+            in: CGRect(x: contentX + 15, y: nextY, width: max(0, contentWidth - 15), height: 14),
+            withAttributes: projAttrs
+          )
+          nextY += 15
         }
 
         let titleAttrs: [NSAttributedString.Key: Any] = [
@@ -294,7 +346,7 @@ public class RemoteSessionModule: Module {
           .paragraphStyle: truncatingParagraph,
         ]
         (item.title as NSString).draw(
-          in: CGRect(x: contentX, y: cardRect.minY + 27, width: contentWidth, height: 16),
+          in: CGRect(x: contentX, y: nextY, width: contentWidth, height: 16),
           withAttributes: titleAttrs
         )
 
@@ -304,7 +356,7 @@ public class RemoteSessionModule: Module {
           .paragraphStyle: truncatingParagraph,
         ]
         (item.attentionReason as NSString).draw(
-          in: CGRect(x: contentX, y: cardRect.minY + 46, width: contentWidth, height: 15),
+          in: CGRect(x: contentX, y: nextY + 19, width: contentWidth, height: 15),
           withAttributes: reasonAttrs
         )
 
@@ -344,6 +396,11 @@ public class RemoteSessionModule: Module {
 
   private func buildNotificationSubtitle(items: [ActionCardItem], totalCount: Int) -> String {
     if totalCount == 1, let first = items.first {
+      if !first.projectName.isEmpty {
+        return first.instanceName.isEmpty
+          ? "\(first.statusLabel) · 📁 \(first.projectName)"
+          : "\(first.statusLabel) · 📁 \(first.projectName) · \(first.instanceName)"
+      }
       return first.subtitle.isEmpty ? first.statusLabel : "\(first.statusLabel) · \(first.subtitle)"
     }
     var approvals = 0

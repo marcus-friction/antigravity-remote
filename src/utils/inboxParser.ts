@@ -2605,6 +2605,47 @@ export function buildInboxSnapshot(
     );
   }
 
+  if (allProjects.length > 0 || allThreads.length > 0) {
+    const projectsByInstance = new Map<
+      string,
+      {
+        nonArchived: InboxServerProject[];
+        archived: InboxServerProject[];
+      }
+    >();
+    for (const proj of allProjects) {
+      let bucket = projectsByInstance.get(proj.instanceUuid);
+      if (!bucket) {
+        bucket = { nonArchived: [], archived: [] };
+        projectsByInstance.set(proj.instanceUuid, bucket);
+      }
+      if (proj.archived) {
+        bucket.archived.push(proj);
+      } else {
+        bucket.nonArchived.push(proj);
+      }
+    }
+
+    for (const thread of allThreads) {
+      const instBucket = projectsByInstance.get(thread.instanceUuid);
+      const lookupIds = new Set<string>([thread.cascadeId, thread.trajectoryId]);
+      const matchedServerProject = instBucket
+        ? (matchServerProjectForThread(thread, instBucket.nonArchived, lookupIds) ??
+          matchServerProjectForThread(thread, instBucket.archived, lookupIds))
+        : undefined;
+      if (matchedServerProject) {
+        thread.projectName = truncateText(matchedServerProject.name, 72);
+        if (!thread.projectId && matchedServerProject.projectId) {
+          thread.projectId = matchedServerProject.projectId;
+        }
+      } else {
+        const fallbackLabel =
+          thread.workspaceName ?? extractLastSegmentFromUri(thread.workspaceUri);
+        thread.projectName = fallbackLabel ? truncateText(fallbackLabel, 72) : null;
+      }
+    }
+  }
+
   allThreads.sort((a, b) => {
     const priorityDiff =
       ATTENTION_PRIORITY[a.attentionKind] - ATTENTION_PRIORITY[b.attentionKind];
@@ -3274,6 +3315,148 @@ export function buildProjectGroups(
   return groups;
 }
 
+/**
+ * Returns the concise project display label for a thread (preferring the
+ * server-resolved `projectName`, then workspace folder name / URI basename).
+ */
+export function resolveThreadProjectName(
+  thread: Pick<InboxThreadItem, 'projectName' | 'workspaceName' | 'workspaceUri'>,
+): string | null {
+  if (typeof thread.projectName === 'string' && thread.projectName.trim()) {
+    return truncateText(thread.projectName, 72);
+  }
+  if (typeof thread.workspaceName === 'string' && thread.workspaceName.trim()) {
+    return truncateText(thread.workspaceName, 72);
+  }
+  const fromUri = extractLastSegmentFromUri(thread.workspaceUri);
+  return fromUri ? truncateText(fromUri, 72) : null;
+}
+
+function matchServerProjectForThread(
+  resolvedThread: InboxThreadItem | undefined,
+  projects: readonly InboxServerProject[],
+  lookupIds: ReadonlySet<string>,
+): InboxServerProject | undefined {
+  if (projects.length === 0) {
+    return undefined;
+  }
+  if (resolvedThread?.projectId) {
+    const byProjectId = projects.find(
+      (proj) => proj.projectId === resolvedThread.projectId,
+    );
+    if (byProjectId) {
+      return byProjectId;
+    }
+  }
+  const byConversationId = projects.find((proj) =>
+    proj.conversationIds.some((cid) => lookupIds.has(cid)),
+  );
+  if (byConversationId) {
+    return byConversationId;
+  }
+  const threadUriKeys: string[] = [];
+  const candidateThreadUris =
+    resolvedThread?.workspaceUris && resolvedThread.workspaceUris.length > 0
+      ? resolvedThread.workspaceUris
+      : resolvedThread?.workspaceUri
+        ? [resolvedThread.workspaceUri]
+        : [];
+  for (const rawUri of candidateThreadUris) {
+    const key = normalizeWorkspaceUriKey(rawUri);
+    if (key && !threadUriKeys.includes(key)) {
+      threadUriKeys.push(key);
+    }
+  }
+  if (threadUriKeys.length > 0) {
+    for (const targetUriKey of threadUriKeys) {
+      const byWorkspaceUri = projects.find((proj) =>
+        proj.workspaceUris.some(
+          (uri) => normalizeWorkspaceUriKey(uri) === targetUriKey,
+        ),
+      );
+      if (byWorkspaceUri) {
+        return byWorkspaceUri;
+      }
+    }
+    let bestLength = 0;
+    let bestMatches: InboxServerProject[] = [];
+    for (const targetUriKey of threadUriKeys) {
+      if (!targetUriKey.startsWith('/')) continue;
+      for (const proj of projects) {
+        for (const uri of proj.workspaceUris) {
+          const projKey = normalizeWorkspaceUriKey(uri);
+          if (
+            !projKey ||
+            !projKey.startsWith('/') ||
+            getCanonicalPathSegmentCount(projKey) < 2
+          ) {
+            continue;
+          }
+          if (
+            targetUriKey.length > projKey.length &&
+            targetUriKey.startsWith(`${projKey}/`)
+          ) {
+            if (projKey.length > bestLength) {
+              bestLength = projKey.length;
+              bestMatches = [proj];
+            } else if (
+              projKey.length === bestLength &&
+              !bestMatches.includes(proj)
+            ) {
+              bestMatches.push(proj);
+            }
+          }
+        }
+      }
+    }
+    if (bestMatches.length === 1) {
+      return bestMatches[0];
+    }
+  }
+  const candidateNames: string[] = [];
+  if (resolvedThread?.workspaceName && resolvedThread.workspaceName.trim()) {
+    candidateNames.push(resolvedThread.workspaceName.trim());
+  }
+  for (const rawUri of candidateThreadUris) {
+    const seg = extractLastSegmentFromUri(rawUri);
+    if (seg && !candidateNames.includes(seg)) {
+      candidateNames.push(seg);
+    }
+  }
+  for (const candName of candidateNames) {
+    const targetName = candName.toLowerCase();
+    const nameMatches = projects.filter((proj) => {
+      if (proj.name.trim().toLowerCase() === targetName) {
+        return true;
+      }
+      return proj.workspaceUris.some((uri) => {
+        const seg = extractLastSegmentFromUri(uri);
+        return seg ? seg.trim().toLowerCase() === targetName : false;
+      });
+    });
+    if (nameMatches.length === 1) {
+      return nameMatches[0];
+    }
+  }
+  for (const candName of candidateNames) {
+    const targetSlug = normalizeProjectSlugKey(candName);
+    if (!targetSlug) continue;
+    const slugMatches = projects.filter((proj) => {
+      if (normalizeProjectSlugKey(proj.name) === targetSlug) {
+        return true;
+      }
+      return proj.workspaceUris.some((uri) => {
+        const seg = extractLastSegmentFromUri(uri);
+        return seg ? normalizeProjectSlugKey(seg) === targetSlug : false;
+      });
+    });
+    if (slugMatches.length === 1) {
+      return slugMatches[0];
+    }
+  }
+  return undefined;
+}
+
 export interface PendingThreadProjectFallback {
   instanceUuid: string;
   cascadeId: string | null;
@@ -3340,132 +3523,9 @@ export function resolveActiveThreadProject(
   const nonArchivedProjects = instanceProjects.filter((proj) => !proj.archived);
   const archivedProjects = instanceProjects.filter((proj) => proj.archived);
 
-  const matchProjectForThread = (
-    projects: readonly InboxServerProject[],
-  ): InboxServerProject | undefined => {
-    if (projects.length === 0) {
-      return undefined;
-    }
-    if (resolvedThread?.projectId) {
-      const byProjectId = projects.find(
-        (proj) => proj.projectId === resolvedThread.projectId,
-      );
-      if (byProjectId) {
-        return byProjectId;
-      }
-    }
-    const byConversationId = projects.find((proj) =>
-      proj.conversationIds.some((cid) => lookupIds.has(cid)),
-    );
-    if (byConversationId) {
-      return byConversationId;
-    }
-    const threadUriKeys: string[] = [];
-    const candidateThreadUris =
-      resolvedThread?.workspaceUris && resolvedThread.workspaceUris.length > 0
-        ? resolvedThread.workspaceUris
-        : resolvedThread?.workspaceUri
-          ? [resolvedThread.workspaceUri]
-          : [];
-    for (const rawUri of candidateThreadUris) {
-      const key = normalizeWorkspaceUriKey(rawUri);
-      if (key && !threadUriKeys.includes(key)) {
-        threadUriKeys.push(key);
-      }
-    }
-    if (threadUriKeys.length > 0) {
-      for (const targetUriKey of threadUriKeys) {
-        const byWorkspaceUri = projects.find((proj) =>
-          proj.workspaceUris.some(
-            (uri) => normalizeWorkspaceUriKey(uri) === targetUriKey,
-          ),
-        );
-        if (byWorkspaceUri) {
-          return byWorkspaceUri;
-        }
-      }
-      let bestLength = 0;
-      let bestMatches: InboxServerProject[] = [];
-      for (const targetUriKey of threadUriKeys) {
-        if (!targetUriKey.startsWith('/')) continue;
-        for (const proj of projects) {
-          for (const uri of proj.workspaceUris) {
-            const projKey = normalizeWorkspaceUriKey(uri);
-            if (
-              !projKey ||
-              !projKey.startsWith('/') ||
-              getCanonicalPathSegmentCount(projKey) < 2
-            ) {
-              continue;
-            }
-            if (
-              targetUriKey.length > projKey.length &&
-              targetUriKey.startsWith(`${projKey}/`)
-            ) {
-              if (projKey.length > bestLength) {
-                bestLength = projKey.length;
-                bestMatches = [proj];
-              } else if (
-                projKey.length === bestLength &&
-                !bestMatches.includes(proj)
-              ) {
-                bestMatches.push(proj);
-              }
-            }
-          }
-        }
-      }
-      if (bestMatches.length === 1) {
-        return bestMatches[0];
-      }
-    }
-    const candidateNames: string[] = [];
-    if (resolvedThread?.workspaceName && resolvedThread.workspaceName.trim()) {
-      candidateNames.push(resolvedThread.workspaceName.trim());
-    }
-    for (const rawUri of candidateThreadUris) {
-      const seg = extractLastSegmentFromUri(rawUri);
-      if (seg && !candidateNames.includes(seg)) {
-        candidateNames.push(seg);
-      }
-    }
-    for (const candName of candidateNames) {
-      const targetName = candName.toLowerCase();
-      const nameMatches = projects.filter((proj) => {
-        if (proj.name.trim().toLowerCase() === targetName) {
-          return true;
-        }
-        return proj.workspaceUris.some((uri) => {
-          const seg = extractLastSegmentFromUri(uri);
-          return seg ? seg.trim().toLowerCase() === targetName : false;
-        });
-      });
-      if (nameMatches.length === 1) {
-        return nameMatches[0];
-      }
-    }
-    for (const candName of candidateNames) {
-      const targetSlug = normalizeProjectSlugKey(candName);
-      if (!targetSlug) continue;
-      const slugMatches = projects.filter((proj) => {
-        if (normalizeProjectSlugKey(proj.name) === targetSlug) {
-          return true;
-        }
-        return proj.workspaceUris.some((uri) => {
-          const seg = extractLastSegmentFromUri(uri);
-          return seg ? normalizeProjectSlugKey(seg) === targetSlug : false;
-        });
-      });
-      if (slugMatches.length === 1) {
-        return slugMatches[0];
-      }
-    }
-    return undefined;
-  };
-
   let matchedServerProject =
-    matchProjectForThread(nonArchivedProjects) ??
-    matchProjectForThread(archivedProjects);
+    matchServerProjectForThread(resolvedThread, nonArchivedProjects, lookupIds) ??
+    matchServerProjectForThread(resolvedThread, archivedProjects, lookupIds);
 
   if (!matchedServerProject && options?.activeUrl) {
     const urlProjectId = extractProjectIdFromUrl(options.activeUrl);

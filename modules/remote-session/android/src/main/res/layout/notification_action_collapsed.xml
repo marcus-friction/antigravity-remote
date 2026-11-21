@@ -86,6 +86,35 @@
             android:gravity="center_vertical"
             android:orientation="horizontal">
 
+            <LinearLayout
+                android:id="@+id/notif_collapsed_project_row"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="6dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:visibility="gone">
+
+                <ImageView
+                    android:layout_width="10dp"
+                    android:layout_height="10dp"
+                    android:importantForAccessibility="no"
+                    android:src="@drawable/ic_notif_folder" />
+
+                <TextView
+                    android:id="@+id/notif_collapsed_project"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="3.5dp"
+                    android:ellipsize="end"
+                    android:includeFontPadding="false"
+                    android:maxEms="12"
+                    android:maxLines="1"
+                    android:textColor="#BCBDC6"
+                    android:textSize="10.5sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
             <TextView
                 android:id="@+id/notif_collapsed_reason"
                 android:layout_width="0dp"

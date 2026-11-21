@@ -6,6 +6,7 @@ import {
 } from '../services/webData';
 import { InboxAttentionKind, InboxThreadItem } from '../types/inbox';
 import { ActionNotificationMode, AuthFlowStage } from '../types/session';
+import { resolveThreadProjectName } from './inboxParser';
 
 const MAX_NOTIFICATION_CARDS = 4;
 
@@ -71,8 +72,10 @@ function buildThreadCardItem(
   thread: InboxThreadItem,
 ): ActionNotificationThreadItem {
   const visuals = getAttentionVisuals(thread.attentionKind);
-  const subtitle = thread.workspaceName
-    ? `${thread.instanceName} • ${thread.workspaceName}`
+  const projectName = resolveThreadProjectName(thread);
+  const instanceName = thread.instanceName || null;
+  const subtitle = projectName
+    ? `${thread.instanceName} • ${projectName}`
     : thread.instanceName;
   const deepLinkUrl =
     buildThreadNotificationDeepLink(thread.targetUrl) ?? ACTION_INBOX_DEEP_LINK;
@@ -83,6 +86,8 @@ function buildThreadCardItem(
     attentionKind: thread.attentionKind,
     statusLabel: visuals.label,
     attentionReason: thread.attentionReason,
+    projectName,
+    instanceName,
     subtitle,
     deepLinkUrl,
   };
@@ -90,7 +95,13 @@ function buildThreadCardItem(
 
 function formatFallbackCardBlock(item: ActionNotificationThreadItem): string {
   const badge = `${getNotificationStatusEmoji(item.attentionKind)} ${item.statusLabel}`;
-  const meta = item.subtitle ? ` · ${item.subtitle}` : '';
+  const hostLabel = item.projectName
+    ? item.instanceName || ''
+    : item.subtitle;
+  const meta = hostLabel ? ` · ${hostLabel}` : '';
+  if (item.projectName) {
+    return `${badge}${meta}\n📁 ${item.projectName}\n${item.title} — ${item.attentionReason}`;
+  }
   return `${badge}${meta}\n${item.title} — ${item.attentionReason}`;
 }
 
@@ -163,7 +174,7 @@ export function buildActionNotificationSyncState(params: {
   const itemsSig = items
     .map(
       (it) =>
-        `${it.id}:${it.attentionKind}:${it.title}:${it.attentionReason}:${it.subtitle}:${it.deepLinkUrl}`,
+        `${it.id}:${it.attentionKind}:${it.projectName ?? ''}:${it.instanceName ?? ''}:${it.title}:${it.attentionReason}:${it.subtitle}:${it.deepLinkUrl}`,
     )
     .join(';');
 

@@ -4102,5 +4102,163 @@ describe('Session and navigation regressions', () => {
         tree.unmount();
       });
     });
+
+    it('renders resolved project eyebrow on sidebar Inbox cards (mirroring thread header), supports project search, and mirrors it in OS notifications', async () => {
+      mockWindowDimensions = { width: 1024, height: 768 };
+
+      mockCookieStore.set('https://antigravity.google.com', {
+        SID: { name: 'SID', value: 'proj-card-sid', domain: '.google.com' },
+      });
+      await backupCookiesFromWebView();
+      await saveLastActiveUrl('https://antigravity.google.com/r/workstation-1');
+      mockCookieStore.clear();
+
+      let tree!: ReactTestRenderer;
+      await act(async () => {
+        tree = renderer.create(<App />);
+      });
+
+      const webView = () => tree.root.findByType('WebView' as any);
+      const controls = () => tree.root.findByType(LeftNavigationDrawer);
+
+      (syncNativeActionNotification as jest.Mock).mockClear();
+      await act(async () => {
+        webView().props.onMessage({
+          nativeEvent: {
+            url: 'https://antigravity.google.com/r/workstation-1',
+            data: JSON.stringify({
+              type: 'AGY_INBOX_SNAPSHOT',
+              fetchedAtMs: Date.now(),
+              activeUrl: 'https://antigravity.google.com/r/workstation-1',
+              activeInstanceUuid: 'workstation-1',
+              activeCascadeId: null,
+              instances: [
+                {
+                  uuid: 'workstation-1',
+                  name: 'Primary Box',
+                  status: 1,
+                  projects: [
+                    {
+                      id: 'proj-agy',
+                      name: 'Antigravity Remote',
+                      projectResources: {
+                        resources: [
+                          {
+                            folderUri:
+                              'file:///home/marcus/projects/antigravity-remote',
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                  trajectories: {
+                    trajectorySummaries: {
+                      'thread-proj-1': {
+                        summary: 'Polish notification cards',
+                        status: 'CASCADE_RUN_STATUS_WAITING_FOR_USER',
+                        waitingSteps: [
+                          {
+                            step: {
+                              runCommand: { commandLine: 'npm run typecheck' },
+                            },
+                          },
+                        ],
+                        trajectoryMetadata: { projectId: 'proj-agy' },
+                        lastModifiedTime: new Date().toISOString(),
+                      },
+                      'thread-standalone': {
+                        summary: 'Quick scratchpad note',
+                        status: 'CASCADE_RUN_STATUS_IDLE',
+                        lastModifiedTime: new Date(
+                          Date.now() - 10_000,
+                        ).toISOString(),
+                      },
+                    },
+                  },
+                },
+              ],
+            }),
+          },
+        });
+      });
+
+      // 1. Inbox card renders dedicated folder + project eyebrow above thread title (only for threads with a project)
+      const projectRows = tree.root
+        .findAllByType('View' as any)
+        .filter((n) => n.props.testID === 'inbox-card-project-row');
+      expect(projectRows).toHaveLength(1);
+      const eyebrowTexts = projectRows[0]
+        .findAllByType('Text' as any)
+        .map((n) => n.props.children);
+      expect(eyebrowTexts).toContain('Antigravity Remote');
+
+      // 2. Notification payload mirrors resolved projectName & instanceName
+      expect(syncNativeActionNotification).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          count: 1,
+          expandedBody:
+            '🟠 NEEDS APPROVAL · Primary Box\n📁 Antigravity Remote\nPolish notification cards — Approve command: npm run typecheck',
+          items: [
+            expect.objectContaining({
+              id: 'workstation-1:thread-proj-1',
+              projectName: 'Antigravity Remote',
+              instanceName: 'Primary Box',
+              subtitle: 'Primary Box • Antigravity Remote',
+            }),
+          ],
+        }),
+      );
+
+      // 3. Searching by server project name in Inbox filters to matching threads
+      const searchToggle = tree.root.find(
+        (n) => n.props.accessibilityLabel === 'Toggle thread search',
+      );
+      await act(async () => {
+        searchToggle.props.onPress();
+      });
+      const searchInput = tree.root.find(
+        (n) => n.props.accessibilityLabel === 'Filter Inbox threads',
+      );
+      await act(async () => {
+        searchInput.props.onChangeText('Antigravity Remote');
+      });
+      expect(
+        tree.root
+          .findAllByType('TouchableOpacity' as any)
+          .filter(
+            (n) =>
+              n.props.accessibilityLabel ===
+              'Open thread Polish notification cards',
+          ),
+      ).toHaveLength(1);
+      expect(
+        tree.root
+          .findAllByType('TouchableOpacity' as any)
+          .filter(
+            (n) =>
+              n.props.accessibilityLabel === 'Open thread Quick scratchpad note',
+          ),
+      ).toHaveLength(0);
+
+      // 4. Switching to Projects tab omits redundant per-card project eyebrows (since threads sit inside Project groups)
+      const projectsModeBtn = tree.root.find(
+        (n) => n.props.accessibilityLabel === 'Drawer mode Projects',
+      );
+      await act(async () => {
+        projectsModeBtn.props.onPress();
+      });
+      expect(
+        tree.root
+          .findAllByType('View' as any)
+          .filter((n) => n.props.testID === 'inbox-card-project-row'),
+      ).toHaveLength(0);
+      expect(controls().props.snapshot.threads[0].projectName).toBe(
+        'Antigravity Remote',
+      );
+
+      await act(async () => {
+        tree.unmount();
+      });
+    });
   });
 });

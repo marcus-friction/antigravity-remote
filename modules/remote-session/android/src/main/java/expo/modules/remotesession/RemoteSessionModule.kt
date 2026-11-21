@@ -43,6 +43,8 @@ class RemoteSessionModule : Module() {
     val attentionKind: String,
     val statusLabel: String,
     val attentionReason: String,
+    val projectName: String,
+    val instanceName: String,
     val subtitle: String,
     val deepLinkUrl: String
   )
@@ -359,6 +361,8 @@ class RemoteSessionModule : Module() {
           }
         }
         val reason = obj.optString("attentionReason", "").trim()
+        val projectName = if (obj.isNull("projectName")) "" else obj.optString("projectName", "").trim()
+        val instanceName = if (obj.isNull("instanceName")) "" else obj.optString("instanceName", "").trim()
         val subtitle = obj.optString("subtitle", "").trim()
         val link = obj.optString("deepLinkUrl", "").trim()
         result.add(
@@ -367,6 +371,8 @@ class RemoteSessionModule : Module() {
             attentionKind = kind,
             statusLabel = statusLabel,
             attentionReason = reason,
+            projectName = projectName,
+            instanceName = instanceName,
             subtitle = subtitle,
             deepLinkUrl = link
           )
@@ -450,6 +456,12 @@ class RemoteSessionModule : Module() {
       setTextViewText(R.id.notif_collapsed_badge, primaryItem.statusLabel)
       setTextColor(R.id.notif_collapsed_badge, style.badgeTextColor)
       setTextViewText(R.id.notif_collapsed_title, primaryItem.title)
+      if (primaryItem.projectName.isNotEmpty()) {
+        setTextViewText(R.id.notif_collapsed_project, primaryItem.projectName)
+        setViewVisibility(R.id.notif_collapsed_project_row, View.VISIBLE)
+      } else {
+        setViewVisibility(R.id.notif_collapsed_project_row, View.GONE)
+      }
       if (primaryItem.attentionReason.isNotEmpty()) {
         setTextViewText(R.id.notif_collapsed_reason, primaryItem.attentionReason)
         setTextColor(R.id.notif_collapsed_reason, style.reasonTextColor)
@@ -457,8 +469,9 @@ class RemoteSessionModule : Module() {
       } else {
         setViewVisibility(R.id.notif_collapsed_reason, View.GONE)
       }
-      if (primaryItem.subtitle.isNotEmpty()) {
-        setTextViewText(R.id.notif_collapsed_subtitle, primaryItem.subtitle)
+      val fallbackMeta = primaryItem.instanceName.ifEmpty { primaryItem.subtitle }
+      if (primaryItem.projectName.isEmpty() && fallbackMeta.isNotEmpty()) {
+        setTextViewText(R.id.notif_collapsed_subtitle, fallbackMeta)
         setViewVisibility(R.id.notif_collapsed_subtitle, View.VISIBLE)
       } else {
         setViewVisibility(R.id.notif_collapsed_subtitle, View.GONE)
@@ -496,6 +509,12 @@ class RemoteSessionModule : Module() {
         setInt(R.id.notif_card_badge, "setBackgroundResource", style.badgeBgRes)
         setTextViewText(R.id.notif_card_badge, item.statusLabel)
         setTextColor(R.id.notif_card_badge, style.badgeTextColor)
+        if (item.projectName.isNotEmpty()) {
+          setTextViewText(R.id.notif_card_project, item.projectName)
+          setViewVisibility(R.id.notif_card_project_row, View.VISIBLE)
+        } else {
+          setViewVisibility(R.id.notif_card_project_row, View.GONE)
+        }
         setTextViewText(R.id.notif_card_title, item.title)
         if (item.attentionReason.isNotEmpty()) {
           setTextViewText(R.id.notif_card_reason, item.attentionReason)
@@ -504,8 +523,13 @@ class RemoteSessionModule : Module() {
         } else {
           setViewVisibility(R.id.notif_card_reason, View.GONE)
         }
-        if (item.subtitle.isNotEmpty()) {
-          setTextViewText(R.id.notif_card_subtitle, item.subtitle)
+        val rightMeta = if (item.projectName.isNotEmpty()) {
+          item.instanceName
+        } else {
+          item.subtitle
+        }
+        if (rightMeta.isNotEmpty()) {
+          setTextViewText(R.id.notif_card_subtitle, rightMeta)
           setViewVisibility(R.id.notif_card_subtitle, View.VISIBLE)
         } else {
           setViewVisibility(R.id.notif_card_subtitle, View.GONE)
