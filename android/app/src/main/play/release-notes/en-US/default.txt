@@ -1,4 +1,3 @@
-• Keep updating thread status and proactively notifying while your screen is locked whenever keep-alive is active.
-• New Projects drawer with project-grouped conversations, folder browser & project creation, and thread project headers.
-• Docked side-by-side sidebar on tablets and foldables, plus automatic drawer opening when archiving leaves an empty screen.
-• Richer color-coded notification cards showing each thread's project name, plus reliability & session-auth fixes.
+• Added a first-launch Quick Intro Tour to explain navigation and let you choose Action Notifications, notification permission, and optional Background Keep-Alive (both Off by default, replayable in Settings).
+• Updated app icon with a distinct REMOTE badge and refined launcher & Play Store branding.
+• Includes Projects drawer, docked tablet/foldable sidebar, and opt-in locked-screen color-coded notification cards.

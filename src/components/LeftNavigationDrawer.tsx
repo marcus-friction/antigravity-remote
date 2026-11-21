@@ -124,6 +124,7 @@ export interface LeftNavigationDrawerProps {
   onChangeActionNotificationMode?: (mode: ActionNotificationMode) => void;
   onNavigateToUrl: (targetUrl: string) => void;
   onOpenHostSettings?: () => void;
+  onOpenIntroTour?: () => void;
   onReloadSession: () => void;
   onSignOut: () => void;
 }
@@ -355,6 +356,7 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
   onChangeActionNotificationMode,
   onNavigateToUrl,
   onOpenHostSettings,
+  onOpenIntroTour,
   onReloadSession,
   onSignOut,
 }) => {
@@ -3501,6 +3503,24 @@ export const LeftNavigationDrawer: React.FC<LeftNavigationDrawerProps> = ({
                         <Text style={styles.errorText}>{validationError}</Text>
                       ) : null}
                     </View>
+                  ) : null}
+                  {onOpenIntroTour ? (
+                    <TouchableOpacity
+                      style={styles.settingActionRow}
+                      onPress={() => {
+                        if (!docked) {
+                          handleClose();
+                        }
+                        onOpenIntroTour();
+                      }}
+                      accessibilityRole="button"
+                      accessibilityLabel="Open quick intro tour"
+                    >
+                      <Text style={styles.settingActionIcon}>✦</Text>
+                      <Text style={styles.settingActionText}>
+                        Quick Intro Tour &amp; Permissions
+                      </Text>
+                    </TouchableOpacity>
                   ) : null}
                 </View>
 

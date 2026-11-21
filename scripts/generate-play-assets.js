@@ -25,6 +25,7 @@ const GRAPHICS_DIR = path.join(
   'android/app/src/main/play/listings/en-US/graphics',
 );
 const APP_ICON_PATH = path.join(ROOT, 'assets/icon.png');
+const ADAPTIVE_ICON_PATH = path.join(ROOT, 'assets/adaptive-icon.png');
 
 const THEME = {
   canvas: '#0B0B0E',
@@ -101,9 +102,58 @@ function findChromiumBinary() {
   );
 }
 
-const ICON_DATA_URI = `data:image/png;base64,${fs
-  .readFileSync(APP_ICON_PATH)
-  .toString('base64')}`;
+function renderBrandIconSvg({ size = 512, transparentBg = false } = {}) {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 1024 1024">
+  <defs>
+    <radialGradient id="bgGlow" cx="30%" cy="22%" r="78%">
+      <stop offset="0%" stop-color="#223150"/>
+      <stop offset="48%" stop-color="#141821"/>
+      <stop offset="100%" stop-color="#0C0E13"/>
+    </radialGradient>
+    <linearGradient id="termFill" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1D2434"/>
+      <stop offset="100%" stop-color="#111520"/>
+    </linearGradient>
+    <linearGradient id="termStroke" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#8AB4F8" stop-opacity="0.72"/>
+      <stop offset="100%" stop-color="#2F71E3" stop-opacity="0.35"/>
+    </linearGradient>
+    <linearGradient id="pillFill" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#3B82F6"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="170%">
+      <feDropShadow dx="0" dy="18" stdDeviation="20" flood-color="#000000" flood-opacity="0.55"/>
+    </filter>
+  </defs>
+  ${transparentBg ? '' : '<rect width="1024" height="1024" fill="url(#bgGlow)"/>'}
+  <!-- Centered strictly within Android adaptive icon 66% safe circle (r=338 around 512,512) -->
+  <g filter="url(#softShadow)">
+    <!-- Remote Workstation Terminal Window -->
+    <rect x="224" y="256" width="444" height="316" rx="44" fill="url(#termFill)" stroke="url(#termStroke)" stroke-width="12"/>
+    <!-- Top window bar divider -->
+    <line x1="236" y1="334" x2="656" y2="334" stroke="#FFFFFF" stroke-opacity="0.10" stroke-width="4"/>
+    <!-- Semantic status dots (working / approval / accent) -->
+    <circle cx="280" cy="296" r="13.5" fill="#34D399"/>
+    <circle cx="322" cy="296" r="13.5" fill="#F59E0B"/>
+    <circle cx="364" cy="296" r="13.5" fill="#60A5FA"/>
+    <!-- Crisp >_ command prompt -->
+    <path d="M292 404 L368 452 L292 500" fill="none" stroke="#F8FAFC" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="398" y="482" width="124" height="28" rx="14" fill="#60A5FA"/>
+  </g>
+  <!-- Wireless Remote Broadcast Arcs (top-right, inside safe circle) -->
+  <g fill="none" stroke-linecap="round">
+    <path d="M684 294 A68 68 0 0 1 730 340" stroke="#93C5FD" stroke-width="19"/>
+    <path d="M700 246 A120 120 0 0 1 782 328" stroke="#60A5FA" stroke-width="19" stroke-opacity="0.9"/>
+    <path d="M716 198 A172 172 0 0 1 834 316" stroke="#3279F9" stroke-width="17" stroke-opacity="0.68"/>
+  </g>
+  <!-- Bold High-Contrast REMOTE Pill Badge -->
+  <g filter="url(#softShadow)">
+    <rect x="266" y="616" width="492" height="122" rx="61" fill="url(#pillFill)" stroke="#93C5FD" stroke-opacity="0.45" stroke-width="6"/>
+    <text x="512" y="700" text-anchor="middle" fill="#FFFFFF" font-family='"Noto Sans", "DejaVu Sans", "Liberation Sans", sans-serif' font-size="64" font-weight="800" letter-spacing="10">REMOTE</text>
+  </g>
+</svg>`;
+}
 
 const FONT_STACK =
   '"Noto Sans", "DejaVu Sans", "Liberation Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
@@ -138,7 +188,7 @@ const SVG_ICONS = {
   battery: () =>
     `<svg width="24" height="13" viewBox="0 0 24 13" fill="none"><rect x="0.8" y="1.2" width="19.5" height="10.6" rx="2.5" stroke="#F4F5F7" stroke-width="1.4"/><rect x="2.8" y="3.2" width="14.5" height="6.6" rx="1.2" fill="#F4F5F7"/><rect x="21.4" y="4.2" width="2" height="4.6" rx="1" fill="#F4F5F7"/></svg>`,
   agyMono: (size = 16, color = '#FFFFFF') =>
-    `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="${color}"><path d="M12 3.2C9.2 3.2 7.8 9.2 5.4 17.6C4.8 19.6 6.2 20.8 7.6 19.8C9.2 18.6 10.3 15.6 12 15.6C13.7 15.6 14.8 18.6 16.4 19.8C17.8 20.8 19.2 19.6 18.6 17.6C16.2 9.2 14.8 3.2 12 3.2Z"/></svg>`,
+    `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="${color}"><path d="M4,5C2.9,5 2,5.9 2,7v10c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2V7c0,-1.1 -0.9,-2 -2,-2H4zM4,7h16v10H4V7zM6.5,9.5L9.5,12L6.5,14.5L7.8,15.8L11.6,12L7.8,8.2L6.5,9.5zM12,14h5v1.8h-5V14z"/></svg>`,
   send: () =>
     `<svg width="17" height="17" viewBox="0 0 20 20" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 15.5V4.5"/><path d="M5.5 9L10 4.5L14.5 9"/></svg>`,
   terminal: (color = '#FDE68A') =>
@@ -1589,6 +1639,7 @@ function settingsDrawerHtml({ widthStyle }) {
               <div class="go-btn">Go</div>
             </div>
           </div>
+          <div class="action-row"><span style="color:${THEME.primaryText};font-size:16px;">✦</span><span>Quick Intro Tour &amp; Permissions</span></div>
         </div>
       </div>
 
@@ -1889,14 +1940,15 @@ function featureGraphicHtml() {
     gap: 18px;
   }
   .fg-icon {
-    width: 78px;
-    height: 78px;
+    width: 82px;
+    height: 82px;
     border-radius: 20px;
+    overflow: hidden;
     box-shadow: 0 12px 30px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255,255,255,0.14);
     flex-shrink: 0;
   }
   .fg-title {
-    font-size: 46px;
+    font-size: 42px;
     font-weight: 800;
     letter-spacing: -0.03em;
     line-height: 1.08;
@@ -1961,12 +2013,15 @@ function featureGraphicHtml() {
   <div class="fg-root">
     <div class="studio-grid"></div>
     <div class="fg-left">
+      <div style="align-self:flex-start;padding:5px 12px;border-radius:999px;background:${THEME.primarySoft};border:1px solid ${THEME.primaryBorder};color:${THEME.primaryText};font-size:11.5px;font-weight:800;letter-spacing:0.06em;">
+        UNOFFICIAL OPEN-SOURCE CLIENT
+      </div>
       <div class="fg-brand-row">
-        <img class="fg-icon" src="${ICON_DATA_URI}" alt="Antigravity Remote" />
-        <div class="fg-title">Antigravity<br/>Remote</div>
+        <div class="fg-icon">${renderBrandIconSvg({ size: 82, transparentBg: false })}</div>
+        <div class="fg-title">Remote Client<br/>for Antigravity</div>
       </div>
       <div class="fg-sub">
-        Cross-workstation Thread Inbox, Projects, live quotas, and proactive lock-screen alerts on Android &amp; tablets.
+        Cross-workstation Thread Inbox, Projects, live quotas, and opt-in lock-screen alerts on Android &amp; tablets.
       </div>
       <div class="fg-pills">
         <span class="fg-pill" style="background:${THEME.primarySoft};border-color:${THEME.primaryBorder};color:${THEME.primaryText};">Thread Inbox</span>
@@ -2014,21 +2069,36 @@ function featureGraphicHtml() {
   </body></html>`;
 }
 
-function playIconHtml() {
+function brandIconHtml({ size, transparentBg = false }) {
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
   * { margin: 0; padding: 0; }
-  html, body { width: 512px; height: 512px; overflow: hidden; background: #121417; }
-  img { width: 512px; height: 512px; display: block; }
-  </style></head><body><img src="${ICON_DATA_URI}" alt="Antigravity Remote Icon" /></body></html>`;
+  html, body { width: ${size}px; height: ${size}px; overflow: hidden; background: ${transparentBg ? 'transparent' : '#121417'}; }
+  svg { width: ${size}px; height: ${size}px; display: block; }
+  </style></head><body>${renderBrandIconSvg({ size, transparentBg })}</body></html>`;
 }
 
 function buildAssetSpecs() {
   const specs = [
     {
+      relPath: 'assets/icon.png',
+      outPath: APP_ICON_PATH,
+      width: 1024,
+      height: 1024,
+      html: brandIconHtml({ size: 1024, transparentBg: false }),
+    },
+    {
+      relPath: 'assets/adaptive-icon.png',
+      outPath: ADAPTIVE_ICON_PATH,
+      width: 1024,
+      height: 1024,
+      transparent: true,
+      html: brandIconHtml({ size: 1024, transparentBg: true }),
+    },
+    {
       relPath: 'icon/play-icon-512.png',
       width: 512,
       height: 512,
-      html: playIconHtml(),
+      html: brandIconHtml({ size: 512, transparentBg: false }),
     },
     {
       relPath: 'feature-graphic/feature-graphic-1024x500.png',
@@ -2201,7 +2271,7 @@ function renderOne(chromeBin, tmpDir, spec, index) {
       return;
     }
     const htmlPath = path.join(tmpDir, `asset-${index}.html`);
-    const outPath = path.join(GRAPHICS_DIR, spec.relPath);
+    const outPath = spec.outPath || path.join(GRAPHICS_DIR, spec.relPath);
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
     fs.writeFileSync(htmlPath, spec.html, 'utf8');
 
@@ -2215,6 +2285,7 @@ function renderOne(chromeBin, tmpDir, spec, index) {
       '--hide-scrollbars',
       '--disable-dev-shm-usage',
       '--force-device-scale-factor=1',
+      ...(spec.transparent ? ['--default-background-color=00000000'] : []),
       `--user-data-dir=${userDataDir}`,
       `--window-size=${spec.width},${spec.height}`,
       `--screenshot=${outPath}`,
@@ -2262,6 +2333,7 @@ async function generatePlayAssets(options = {}) {
   // never uploads obsolete screenshots from earlier releases.
   const expectedByDir = new Map();
   for (const spec of specs) {
+    if (spec.outPath) continue;
     const dir = path.dirname(spec.relPath);
     const base = path.basename(spec.relPath);
     if (!expectedByDir.has(dir)) expectedByDir.set(dir, new Set());

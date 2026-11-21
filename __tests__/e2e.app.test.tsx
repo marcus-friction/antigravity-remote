@@ -20,6 +20,7 @@ let mockInitialUrl: string | null = null;
 let mockNextTimingInterrupted = false;
 let mockWindowDimensions = { width: 390, height: 844 };
 const mockOpenURL = jest.fn(async (_url: string) => true);
+const mockOpenSettings = jest.fn(async () => undefined);
 const mockPermissionsCheck = jest.fn(async (_permission: string) => false);
 const mockPermissionsRequest = jest.fn(
   async (_permission: string) => 'granted',
@@ -159,6 +160,7 @@ jest.mock('expo-linking', () => ({
     },
   ),
   openURL: (url: string) => mockOpenURL(url),
+  openSettings: () => mockOpenSettings(),
 }));
 
 jest.mock('expo-secure-store', () => ({
@@ -590,6 +592,7 @@ describe('Session and navigation regressions', () => {
   beforeEach(async () => {
     resumeSessionPersistence();
     mockSecureStoreData.clear();
+    mockSecureStoreData.set('agy_intro_tour_seen_v1', 'true');
     mockCookieStore.clear();
     mockAppStateListeners.clear();
     mockKeyboardShowListeners.clear();
@@ -599,6 +602,7 @@ describe('Session and navigation regressions', () => {
     mockInitialUrl = null;
     mockWebViewMountCount = 0;
     mockOpenURL.mockClear();
+    mockOpenSettings.mockClear();
     mockWebViewReload.mockClear();
     mockWebViewInjectJavaScript.mockClear();
     mockPermissionsCheck.mockReset().mockResolvedValue(false);
@@ -907,19 +911,14 @@ describe('Session and navigation regressions', () => {
     expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(false, 0, false);
     expect(mockPermissionsRequest).not.toHaveBeenCalled();
 
-    // Default is 30m paired with Action Notifications: signing in activates keep-alive and requests POST_NOTIFICATIONS
+    // Default is Off (opt-in via intro tour or Settings): signing in keeps keep-alive inactive and does NOT prematurely request POST_NOTIFICATIONS
     mockCookieStore.set('https://antigravity.google.com', {
       SID: { name: 'SID', value: 'live-session', domain: '.google.com' },
     });
     await navigate('https://antigravity.google.com/r/workstation-1', false);
 
-    expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(true, 30, true);
-    expect(mockPermissionsCheck).toHaveBeenCalledWith(
-      'android.permission.POST_NOTIFICATIONS',
-    );
-    expect(mockPermissionsRequest).toHaveBeenCalledWith(
-      'android.permission.POST_NOTIFICATIONS',
-    );
+    expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(false, 0, false);
+    expect(mockPermissionsRequest).not.toHaveBeenCalled();
     mockWebViewInjectJavaScript.mockClear();
 
     // Brief iOS/Android inactive peek without backgrounding does not spam wakeup events on authenticated pages
@@ -950,7 +949,7 @@ describe('Session and navigation regressions', () => {
     ).toBe(true);
 
     // Returning authenticated onto a non-thread workstation route automatically has our Inbox drawer open;
-    // switch to Settings mode, verify concise guidance, and adjust ('5m' -> '60m' -> 'Off')
+    // switch to Settings mode, verify Off default guidance, and opt in ('5m' -> '60m' -> 'Off')
     expect(controls().props.visible).toBe(true);
     const settingsModeBtn = tree.root
       .findAllByType('TouchableOpacity' as any)
@@ -976,7 +975,7 @@ describe('Session and navigation regressions', () => {
         .some(
           (node) =>
             typeof node.props.children === 'string' &&
-            node.props.children.includes('Active for up to 30m'),
+            node.props.children.includes('Off (no background battery use)'),
         ),
     ).toBe(true);
 
@@ -988,6 +987,12 @@ describe('Session and navigation regressions', () => {
       fiveChip.props.onPress();
     });
     expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(true, 5, true);
+    expect(mockPermissionsCheck).toHaveBeenCalledWith(
+      'android.permission.POST_NOTIFICATIONS',
+    );
+    expect(mockPermissionsRequest).toHaveBeenCalledWith(
+      'android.permission.POST_NOTIFICATIONS',
+    );
 
     const sixtyChip = tree.root
       .findAllByType('TouchableOpacity' as any)
@@ -997,6 +1002,15 @@ describe('Session and navigation regressions', () => {
       sixtyChip.props.onPress();
     });
     expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(true, 60, true);
+    expect(
+      tree.root
+        .findAllByType('Text' as any)
+        .some(
+          (node) =>
+            typeof node.props.children === 'string' &&
+            node.props.children.includes('Active for up to 60m'),
+        ),
+    ).toBe(true);
 
     const offChip = tree.root
       .findAllByType('TouchableOpacity' as any)
@@ -1030,11 +1044,11 @@ describe('Session and navigation regressions', () => {
     });
     expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(true, 30, true);
 
-    // Sign Out stops active native keep-alive immediately and resets preference back to default 30m
+    // Sign Out stops active native keep-alive immediately and resets preference back to default Off (0)
     await act(async () => {
       await controls().props.onSignOut();
     });
-    expect(controls().props.keepAliveMinutes).toBe(30);
+    expect(controls().props.keepAliveMinutes).toBe(0);
     expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(false, 0, false);
   });
 
@@ -1191,8 +1205,8 @@ describe('Session and navigation regressions', () => {
     });
 
     expect(webView().props.source.uri).toBe('https://antigravity.google.com');
-    expect(controls().props.keepAliveMinutes).toBe(30);
-    expect(controls().props.actionNotificationMode).toBe('all_attention');
+    expect(controls().props.keepAliveMinutes).toBe(0);
+    expect(controls().props.actionNotificationMode).toBe('off');
     expect(mockSecureStoreData.has('agy_session_cleanup_pending')).toBe(false);
     expect(mockSecureStoreData.has('agy_last_active_url_v1')).toBe(false);
     expect(mockSecureStoreData.has('agy_keep_alive_minutes_v1')).toBe(false);
@@ -1839,6 +1853,9 @@ describe('Session and navigation regressions', () => {
       'https://antigravity.google.com/r/workstation-1?p=c%2Factive-local',
       false,
     );
+    await act(async () => {
+      controls().props.onChangeActionNotificationMode?.('all_attention');
+    });
 
     const deliverSnapshot = async (
       approvalPresent: boolean,
@@ -1998,7 +2015,8 @@ describe('Session and navigation regressions', () => {
       allAttentionChip.props.onPress();
     });
     expect(controls().props.actionNotificationMode).toBe('all_attention');
-    expect(controls().props.keepAliveMinutes).toBe(30);
+    // Enabling Action Notifications must NOT silently turn on Keep-Alive (opt-in only)
+    expect(controls().props.keepAliveMinutes).toBe(0);
 
     // 5. Tapping a single-action thread notification (`antigravity-remote://r/workstation-2?p=c%2Funread-remote`)
     // closes the open Sidebar and navigates directly to that thread
@@ -2032,6 +2050,9 @@ describe('Session and navigation regressions', () => {
       'https://antigravity.google.com/r/workstation-1?p=c%2Fagent-run-1',
       false,
     );
+    await act(async () => {
+      controls().props.onChangeActionNotificationMode?.('all_attention');
+    });
 
     // Simulate workstation clock 5 minutes BEHIND phone `Date.now()`
     const workstationStartIso = new Date(Date.now() - 300_000).toISOString();
@@ -3762,6 +3783,9 @@ describe('Session and navigation regressions', () => {
       'https://antigravity.google.com/r/workstation-1?p=c%2Fbg-thread-1',
       false,
     );
+    await act(async () => {
+      controls().props.onChangeActionNotificationMode?.('all_attention');
+    });
 
     const startIso = new Date(Date.now() - 120_000).toISOString();
     const midIso = new Date(Date.now() - 60_000).toISOString();
@@ -4126,6 +4150,7 @@ describe('Session and navigation regressions', () => {
       });
       await backupCookiesFromWebView();
       await saveLastActiveUrl('https://antigravity.google.com/r/workstation-1');
+      mockSecureStoreData.set('agy_action_notifications_v1', 'all_attention');
       mockCookieStore.clear();
 
       let tree!: ReactTestRenderer;
@@ -4284,6 +4309,7 @@ describe('Session and navigation regressions', () => {
       });
       await backupCookiesFromWebView();
       await saveLastActiveUrl('https://antigravity.google.com/r/workstation-1');
+      mockSecureStoreData.set('agy_action_notifications_v1', 'all_attention');
       mockCookieStore.clear();
 
       let tree!: ReactTestRenderer;
@@ -4757,6 +4783,9 @@ describe('Session and navigation regressions', () => {
       'https://antigravity.google.com/r/workstation-1?p=c%2Flock-thread-1',
       false,
     );
+    await act(async () => {
+      controls().props.onChangeActionNotificationMode?.('all_attention');
+    });
 
     const startIso = new Date(Date.now() - 90_000).toISOString();
     const waitIso = new Date(Date.now() - 5_000).toISOString();
@@ -4904,6 +4933,9 @@ describe('Session and navigation regressions', () => {
       false,
     );
     await act(async () => {
+      controls().props.onChangeActionNotificationMode?.('all_attention');
+    });
+    await act(async () => {
       webView().props.onMessage({
         nativeEvent: {
           url: 'https://antigravity.google.com/r/workstation-1?p=c%2Fother-thread',
@@ -5019,5 +5051,125 @@ describe('Session and navigation regressions', () => {
     });
     await navigate('https://antigravity.google.com/r/workstation-2', false);
     expect(controls().props.visible).toBe(true);
+  });
+
+  it('shows the 3-step Quick Intro Tour on first launch with Off defaults, lets users configure notifications/permissions and opt-in keep-alive, supports Back/Skip, and replays from Settings', async () => {
+    const RNPlatform = require('react-native').Platform;
+    RNPlatform.OS = 'android';
+    RNPlatform.Version = 35;
+
+    await act(async () => {
+      tree.unmount();
+    });
+    mockSecureStoreData.clear();
+    mockPermissionsCheck.mockReset().mockResolvedValue(false);
+    mockPermissionsRequest.mockReset().mockResolvedValue('denied');
+    (configureNativeKeepAlive as jest.Mock).mockClear();
+
+    await act(async () => {
+      tree = renderer.create(<App />);
+    });
+
+    // 1. Fresh install opens Intro Tour on Step 1 with both settings Off and zero premature permission/FGS calls
+    const findOverlay = () =>
+      tree.root
+        .findAllByType('View' as any)
+        .find((node) => node.props.testID === 'intro-tour-overlay');
+    const findBtn = (label: string) =>
+      tree.root
+        .findAllByType('TouchableOpacity' as any)
+        .find((node) => node.props.accessibilityLabel === label);
+
+    expect(findOverlay()).toBeDefined();
+    expect(controls().props.keepAliveMinutes).toBe(0);
+    expect(controls().props.actionNotificationMode).toBe('off');
+    expect(mockPermissionsRequest).not.toHaveBeenCalled();
+    expect(configureNativeKeepAlive).toHaveBeenLastCalledWith(false, 0, false);
+
+    // 2. Step 1 -> Step 2 (Action Notifications): choosing All Attention requests POST_NOTIFICATIONS.
+    //    When denied, shows Open System Settings CTA; returning to app after granting updates badge live.
+    await act(async () => {
+      findBtn('Intro tour next')!.props.onPress();
+    });
+    await act(async () => {
+      findBtn('Tour notifications All Attention')!.props.onPress();
+    });
+    expect(controls().props.actionNotificationMode).toBe('all_attention');
+    expect(controls().props.keepAliveMinutes).toBe(0);
+    expect(mockPermissionsRequest).toHaveBeenCalledWith(
+      'android.permission.POST_NOTIFICATIONS',
+    );
+    const openSettingsBtn = findBtn('Intro tour open settings');
+    expect(openSettingsBtn).toBeDefined();
+    await act(async () => {
+      openSettingsBtn!.props.onPress();
+    });
+    expect(mockOpenSettings).toHaveBeenCalledTimes(1);
+
+    // Simulate returning from Android System Settings with permission now granted
+    mockPermissionsCheck.mockResolvedValue(true);
+    await act(async () => {
+      for (const listener of mockAppStateListeners) listener('active');
+    });
+    expect(findBtn('Intro tour open settings')).toBeUndefined();
+    expect(
+      tree.root
+        .findAllByType('Text' as any)
+        .some(
+          (node) =>
+            node.props.children === 'Notification permission granted',
+        ),
+    ).toBe(true);
+
+    // 3. Step 2 -> Step 3 (Background Keep-Alive): Off is selected by default; user explicitly opts into 30m
+    await act(async () => {
+      findBtn('Intro tour next')!.props.onPress();
+    });
+    expect(findBtn('Tour keep-alive Off')!.props.accessibilityState?.selected).toBe(
+      true,
+    );
+    await act(async () => {
+      findBtn('Tour keep-alive 30m')!.props.onPress();
+    });
+    expect(controls().props.keepAliveMinutes).toBe(30);
+
+    // 4. Android hardware Back inside Step 3 returns to Step 2 rather than closing the app or WebView
+    let handledBack = false;
+    await act(async () => {
+      for (const listener of mockBackPressListeners) {
+        handledBack = listener() || handledBack;
+      }
+    });
+    expect(handledBack).toBe(true);
+    expect(findBtn('Tour notifications All Attention')).toBeDefined();
+
+    // Advance back to Step 3 and finish -> persists completion and closes overlay
+    await act(async () => {
+      findBtn('Intro tour next')!.props.onPress();
+    });
+    await act(async () => {
+      findBtn('Intro tour finish')!.props.onPress();
+    });
+    expect(findOverlay()).toBeUndefined();
+    expect(mockSecureStoreData.get('agy_intro_tour_seen_v1')).toBe('true');
+
+    // 5. Reopening from Settings -> Quick Intro Tour & Permissions opens Step 1 and Skip closes cleanly
+    mockCookieStore.set('https://antigravity.google.com', {
+      SID: { name: 'SID', value: 'tour-replay-session', domain: '.google.com' },
+    });
+    await navigate('https://antigravity.google.com/r/workstation-1', false);
+    await act(async () => {
+      findBtn('Drawer mode Settings')!.props.onPress();
+    });
+    const replayTourBtn = findBtn('Open quick intro tour');
+    expect(replayTourBtn).toBeDefined();
+    await act(async () => {
+      replayTourBtn!.props.onPress();
+    });
+    expect(findOverlay()).toBeDefined();
+    await act(async () => {
+      findBtn('Intro tour skip')!.props.onPress();
+    });
+    expect(findOverlay()).toBeUndefined();
   });
 });

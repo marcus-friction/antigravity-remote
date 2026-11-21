@@ -12,7 +12,7 @@
       android:foregroundServiceType="specialUse">
       <property
         android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-        android:value="Maintains active user-initiated Antigravity Remote workstation WebSocket sessions while multitasking for a bounded user-configured duration." />
+        android:value="Maintains user-opted-in Antigravity Remote workstation WebSocket sessions and bounded on-device attention status checks while multitasking or while the screen is locked for a user-selected duration (5-60 minutes), with a persistent stoppable notification." />
     </service>
   </application>
 </manifest>

@@ -1,1 +1,1 @@
-Mobile companion for Antigravity Remote: Inbox, Projects, Quotas & Live Alerts.
+Unofficial remote client for Antigravity: Inbox, Projects, Quotas & Alerts.

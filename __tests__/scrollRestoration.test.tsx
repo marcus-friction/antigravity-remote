@@ -116,11 +116,15 @@ jest.mock('expo-linking', () => ({
 jest.mock('expo-secure-store', () => ({
   AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY: 'AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY',
   setItemAsync: jest.fn(async () => undefined),
-  getItemAsync: jest.fn(async (key: string) =>
-    key === 'agy_last_active_url_v1'
-      ? 'https://antigravity.google.com/r/machine-1'
-      : null,
-  ),
+  getItemAsync: jest.fn(async (key: string) => {
+    if (key === 'agy_last_active_url_v1') {
+      return 'https://antigravity.google.com/r/machine-1';
+    }
+    if (key === 'agy_intro_tour_seen_v1') {
+      return 'true';
+    }
+    return null;
+  }),
   deleteItemAsync: jest.fn(async () => undefined),
 }));
 

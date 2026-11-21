@@ -63,12 +63,14 @@ import {
   backupCookiesFromWebView,
   clearSession,
   getActionNotificationMode,
+  getIntroTourSeen,
   getKeepAliveMinutes,
   getLastActiveUrl,
   hydrateCookiesToWebView,
   isSafeToReinjectCookie,
   reassembleChunks,
   saveActionNotificationMode,
+  saveIntroTourSeen,
   saveKeepAliveMinutes,
   saveLastActiveUrl,
   splitIntoChunks,
@@ -316,8 +318,12 @@ describe('sessionVault', () => {
   });
 
   it('persists valid keep-alive durations and action notification modes and resets to defaults on clearSession()', async () => {
-    expect(await getKeepAliveMinutes()).toBe(30);
-    expect(await getActionNotificationMode()).toBe('all_attention');
+    expect(await getKeepAliveMinutes()).toBe(0);
+    expect(await getActionNotificationMode()).toBe('off');
+    expect(await getIntroTourSeen()).toBe(false);
+
+    await saveIntroTourSeen(true);
+    expect(await getIntroTourSeen()).toBe(true);
 
     await saveKeepAliveMinutes(5);
     expect(await getKeepAliveMinutes()).toBe(5);
@@ -331,31 +337,33 @@ describe('sessionVault', () => {
     await saveActionNotificationMode('approvals');
     expect(await getActionNotificationMode()).toBe('approvals');
 
-    await saveActionNotificationMode('off');
-    expect(await getActionNotificationMode()).toBe('off');
+    await saveActionNotificationMode('all_attention');
+    expect(await getActionNotificationMode()).toBe('all_attention');
 
     // Rejects unsupported values stored externally
     mockSecureStoreData.set('agy_keep_alive_minutes_v1', '999');
-    expect(await getKeepAliveMinutes()).toBe(30);
+    expect(await getKeepAliveMinutes()).toBe(0);
     mockSecureStoreData.set('agy_action_notifications_v1', 'invalid_mode');
-    expect(await getActionNotificationMode()).toBe('all_attention');
+    expect(await getActionNotificationMode()).toBe('off');
 
     await saveKeepAliveMinutes(15);
     expect(await getKeepAliveMinutes()).toBe(15);
-    await saveActionNotificationMode('off');
-    expect(await getActionNotificationMode()).toBe('off');
+    await saveActionNotificationMode('all_attention');
+    expect(await getActionNotificationMode()).toBe('all_attention');
 
     // Pending sign-out marker immediately blocks reading stale URL, keep-alive, or notification preferences
     await saveLastActiveUrl('https://antigravity.google.com/r/stale-session');
     mockSecureStoreData.set(SECURE_STORE_SIGN_OUT_KEY, 'true');
     expect(await getLastActiveUrl()).toBe('https://antigravity.google.com');
-    expect(await getKeepAliveMinutes()).toBe(30);
-    expect(await getActionNotificationMode()).toBe('all_attention');
+    expect(await getKeepAliveMinutes()).toBe(0);
+    expect(await getActionNotificationMode()).toBe('off');
     mockSecureStoreData.delete(SECURE_STORE_SIGN_OUT_KEY);
 
     await clearSession();
-    expect(await getKeepAliveMinutes()).toBe(30);
-    expect(await getActionNotificationMode()).toBe('all_attention');
+    expect(await getKeepAliveMinutes()).toBe(0);
+    expect(await getActionNotificationMode()).toBe('off');
+    // Intro tour completion survives sign-out so returning users aren't forced through onboarding again
+    expect(await getIntroTourSeen()).toBe(true);
   });
 
   it('completely wipes CookieManager and all SecureStore chunks on clearSession()', async () => {

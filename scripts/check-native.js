@@ -71,6 +71,11 @@ function checkNative(root, options = {}) {
       500,
     );
     readPlayText(
+      'android/app/src/main/play/contact-website.txt',
+      'contact website',
+      200,
+    );
+    readPlayText(
       'android/app/src/main/play/listings/en-US/title.txt',
       'title',
       30,
@@ -141,6 +146,8 @@ function checkNative(root, options = {}) {
     'fullBackupContent="false"',
     'usesCleartextTraffic="false"',
     'dataExtractionRules="@xml/remote_data_extraction_rules"',
+    'android:name="android.permission.USE_BIOMETRIC" tools:node="remove"',
+    'android:name="android.permission.USE_FINGERPRINT" tools:node="remove"',
   ]) {
     assert(
       manifest.includes(attribute),

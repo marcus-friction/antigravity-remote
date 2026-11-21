@@ -15,6 +15,7 @@ import {
   SECURE_STORE_CHUNK_PREFIX,
   SECURE_STORE_CHUNK_SIZE,
   SECURE_STORE_DRAWER_GUIDANCE_SEEN_KEY,
+  SECURE_STORE_INTRO_TOUR_SEEN_KEY,
   SECURE_STORE_KEEP_ALIVE_MINUTES_KEY,
   SECURE_STORE_SNAPSHOT_PREFIX,
   SECURE_STORE_SIGN_OUT_KEY,
@@ -619,6 +620,34 @@ export async function getDrawerGuidanceSeen(): Promise<boolean> {
   try {
     const saved = await SecureStore.getItemAsync(
       SECURE_STORE_DRAWER_GUIDANCE_SEEN_KEY,
+      SECURE_STORE_OPTIONS,
+    );
+    return saved === 'true';
+  } catch {
+    return false;
+  }
+}
+
+export function saveIntroTourSeen(seen: boolean = true): Promise<void> {
+  const generation = sessionGeneration;
+  return serialize(async () => {
+    if (!isCurrent(generation)) return;
+    try {
+      await SecureStore.setItemAsync(
+        SECURE_STORE_INTRO_TOUR_SEEN_KEY,
+        seen ? 'true' : 'false',
+        SECURE_STORE_OPTIONS,
+      );
+    } catch {
+      /* Intro tour completion state is non-critical if storage is unavailable. */
+    }
+  });
+}
+
+export async function getIntroTourSeen(): Promise<boolean> {
+  try {
+    const saved = await SecureStore.getItemAsync(
+      SECURE_STORE_INTRO_TOUR_SEEN_KEY,
       SECURE_STORE_OPTIONS,
     );
     return saved === 'true';

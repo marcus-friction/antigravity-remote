@@ -24,7 +24,6 @@ import {
 import { ShouldStartLoadRequest } from 'react-native-webview/lib/WebViewTypes';
 import {
   ANTIGRAVITY_DASHBOARD_URL,
-  AUTO_NOTIFICATION_KEEP_ALIVE_MINUTES,
   DEFAULT_ACTION_NOTIFICATION_MODE,
   DEFAULT_KEEP_ALIVE_MINUTES,
 } from '../constants/config';
@@ -50,11 +49,13 @@ import {
   getActionNotificationMode,
   getDrawerGuidanceSeen,
   getGoogleSessionSignature,
+  getIntroTourSeen,
   getKeepAliveMinutes,
   getLastActiveUrl,
   hydrateCookiesToWebView,
   saveActionNotificationMode,
   saveDrawerGuidanceSeen,
+  saveIntroTourSeen,
   saveKeepAliveMinutes,
   saveLastActiveUrl,
   suspendSessionPersistence,
@@ -106,6 +107,10 @@ import {
   validateNavigationUrl,
 } from '../utils/urlValidator';
 import { getCleanMobileUserAgent } from '../utils/userAgent';
+import {
+  IntroTourModal,
+  NotificationPermissionStatus,
+} from './IntroTourModal';
 import { DrawerMode, LeftNavigationDrawer } from './LeftNavigationDrawer';
 import { TopStatusBanner } from './TopStatusBanner';
 
@@ -512,6 +517,8 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const isComposingNewThreadRef = useRef<boolean>(false);
   const wasAuthenticatedRef = useRef<boolean>(false);
   const drawerBackInterceptorRef = useRef<(() => boolean) | null>(null);
+  const introTourBackInterceptorRef = useRef<(() => boolean) | null>(null);
+  const isIntroTourOpenRef = useRef<boolean>(false);
   const activeThreadProjectRef = useRef<ActiveThreadProjectContext | null>(null);
   const lastSyncedThreadProjectSigRef = useRef<string | null>(null);
 
@@ -536,6 +543,9 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
   const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
   const [hasSeenDrawerGuidance, setHasSeenDrawerGuidance] =
     useState<boolean>(false);
+  const [isIntroTourOpen, setIsIntroTourOpen] = useState<boolean>(false);
+  const [notificationPermissionStatus, setNotificationPermissionStatus] =
+    useState<NotificationPermissionStatus>('undetermined');
   const [drawerInitialMode, setDrawerInitialMode] =
     useState<DrawerMode>('inbox');
   const [isInboxRefreshing, setIsInboxRefreshing] = useState<boolean>(false);
@@ -617,12 +627,14 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
         savedKeepAliveMinutes,
         savedActionNotificationMode,
         savedDrawerGuidanceSeen,
+        savedIntroTourSeen,
         sessionSignature,
       ] = await Promise.all([
         getLastActiveUrl(),
         getKeepAliveMinutes(),
         getActionNotificationMode(),
         getDrawerGuidanceSeen(),
+        getIntroTourSeen(),
         getGoogleSessionSignature(),
       ]);
 
@@ -654,6 +666,25 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       setActionNotificationMode(savedActionNotificationMode);
       actionNotificationModeRef.current = savedActionNotificationMode;
       setHasSeenDrawerGuidance(savedDrawerGuidanceSeen);
+      const shouldShowIntroTour = !savedIntroTourSeen;
+      isIntroTourOpenRef.current = shouldShowIntroTour;
+      setIsIntroTourOpen(shouldShowIntroTour);
+      if (Platform.OS === 'android') {
+        if (typeof Platform.Version === 'number' && Platform.Version < 33) {
+          setNotificationPermissionStatus('not_required');
+        } else {
+          try {
+            const granted = await PermissionsAndroid?.check?.(
+              'android.permission.POST_NOTIFICATIONS' as any,
+            );
+            setNotificationPermissionStatus(
+              granted ? 'granted' : 'undetermined',
+            );
+          } catch {
+            setNotificationPermissionStatus('undetermined');
+          }
+        }
+      }
       setCurrentSourceUrl(initialTarget);
       setActiveHostUrl(initialTarget);
       currentNavUrlRef.current = initialTarget;
@@ -756,35 +787,79 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     void installNativeDocumentStartScript?.(PROJECT_OVERVIEW_SCROLL_SCRIPT);
   }, [isHydrated, resetRequest, webViewInstanceKey]);
 
+  const refreshNotificationPermissionStatus = useCallback(async () => {
+    if (Platform.OS !== 'android') {
+      return;
+    }
+    if (typeof Platform.Version === 'number' && Platform.Version < 33) {
+      setNotificationPermissionStatus('not_required');
+      return;
+    }
+    try {
+      const granted = await PermissionsAndroid?.check?.(
+        'android.permission.POST_NOTIFICATIONS' as any,
+      );
+      if (granted) {
+        setNotificationPermissionStatus('granted');
+      } else {
+        setNotificationPermissionStatus((prev) =>
+          prev === 'denied' ? 'denied' : 'undetermined',
+        );
+      }
+    } catch {
+      // Ignore permission check errors on restricted profiles/ROMs.
+    }
+  }, []);
+
+  const handleRequestNotificationPermission =
+    useCallback(async (): Promise<NotificationPermissionStatus> => {
+      if (Platform.OS === 'ios') {
+        notificationPermissionRequestedRef.current = true;
+        try {
+          const granted = Boolean(await requestNativeNotificationPermission?.());
+          const nextStatus: NotificationPermissionStatus = granted
+            ? 'granted'
+            : 'denied';
+          setNotificationPermissionStatus(nextStatus);
+          return nextStatus;
+        } catch {
+          return 'undetermined';
+        }
+      }
+      if (
+        Platform.OS !== 'android' ||
+        typeof Platform.Version !== 'number' ||
+        Platform.Version < 33
+      ) {
+        setNotificationPermissionStatus('not_required');
+        return 'not_required';
+      }
+      notificationPermissionRequestedRef.current = true;
+      const permission = 'android.permission.POST_NOTIFICATIONS' as any;
+      try {
+        const alreadyGranted = await PermissionsAndroid?.check?.(permission);
+        if (alreadyGranted) {
+          setNotificationPermissionStatus('granted');
+          return 'granted';
+        }
+        const result = await PermissionsAndroid?.request?.(permission);
+        const grantedValue = PermissionsAndroid?.RESULTS?.GRANTED ?? 'granted';
+        const nextStatus: NotificationPermissionStatus =
+          result === grantedValue ? 'granted' : 'denied';
+        setNotificationPermissionStatus(nextStatus);
+        return nextStatus;
+      } catch {
+        // Ignore permission request errors on restricted profiles/ROMs.
+        return 'undetermined';
+      }
+    }, []);
+
   const requestNotificationPermissionIfNeeded = useCallback(() => {
     if (notificationPermissionRequestedRef.current) {
       return;
     }
-    if (Platform.OS === 'ios') {
-      notificationPermissionRequestedRef.current = true;
-      void requestNativeNotificationPermission?.();
-      return;
-    }
-    if (
-      Platform.OS !== 'android' ||
-      typeof Platform.Version !== 'number' ||
-      Platform.Version < 33
-    ) {
-      return;
-    }
-    notificationPermissionRequestedRef.current = true;
-    const permission = 'android.permission.POST_NOTIFICATIONS' as any;
-    void (async () => {
-      try {
-        const alreadyGranted = await PermissionsAndroid?.check?.(permission);
-        if (!alreadyGranted) {
-          await PermissionsAndroid?.request?.(permission);
-        }
-      } catch {
-        // Ignore permission request errors on restricted profiles/ROMs.
-      }
-    })();
-  }, []);
+    void handleRequestNotificationPermission();
+  }, [handleRequestNotificationPermission]);
 
   // Step 2b: Synchronize bounded background keep-alive settings with native Android/iOS controllers
   useEffect(() => {
@@ -814,12 +889,13 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       );
     }
 
-    if (keepAliveEligible || notificationsEligible) {
+    if (!isIntroTourOpen && (keepAliveEligible || notificationsEligible)) {
       requestNotificationPermissionIfNeeded();
     }
   }, [
     actionNotificationMode,
     isHydrated,
+    isIntroTourOpen,
     keepAliveMinutes,
     requestNotificationPermissionIfNeeded,
     resetRequest,
@@ -1225,6 +1301,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           }
           void syncCookiesToVault();
         } else if (nextAppState === 'active') {
+          void refreshNotificationPermissionStatus();
           const returningFromBackground = wasBackgroundedRef.current;
           wasBackgroundedRef.current = false;
           if (!isAppForegroundRef.current) {
@@ -1358,6 +1435,7 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     checkPost2faSessionAndAdvance,
     markThreadReadInWorkstationClock,
     recomputeSnapshotWithLocalState,
+    refreshNotificationPermissionStatus,
     syncCookiesToVault,
   ]);
 
@@ -1453,6 +1531,15 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
     }
 
     const onHardwareBackPress = (): boolean => {
+      if (isIntroTourOpenRef.current) {
+        if (introTourBackInterceptorRef.current?.()) {
+          return true;
+        }
+        isIntroTourOpenRef.current = false;
+        setIsIntroTourOpen(false);
+        void saveIntroTourSeen(true);
+        return true;
+      }
       if (isDrawerOpenRef.current) {
         if (drawerBackInterceptorRef.current?.()) {
           return true;
@@ -1916,13 +2003,28 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
       }
       notificationPermissionRequestedRef.current = false;
       requestNotificationPermissionIfNeeded();
-      if (keepAliveMinutesRef.current === 0) {
-        keepAliveMinutesRef.current = AUTO_NOTIFICATION_KEEP_ALIVE_MINUTES;
-        setKeepAliveMinutes(AUTO_NOTIFICATION_KEEP_ALIVE_MINUTES);
-        void saveKeepAliveMinutes(AUTO_NOTIFICATION_KEEP_ALIVE_MINUTES);
-      }
     },
     [requestNotificationPermissionIfNeeded],
+  );
+
+  const handleCompleteIntroTour = useCallback(() => {
+    isIntroTourOpenRef.current = false;
+    setIsIntroTourOpen(false);
+    void saveIntroTourSeen(true);
+  }, []);
+
+  const handleOpenIntroTour = useCallback(() => {
+    if (isResettingSessionRef.current) return;
+    void refreshNotificationPermissionStatus();
+    isIntroTourOpenRef.current = true;
+    setIsIntroTourOpen(true);
+  }, [refreshNotificationPermissionStatus]);
+
+  const registerIntroTourBackInterceptor = useCallback(
+    (interceptor: (() => boolean) | null) => {
+      introTourBackInterceptorRef.current = interceptor;
+    },
+    [],
   );
 
   const getDashboardUrlForCurrentAccount = useCallback((): string => {
@@ -3137,10 +3239,25 @@ export const RemoteWebView: React.FC<RemoteWebViewProps> = ({
           onChangeActionNotificationMode={handleChangeActionNotificationMode}
           onNavigateToUrl={handleNavigateToUrl}
           onOpenHostSettings={handleOpenHostSettings}
+          onOpenIntroTour={handleOpenIntroTour}
           onReloadSession={handleReloadSession}
           onSignOut={handleSignOut}
         />
       </View>
+
+      <IntroTourModal
+        visible={isIntroTourOpen}
+        stage={stage}
+        isTabletLayout={isTabletLayout}
+        actionNotificationMode={actionNotificationMode}
+        keepAliveMinutes={keepAliveMinutes}
+        notificationPermissionStatus={notificationPermissionStatus}
+        onChangeActionNotificationMode={handleChangeActionNotificationMode}
+        onChangeKeepAliveMinutes={handleChangeKeepAliveMinutes}
+        onRequestNotificationPermission={handleRequestNotificationPermission}
+        onComplete={handleCompleteIntroTour}
+        onRegisterBackHandler={registerIntroTourBackInterceptor}
+      />
     </View>
   );
 };
